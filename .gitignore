@@ -1,0 +1,13 @@
+# Everything derived from the game stays local and is never tracked.
+gen/
+build/
+logs/
+*.bin
+*.upk
+*.u
+*.umap
+*.tfc
+*.bik
+config.local
+__pycache__/
+*.pyc
