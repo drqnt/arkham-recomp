@@ -105,7 +105,7 @@ class MachO:
                 self._function_starts(off)
             elif cmd == LC_DATA_IN_CODE:
                 self._data_in_code(off)
-            elif cmd == LC_DYLD_INFO_ONLY:
+            elif cmd in (LC_DYLD_INFO_ONLY, 0x22):
                 self._dyld_info(off)
             elif cmd == LC_UNIXTHREAD:
                 # flavor, count, then x86_thread_state32: eip is register index 10.

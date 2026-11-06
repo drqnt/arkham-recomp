@@ -70,7 +70,7 @@ SHIM(api_noop) { RET(0); }
 // ---------- C++ interfaces: guest objects whose vtables call Valve's flat API ----------
 u32 rt_dyn_import(const char *name, void (*fn)(CPU *));
 u32 rt_dyn_import_arg(void (*fn)(CPU *), u32 arg);
-extern u32 rt_dyn_cur_arg;
+extern __thread u32 rt_dyn_cur_arg;
 
 #define FLAT(ret, name, ...) ((ret(*)(__VA_ARGS__))dlsym(lib, "SteamAPI_" name))
 #define HOSTI(accessor) (((void *(*)(void))dlsym(lib, "SteamAPI_" accessor))())
@@ -135,8 +135,73 @@ SHIM(utils_IsOverlayEnabled) { RET(0); }
 SHIM(utils_BOverlayNeedsPresent) { RET(0); }
 SHIM(utils_noop) { RET(0); }
 
+// ISteamRemoteStorage: the game's saves go through Steam Cloud, so these are the real client's calls.
+#define STORE HOSTI("SteamRemoteStorage_v016")
+// Scripted test runs read the player's real saves but must never change them.
+static int cloud_read_only(void) { return getenv("ARKHAM_INPUT") != NULL; }
+SHIM(store_FileWrite) {
+    if (cloud_read_only()) {
+        fprintf(stderr, "[steam] test run: not writing %s, %d bytes\n", GS(ARG(1)), (int)ARG(3));
+        RET(1);
+        return;
+    }
+    int r = FLAT(signed char, "ISteamRemoteStorage_FileWrite", void *, const char *, const void *, int)(STORE, GS(ARG(1)), GP(ARG(2)), (int)ARG(3));
+    fprintf(stderr, "[steam] cloud write %s, %d bytes -> %d\n", GS(ARG(1)), (int)ARG(3), r);
+    RET(r);
+}
+SHIM(store_FileRead) {
+    int r = FLAT(int, "ISteamRemoteStorage_FileRead", void *, const char *, void *, int)(STORE, GS(ARG(1)), GP(ARG(2)), (int)ARG(3));
+    fprintf(stderr, "[steam] cloud read %s -> %d bytes\n", GS(ARG(1)), r);
+    RET(r);
+}
+SHIM(store_FileForget) { if (cloud_read_only()) { RET(1); return; } RET(FLAT(signed char, "ISteamRemoteStorage_FileForget", void *, const char *)(STORE, GS(ARG(1)))); }
+SHIM(store_FileDelete) {
+    if (cloud_read_only()) {
+        fprintf(stderr, "[steam] test run: not deleting %s\n", GS(ARG(1)));
+        RET(1);
+        return;
+    }
+    int r = FLAT(signed char, "ISteamRemoteStorage_FileDelete", void *, const char *)(STORE, GS(ARG(1)));
+    fprintf(stderr, "[steam] cloud delete %s -> %d\n", GS(ARG(1)), r);
+    RET(r);
+}
+SHIM(store_SetSyncPlatforms) { RET(FLAT(signed char, "ISteamRemoteStorage_SetSyncPlatforms", void *, const char *, int)(STORE, GS(ARG(1)), (int)ARG(2))); }
+SHIM(store_FileExists) { RET(FLAT(signed char, "ISteamRemoteStorage_FileExists", void *, const char *)(STORE, GS(ARG(1)))); }
+SHIM(store_FilePersisted) { RET(FLAT(signed char, "ISteamRemoteStorage_FilePersisted", void *, const char *)(STORE, GS(ARG(1)))); }
+SHIM(store_GetFileSize) { RET(FLAT(int, "ISteamRemoteStorage_GetFileSize", void *, const char *)(STORE, GS(ARG(1)))); }
+SHIM(store_GetFileTimestamp) { i64 v = FLAT(i64, "ISteamRemoteStorage_GetFileTimestamp", void *, const char *)(STORE, GS(ARG(1))); RET64(v); }
+SHIM(store_GetFileCount) { RET(FLAT(int, "ISteamRemoteStorage_GetFileCount", void *)(STORE)); }
+SHIM(store_GetFileNameAndSize) {
+    int size = 0;
+    const char *s = FLAT(const char *, "ISteamRemoteStorage_GetFileNameAndSize", void *, int, int *)(STORE, (int)ARG(1), &size);
+    if (ARG(2)) G32(ARG(2)) = (u32)size;
+    RET(s ? rt_guest_strdup(s) : 0);
+}
+// This game's version of the call takes 32-bit sizes.
+SHIM(store_GetQuota) {
+    u64 total = 0, avail = 0;
+    int r = FLAT(signed char, "ISteamRemoteStorage_GetQuota", void *, u64 *, u64 *)(STORE, &total, &avail);
+    if (ARG(1)) G32(ARG(1)) = total > 0x7FFFFFFFu ? 0x7FFFFFFFu : (u32)total;
+    if (ARG(2)) G32(ARG(2)) = avail > 0x7FFFFFFFu ? 0x7FFFFFFFu : (u32)avail;
+    fprintf(stderr, "[steam] cloud quota %llu of %llu free -> %d\n", (unsigned long long)avail, (unsigned long long)total, r);
+    RET(r);
+}
+SHIM(store_IsCloudEnabledForAccount) { RET(FLAT(signed char, "ISteamRemoteStorage_IsCloudEnabledForAccount", void *)(STORE)); }
+SHIM(store_IsCloudEnabledForApp) { RET(FLAT(signed char, "ISteamRemoteStorage_IsCloudEnabledForApp", void *)(STORE)); }
+#define FRIENDS HOSTI("SteamFriends_v018")
+SHIM(friends_GetPersonaName) {
+    const char *s = FLAT(const char *, "ISteamFriends_GetPersonaName", void *)(FRIENDS);
+    RET(s ? rt_guest_strdup(s) : 0);
+}
+
 typedef struct { const char *iface; u32 slot; void (*fn)(CPU *); } SlotDef;
 static const SlotDef slots[] = {
+    {"SteamRemoteStorage", 0, shim_store_FileWrite}, {"SteamRemoteStorage", 1, shim_store_FileRead}, {"SteamRemoteStorage", 2, shim_store_FileForget},
+    {"SteamRemoteStorage", 3, shim_store_FileDelete}, {"SteamRemoteStorage", 5, shim_store_SetSyncPlatforms}, {"SteamRemoteStorage", 10, shim_store_FileExists},
+    {"SteamRemoteStorage", 11, shim_store_FilePersisted}, {"SteamRemoteStorage", 12, shim_store_GetFileSize}, {"SteamRemoteStorage", 13, shim_store_GetFileTimestamp},
+    {"SteamRemoteStorage", 15, shim_store_GetFileCount}, {"SteamRemoteStorage", 16, shim_store_GetFileNameAndSize}, {"SteamRemoteStorage", 17, shim_store_GetQuota},
+    {"SteamRemoteStorage", 18, shim_store_IsCloudEnabledForAccount}, {"SteamRemoteStorage", 19, shim_store_IsCloudEnabledForApp},
+    {"SteamFriends", 0, shim_friends_GetPersonaName},
     {"SteamApps", 0, shim_apps_BIsSubscribed}, {"SteamApps", 1, shim_apps_BIsLowViolence}, {"SteamApps", 2, shim_apps_BIsCybercafe},
     {"SteamApps", 3, shim_apps_BIsVACBanned}, {"SteamApps", 4, shim_apps_GetCurrentGameLanguage},
     {"SteamApps", 5, shim_apps_GetAvailableGameLanguages}, {"SteamApps", 6, shim_apps_BIsSubscribedApp},

@@ -19,8 +19,11 @@ import time
 from array import array
 
 sys.path.insert(0, os.path.dirname(__file__))
+import emit as emit_module  # noqa: E402
 from emit import ALL, CONDS, Unsupported, emit, flag_effect, hx, rd, opsize, TYPES, STYPES  # noqa: E402
-from game_path import game_binary  # noqa: E402
+from eh import all_landing_pads  # noqa: E402
+from game_path import game_binary, game_bink  # noqa: E402
+from rebase_dylib import rebase_dylib  # noqa: E402
 from macho import MachO  # noqa: E402
 from x86 import Ins, Op, parse_lines  # noqa: E402
 
@@ -38,14 +41,14 @@ TERMINATORS = {"ret", "retn", "hlt", "ud2", "int3", "<unknown>", "jmp", "iretd",
 
 # ---------- disassembly ----------
 
-def ensure_disasm(binary: str):
+def ensure_disasm(binary: str, tag: str = "", sections: tuple[str, ...] = ("__text", "google_malloc")):
     """Linear sweep over code sections. Returns the path and a sorted (addrs, offsets) index."""
     os.makedirs(BUILD, exist_ok=True)
-    dis = os.path.join(BUILD, "dis.txt")
-    idx = os.path.join(BUILD, "dis.idx")
+    dis = os.path.join(BUILD, f"dis{tag}.txt")
+    idx = os.path.join(BUILD, f"dis{tag}.idx")
     if not os.path.exists(idx):
         with open(dis, "wb") as fh:
-            for sec in ("__text", "google_malloc"):
+            for sec in sections:
                 subprocess.run(OBJDUMP + [f"--section={sec}", binary], stdout=fh, check=True, env=ENV)
         addrs, offs = array("I"), array("Q")
         pos = 0
@@ -67,31 +70,45 @@ def ensure_disasm(binary: str):
 class World:
     """Everything workers share: image metadata and the disassembly index."""
 
-    def __init__(self, binary: str, extra_roots: set[int]):
+    def __init__(self, binary: str, extra_roots: set[int], tag: str = "", import_base: int = 0):
         self.binary = binary
+        self.tag = tag
         self.m = MachO(binary)
-        self.dis, self.addrs, self.offs = ensure_disasm(binary)
         m = self.m
+        code_sections = tuple(n for n in ("__text", "google_malloc") if m.section(n))
+        self.dis, self.addrs, self.offs = ensure_disasm(binary, tag, code_sections)
         self.code_ranges = []
-        for name in ("__text", "google_malloc"):
+        for name in code_sections:
             sec = m.section(name)
             self.code_ranges.append((sec.addr, sec.end))
         gm = m.section("google_malloc")
-        roots = set(m.function_starts) | set(extra_roots)
-        roots.add(m.entry)
-        roots.add(gm.addr)
+        # Every exception landing pad is an entry point: the unwinder enters it with restored registers.
+        self.landing_pads = all_landing_pads(m)[0] if m.section("__eh_frame") else set()
+        hard = set(m.function_starts)
+        if m.entry:
+            hard.add(m.entry)
+        if gm:
+            hard.add(gm.addr)
+        roots = hard | set(extra_roots) | self.landing_pads
+        if not m.function_starts:
+            # No linker table in an old dylib: use its symbols and standard prologues for extents, and also start from
+            # anything that follows a return or that data points at. Those extra roots never cut a function short.
+            prologues, others = self.scan_function_starts()
+            hard |= prologues
+            roots |= prologues | others
         self.roots = sorted(r for r in roots if self.in_code(r))
         self.rootset = set(self.roots)
         # Function extents come only from the linker's table. An extra root (say, a jump into the middle of a
         # function, or one derived from data decoded as code) gets its own copy and never cuts a real function short.
-        self.hard_starts = sorted({r for r in set(m.function_starts) | {m.entry, gm.addr} if self.in_code(r)})
+        self.hard_starts = sorted({r for r in hard if self.in_code(r)})
         # imports
         self.imports: dict[str, int] = {}
+        self._import_names: dict[int, str] = {}
         self.bind_at: dict[int, tuple[str, int]] = {}
         defined = m.defined_by_name()
         for b in m.binds:
             if b.ordinal > 0 or b.ordinal < 0 or b.symbol not in defined:
-                idx = self.imports.setdefault(b.symbol, len(self.imports))
+                idx = self.imports.setdefault(b.symbol, import_base + len(self.imports))
                 self.bind_at[b.addr] = (b.symbol, b.addend)
             else:
                 self.bind_at[b.addr] = (b.symbol, b.addend)
@@ -109,6 +126,39 @@ class World:
             else:
                 self.stubs[a] = ("fn", m.read_u32(ptr))
         self.stub_section = (st.addr, st.end)
+
+    def scan_function_starts(self) -> tuple[set[int], set[int]]:
+        m = self.m
+        prologues = {a for a in m.defined_symbols() if self.in_code(a)}
+        others = set()
+        for r in m.rebases:
+            off = m.vm_to_file(r)
+            if off is not None:
+                v = m.read_u32(r)
+                if self.in_code(v):
+                    others.add(v)
+        pat = re.compile(r"^\s*([0-9a-f]+):\s+(\S+)\s*(.*?)\s*(?:<.*)?$")
+        prev_mn, prev_ops, prev_addr, after_end = "", "", 0, False
+        with open(self.dis, errors="replace") as fh:
+            for line in fh:
+                g = pat.match(line)
+                if not g:
+                    continue
+                a, mn, ops = int(g.group(1), 16), g.group(2), g.group(3)
+                if prev_mn == "push" and prev_ops == "ebp" and mn == "mov" and ops == "ebp, esp":
+                    prologues.add(prev_addr)
+                if after_end and mn not in ("nop", "int3"):
+                    others.add(a)
+                    after_end = False
+                if mn in ("ret", "retl") or (mn == "jmp" and not ops.startswith("0x")):
+                    after_end = True
+                prev_mn, prev_ops, prev_addr = mn, ops, a
+        return prologues, others
+
+    def import_names(self) -> dict[int, str]:
+        if not self._import_names:
+            self._import_names = {i: n for n, i in self.imports.items()}
+        return self._import_names
 
     def in_code(self, a: int) -> bool:
         return any(lo <= a < hi for lo, hi in self.code_ranges)
@@ -241,15 +291,21 @@ def recover_table(fn: Fn, jmp: Ins, order: list[int]) -> list[int] | None:
 
 
 def walk(fn: Fn) -> None:
-    fh = walk.fh
-    lines = W.slice_lines(fn.addr, fn.end, fh)
-    parsed = parse_lines(lines)
-    for i in parsed:
-        if i.addr < fn.end:
-            fn.ins[i.addr] = i
-    if parsed and parsed[-1].next == 0:
-        parsed[-1].next = fn.end
-    order = sorted(fn.ins)
+    # A landing pad's copy shares the parsed instructions of the real function it lives in.
+    i = bisect.bisect_right(W.hard_starts, fn.addr) - 1
+    hard = W.hard_starts[i] if i >= 0 else fn.addr
+    if getattr(walk, "cache_key", None) != hard:
+        lines = W.slice_lines(hard, fn.end, walk.fh)
+        parsed = parse_lines(lines)
+        cache = {}
+        for ins in parsed:
+            if ins.addr < fn.end:
+                cache[ins.addr] = ins
+        if parsed and parsed[-1].next == 0:
+            parsed[-1].next = fn.end
+        walk.cache_key = hard
+        walk.cache = cache
+    fn.ins = walk.cache
     work = [fn.addr]
     seen = fn.reach
     while work:
@@ -276,8 +332,7 @@ def walk(fn: Fn) -> None:
                 else:
                     o = i.ops[0]
                     if o.kind == "r32":
-                        order = sorted(fn.ins)
-                        tb = recover_table(fn, i, order)
+                        tb = recover_table(fn, i, sorted(fn.ins))
                         if tb:
                             fn.tables[a] = tb
                             work.extend(tb)
@@ -353,7 +408,9 @@ def liveness(fn: Fn) -> dict[int, int]:
         for a in order:
             i = fn.reach[a]
             out = 0
-            if i.mn != "call":
+            # "call next; pop reg" only reads the program counter, so flags stay live across it.
+            is_pc_read = i.mn == "call" and i.ops[0].kind == "imm" and (i.ops[0].val & 0xFFFFFFFF) == i.next
+            if i.mn != "call" or is_pc_read:
                 for s in succ[a]:
                     out |= live_in[s]
             r, w = effects[a]
@@ -365,6 +422,60 @@ def liveness(fn: Fn) -> dict[int, int]:
 
 
 # ---------- C emission ----------
+
+FRAME_WAIT_BRANCH = 0x182dffe
+# Functions translated as an immediate return. The first writes Feral's shader usage log at exit through std::ofstream.
+EMPTY_FUNCTIONS = {0x497b0}
+# Called directly by the engine and changing the Direct3D layer's state, so it has to run in order on that layer's thread (runtime/d3d_queue.c).
+D3D_QUEUE_FUNCTIONS = {0x1e4ab50}
+# Ordered loads and stores trap when a value crosses a 16-byte boundary, which costs microseconds each time. These functions walk
+# byte streams with unaligned reads and writes, and none of them coordinates with another thread through that memory, so they use
+# plain accesses. Find more with ARKHAM_TRACE_UNALIGNED=1.
+UNALIGNED_FUNCTIONS = {
+    0x1c05da0,  # launcher: searches a large buffer for a marker, one byte at a time
+    0x2804180,  # LZO decompression of game packages
+    0x1be4870,  # text parser on UTF-16 strings
+    0x1ec4370,  # reads a packed bit stream
+    0x1ec4800,  # constructor of a packed struct array
+    0xe101767e,  # Bink: video block copy
+    0xe1016b5a,  # the same
+    0x378d00,  # package loading: converts names and paths held in packed records
+    0x32dfe0,  # package loading: reads packed records
+}
+# Library calls so frequent and so simple that translated code makes them itself, with the arguments still on the guest stack.
+INLINE_IMPORTS = {
+    "_pthread_getspecific": "eax=rt_tsd_get(c,R32(esp));",
+    "_pthread_setspecific": "rt_tsd_set(c,R32(esp),R32(esp+4));eax=0;",
+    "_memcpy": "{u32 d_=R32(esp);memmove(M+d_,M+R32(esp+4),R32(esp+8));eax=d_;}",
+    "_memset": "{u32 d_=R32(esp);memset(M+d_,(int)R32(esp+4),R32(esp+8));eax=d_;}",
+    "___bzero": "memset(M+R32(esp),0,R32(esp+4));",
+    "_memcmp": "eax=(u32)memcmp(M+R32(esp),M+R32(esp+4),R32(esp+8));",
+    "_strlen": "eax=(u32)strlen((const char*)(M+R32(esp)));",
+    "_wcscmp": "eax=(u32)wcscmp((const wchar_t*)(M+R32(esp)),(const wchar_t*)(M+R32(esp+4)));",
+}
+# These unwind through guest frames, so they need every register in memory.
+NOT_LEAF = {"___cxa_throw", "___cxa_rethrow", "__Unwind_Resume", "___cxa_begin_catch", "___cxa_end_catch", "___cxa_free_exception",
+            "___cxa_allocate_exception", "__ZSt18uncaught_exceptionv"}
+_no_gate: tuple[set[str], set[str]] | None = None
+
+
+def is_leaf_import(name: str) -> bool:
+    """Shims that skip the runtime's lock never run guest code: the list lives in rt_shim_no_gate in runtime/shims_misc.c."""
+    global _no_gate
+    if _no_gate is None:
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runtime", "shims_misc.c")).read()
+        src = src[src.index("int rt_shim_no_gate("):]
+        src = src[:src.index("// Find a shim for a function")]
+        names_part, gl_part = src.split('if (!strncmp(name, "_gl", 3))', 1)
+        _no_gate = (set(re.findall(r'"(_[^"]+)"', names_part)), set(re.findall(r'"(_[^"]+)"', gl_part)))
+    if name in NOT_LEAF:
+        return False
+    if name.startswith("_gl"):
+        return name not in _no_gate[1]
+    return name in _no_gate[0]
+
+
+UNALIGNED_RANGES = [(0x1850000, 0x1870000)]  # UnrealScript: opcodes read their operands from the bytecode stream
 
 CMP_COND = {
     "e": "a==b", "ne": "a!=b", "b": "a<b", "ae": "a>=b", "be": "a<=b", "a": "a>b",
@@ -408,6 +519,12 @@ class Emitter:
         if lo <= t < hi:
             st = W.stubs.get(t)
             if st and st[0] == "imp":
+                name = W.import_names().get(st[1], "")
+                if name in INLINE_IMPORTS:
+                    return INLINE_IMPORTS[name]
+                if is_leaf_import(name):
+                    # The shim reads its arguments through esp and answers in eax and edx. Nothing else needs to reach memory.
+                    return f"esp-=4;R32(esp)={hx(nxt)};c->esp=esp;rt_imp(c,{st[1]});esp=c->esp;eax=c->eax;edx=c->edx;"
                 return f"{pre}rt_imp(c,{st[1]});LOAD;"
             if st and st[0] == "fn":
                 t = st[1]
@@ -513,15 +630,20 @@ class Emitter:
             tb = self.fn.tables.get(a)
             if tb:
                 cases = "".join(f"case {hx(t)}:goto L_{t:x};" for t in sorted(set(tb)))
-                return (f"POLL;switch({rd(o, 4)}){{{cases}"
-                        f'default:SAVE;rt_trap(c,{hx(a)},"jump table miss");return;}}')
+                # A recovered table can be a false match on a tail call through a vtable, so a miss goes to the dispatcher.
+                return (f"POLL;{{u32 jt_={rd(o, 4)};switch(jt_){{{cases}"
+                        f"default:c->jt=jt_;SAVE;__attribute__((musttail)) return rt_dispatch_jt(c);}}}}")
             return f"c->jt={rd(o, 4)};SAVE;__attribute__((musttail)) return rt_dispatch_jt(c);"
         if mn in ("ret", "retn"):
             n = i.ops[0].val if i.ops else 0
             return f"esp+={4 + n}u;SAVE;return;"
         if mn in JCC:
             t = imm_target(i)
-            return f"if({CONDS[mn[1:]][0]}){{{self.jump(i, t)}}}"
+            cond = CONDS[mn[1:]][0]
+            # The engine's frame pacing: this branch means "no time to wait". Taking it always removes the frame limit.
+            if a == FRAME_WAIT_BRANCH:
+                cond = f"rt_no_frame_limit||({cond})"
+            return f"if({cond}){{{self.jump(i, t)}}}"
         if mn == "jecxz":
             return f"if(ecx==0){{{self.jump(i, imm_target(i))}}}"
         if mn == "loop":
@@ -569,7 +691,15 @@ def lift_shard(job):
         external |= fn.external
         unresolved += fn.unresolved
         em = Emitter(fn, stats)
+        emit_module.plain_memory = f in UNALIGNED_FUNCTIONS or any(lo <= f < hi for lo, hi in UNALIGNED_RANGES)
         body = em.run()
+        emit_module.plain_memory = False
+        if f in EMPTY_FUNCTIONS:
+            em.refs = set()
+            body = f"void F_{f:07x}(CPU *restrict c){{c->eax=0;c->esp+=4;}}"
+        if f in D3D_QUEUE_FUNCTIONS:
+            body = body.replace(f"void F_{f:07x}(CPU *restrict c){{", f"static void H_{f:07x}(CPU *restrict c){{", 1)
+            body += f"\nvoid rt_d3dq_function(CPU *c, guest_fn body);\nvoid F_{f:07x}(CPU *restrict c){{rt_d3dq_function(c,H_{f:07x});}}"
         if hooked:
             # The real body becomes H_xxx; F_xxx logs around it and may be overridden in the runtime.
             body = body.replace(f"void F_{f:07x}(CPU *restrict c){{", f"static void H_{f:07x}(CPU *restrict c){{", 1)
@@ -603,7 +733,8 @@ def init_worker(binary, roots):
     W = World(binary, roots)
 
 
-def write_tables(world: World, fnlist: list[int]) -> None:
+def write_tables(world: World, bink: World, bink_base: int) -> None:
+    fnlist = world.roots + bink.roots
     with open(os.path.join(GEN, "fntab.c"), "w") as fh:
         fh.write('#include "rt.h"\n')
         for f in fnlist:
@@ -612,7 +743,8 @@ def write_tables(world: World, fnlist: list[int]) -> None:
         for f in fnlist:
             fh.write(f"{{{f:#x}u,F_{f:07x}}},\n")
         fh.write("};\nconst unsigned rt_fntab_n = sizeof(rt_fntab)/sizeof(rt_fntab[0]);\n")
-    names = sorted(world.imports, key=world.imports.get)
+    # The Bink library's imports continue the game's numbering; a name in both reaches the same shim.
+    names = sorted(world.imports, key=world.imports.get) + sorted(bink.imports, key=bink.imports.get)
     with open(os.path.join(GEN, "imports.c"), "w") as fh:
         fh.write('#include "rt.h"\nconst char *const rt_import_names[] = {\n')
         for n in names:
@@ -620,16 +752,18 @@ def write_tables(world: World, fnlist: list[int]) -> None:
         fh.write("};\nconst unsigned rt_import_n = sizeof(rt_import_names)/sizeof(rt_import_names[0]);\n")
         fh.write("const rt_bind_entry rt_binds[] = {\n")
         count = 0
-        defined = world.m.defined_by_name()
-        for addr, (sym, addend) in sorted(world.bind_at.items()):
-            if sym in world.imports:
-                fh.write(f"{{{addr:#x}u,{world.imports[sym]}u,{addend}}},\n")
-                count += 1
+        for w in (world, bink):
+            for addr, (sym, addend) in sorted(w.bind_at.items()):
+                if sym in w.imports:
+                    fh.write(f"{{{addr:#x}u,{w.imports[sym]}u,{addend}}},\n")
+                    count += 1
         fh.write("};\n")
         fh.write(f"const unsigned rt_binds_n = {count}u;\n")
         fh.write(f"const unsigned rt_entry_addr = {world.m.entry:#x}u;\n")
         mi = world.m.section("__mod_init_func")
         fh.write(f"const unsigned rt_modinit_addr = {mi.addr:#x}u;\nconst unsigned rt_modinit_n = {mi.size // 4}u;\n")
+        ehf = world.m.section("__eh_frame")
+        fh.write(f"const unsigned rt_eh_frame_addr = {ehf.addr:#x}u;\nconst unsigned rt_eh_frame_size = {ehf.size:#x}u;\n")
         for label, sname in (("class", "__class"), ("cat", "__category"), ("msgrefs", "__message_refs")):
             sec = world.m.section(sname, "__OBJC")
             fh.write(f"const unsigned rt_objc_{label}_addr = {sec.addr:#x}u;\nconst unsigned rt_objc_{label}_size = {sec.size:#x}u;\n")
@@ -640,35 +774,51 @@ def write_tables(world: World, fnlist: list[int]) -> None:
         for v, vs, fo, fs in segs:
             fh.write(f"{{{v:#x}u,{vs:#x}u,{fo:#x}u,{fs:#x}u}},\n")
         fh.write("};\n" + f"const unsigned rt_segs_n = {len(segs)}u;\n")
+    # The Bink library: where it goes, what the loader must slide, and a forwarder for each function the game calls.
+    with open(os.path.join(GEN, "bink_tables.c"), "w") as fh:
+        fh.write('#include "shim.h"\n#include "shim_reg.h"\n')
+        fh.write(f"const unsigned rt_bink_base = {bink_base:#x}u;\n")
+        segs = [(s.vmaddr, s.vmsize, s.fileoff, s.filesize) for s in bink.m.segments]
+        fh.write("const rt_seg_entry rt_bink_segs[] = {\n")
+        for v, vs, fo, fs in segs:
+            fh.write(f"{{{v:#x}u,{vs:#x}u,{fo:#x}u,{fs:#x}u}},\n")
+        fh.write("};\n" + f"const unsigned rt_bink_segs_n = {len(segs)}u;\n")
+        fh.write("const unsigned rt_bink_rebases[] = {\n")
+        for r in bink.m.rebases:
+            fh.write(f"{r:#x}u,\n")
+        fh.write("};\n" + f"const unsigned rt_bink_rebases_n = {len(bink.m.rebases)}u;\n")
+        exports = {n: a for n, a in bink.m.defined_by_name().items() if n in world.imports and bink.in_code(a)}
+        for n, a in sorted(exports.items()):
+            # The translated function pops the return address itself, and rt_imp pops it again after a shim returns.
+            fh.write(f"static void fwd{n}(CPU *c) {{ rt_dispatch(c, {a:#x}u); c->esp -= 4; }}\n")
+        fh.write("const ShimReg rt_shims_bink_exports[] = {\n")
+        for n in sorted(exports):
+            fh.write(f'{{"{n}", fwd{n}}},\n')
+        fh.write("{NULL, NULL},\n};\n")
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--jobs", type=int, default=os.cpu_count())
-    ap.add_argument("--shards", type=int, default=0, help="only lift this many shards (smoke test)")
-    ap.add_argument("--max-rounds", type=int, default=8)
-    args = ap.parse_args()
-    binary = game_binary()
-    os.makedirs(GEN, exist_ok=True)
-    os.makedirs(CONFIG, exist_ok=True)
-    roots_file = os.path.join(BUILD, "extra_roots.json")
+BINK_BASE = 0xE1000000
+
+
+def lift_image(binary: str, tag: str, import_base: int, args) -> World:
+    global W
+    roots_file = os.path.join(BUILD, f"extra_roots{tag}.json")
     extra: set[int] = set()
     if os.path.exists(roots_file):
         extra = set(json.load(open(roots_file)))
-    manual = os.path.join(CONFIG, "roots.json")
+    manual = os.path.join(CONFIG, f"roots{tag}.json")
     if os.path.exists(manual):
         extra |= {int(x, 16) for x in json.load(open(manual))}
     ctx = mp.get_context("fork")
     for rnd in range(args.max_rounds):
         t0 = time.time()
-        world = World(binary, extra)
+        world = World(binary, extra, tag, import_base)
         by_shard = collections.defaultdict(list)
         for f in world.roots:
             by_shard[f >> SHARD_BITS].append(f)
         jobs = sorted(by_shard.items())
         if args.shards:
             jobs = jobs[: args.shards]
-        global W
         W = world
         with ctx.Pool(args.jobs) as pool:
             results = pool.map(lift_shard, jobs, chunksize=1)
@@ -689,31 +839,45 @@ def main() -> int:
                 continue
             if world.in_code(t) and t not in world.rootset:
                 new_roots.add(t)
-        for addr, _ in world.stubs.items():
-            pass
         for st in world.stubs.values():
             if st[0] == "fn" and world.in_code(st[1]) and st[1] not in world.rootset:
                 new_roots.add(st[1])
         total_ins = sum(r["n_ins"] for r in results)
-        print(f"round {rnd}: shards={len(results)} functions={sum(r['n_fn'] for r in results)} reachable_ins={total_ins} "
+        print(f"{tag or 'game'} round {rnd}: shards={len(results)} functions={sum(r['n_fn'] for r in results)} reachable_ins={total_ins} "
               f"redecodes={sum(r['redecodes'] for r in results)} new_roots={len(new_roots)} "
-              f"unresolved_jumps={len(unresolved)} changed={sum(r['changed'] for r in results)} {time.time() - t0:.0f}s", flush=True)
+              f"unresolved_jumps={len(unresolved)} changed={sum(r['changed'] for r in results)} {time.time() - t0:.0f}s")
         if args.shards or not new_roots:
             break
         extra |= new_roots
         with open(roots_file, "w") as fh:
             json.dump(sorted(extra), fh)
-    write_tables(world, world.roots)
     report = {
         "functions": len(world.roots), "reachable_instructions": total_ins,
         "imports": len(world.imports), "binds": len(world.bind_at),
         "unresolved_jumps": [hex(x) for x in sorted(unresolved)],
         "stats": dict(stats.most_common()),
     }
-    with open(os.path.join(BUILD, "lift_report.json"), "w") as fh:
+    with open(os.path.join(BUILD, f"lift_report{tag}.json"), "w") as fh:
         json.dump(report, fh, indent=1)
-    print(json.dumps({k: v for k, v in report.items() if k not in ("unresolved_jumps",)}, indent=0)[:6000])
-    print("unresolved sample", report["unresolved_jumps"][:10])
+    print(json.dumps({k: v for k, v in report.items() if k not in ("unresolved_jumps", "stats")}))
+    print("unresolved sample", report["unresolved_jumps"][:10], "unsupported",
+          {k: v for k, v in stats.items() if k.startswith(("unsupported", "trap"))})
+    return world
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--jobs", type=int, default=os.cpu_count())
+    ap.add_argument("--shards", type=int, default=0, help="only lift this many shards (smoke test)")
+    ap.add_argument("--max-rounds", type=int, default=8)
+    args = ap.parse_args()
+    os.makedirs(GEN, exist_ok=True)
+    os.makedirs(CONFIG, exist_ok=True)
+    game = lift_image(game_binary(), "", 0, args)
+    rebased = os.path.join(BUILD, "libBink.rebased.dylib")
+    rebase_dylib(game_bink(), rebased, BINK_BASE)
+    bink = lift_image(rebased, "_bink", len(game.imports), args)
+    write_tables(game, bink, BINK_BASE)
     return 0
 
 

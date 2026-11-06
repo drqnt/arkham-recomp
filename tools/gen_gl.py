@@ -33,7 +33,8 @@ BOUND = {
 # Implemented by hand in shims_gl.c.
 MANUAL = {"glGetString", "glGetStringi", "glMapBuffer", "glMapBufferRange", "glUnmapBuffer", "glFlushMappedBufferRange",
           "glFlushMappedBufferRangeAPPLE", "glShaderSource", "glFenceSync", "glClientWaitSync", "glDeleteSync",
-          "glTransformFeedbackVaryings", "glFinish"}
+          "glTransformFeedbackVaryings", "glFinish", "glCompileShader", "glLinkProgram",
+          "glBindBuffer", "glBindVertexArray", "glDeleteBuffers"}
 
 INTS = {"GLenum", "GLboolean", "GLbitfield", "GLbyte", "GLshort", "GLint", "GLubyte", "GLushort", "GLuint", "GLsizei",
         "GLchar", "GLcharARB", "GLenum", "GLhalf", "GLhandleARB", "GLfixed"}
@@ -161,7 +162,8 @@ def main():
             body += f"RETF({call});"
         else:
             body += f"RET({call});"
-        out.append(f"SHIM({name}) {{ {body} }}")
+        count = "rt_gl_draws++; " if name.startswith("glDraw") and not name.startswith("glDrawBuffer") else ""
+        out.append(f"SHIM({name}) {{ {count}{body} }}")
         regs.append(name)
     out.append("")
     out.append("const ShimReg rt_shims_gl_gen[] = {")

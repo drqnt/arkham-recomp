@@ -10,17 +10,62 @@ SHIM(Znwm) { RET(rt_guest_malloc(ARG(0))); }
 SHIM(ZdlPv) { rt_guest_free(ARG(0)); }
 
 // ---------- static-local guards ----------
-SHIM(__cxa_guard_acquire) { RET(G8(ARG(0)) ? 0 : 1); }
-SHIM(__cxa_guard_release) { G8(ARG(0)) = 1; }
-SHIM(__cxa_guard_abort) {}
+// A function's static: byte 0 means initialized, byte 1 means another thread is doing it now.
+void rt_block_a_little(void);
+void rt_event_notify(void);
+SHIM(__cxa_guard_acquire) {
+    u32 g = ARG(0);
+    while (!G8(g) && G8(g + 1)) rt_block_a_little();
+    if (G8(g)) {
+        RET(0);
+        return;
+    }
+    G8(g + 1) = 1;
+    RET(1);
+}
+SHIM(__cxa_guard_release) {
+    __atomic_store_n((u8 *)GP(ARG(0)), 1, __ATOMIC_RELEASE);
+    G8(ARG(0) + 1) = 0;
+    rt_event_notify();
+}
+SHIM(__cxa_guard_abort) {
+    G8(ARG(0) + 1) = 0;
+    rt_event_notify();
+}
 SHIM(__cxa_pure_virtual) { rt_trap(c, G32(c->esp), "pure virtual call"); }
 
 // ---------- exceptions: reported loudly until a real path needs them ----------
-static const char *type_name(u32 ti) { return ti ? GS(G32(ti + 4)) : "?"; }
+// Typeinfo for fundamental types lives in libstdc++, so here it's an import slot with no name inside.
+static const char *type_name(u32 ti) {
+    if (!ti) return "?";
+    u32 base = 0xEF000000u;
+    if (ti >= base && ti < base + rt_import_n * 64u) return rt_import_names[(ti - base) / 64u];
+    u32 nm = G32(ti + 4);
+    return nm ? GS(nm) : "?";
+}
 SHIM(__cxa_allocate_exception) { RET(rt_guest_malloc(ARG(0) + 128) + 128); }
 SHIM(__cxa_free_exception) {}
+// Unreal reports fatal errors by throwing a string, so show it: it's the engine telling us what went wrong.
+static void print_thrown_string(u32 obj) {
+    u32 p = G32(obj);
+    if (p < 0x1000u || p >= 0xE0000000u) return;
+    char b[1024];
+    int n = 0;
+    const u16a *w = GP(p);
+    // TCHAR here is UTF-16 or UTF-32 depending on the module, so sniff the second code unit.
+    int wide32 = w[1] == 0;
+    if (wide32) {
+        const u32a *q = GP(p);
+        for (; n < 1000 && q[n]; n++) b[n] = q[n] < 128 ? (char)q[n] : '?';
+    } else {
+        for (; n < 1000 && w[n]; n++) b[n] = w[n] < 128 ? (char)w[n] : '?';
+    }
+    b[n] = 0;
+    fprintf(stderr, "*** thrown string: %s\n", b);
+}
 SHIM(__cxa_throw) {
     fprintf(stderr, "\n*** guest threw a C++ exception of type %s\n", type_name(ARG(1)));
+    print_thrown_string(ARG(0));
     rt_trap(c, G32(c->esp), "__cxa_throw");
 }
 SHIM(__cxa_rethrow) { rt_trap(c, G32(c->esp), "__cxa_rethrow"); }
@@ -45,6 +90,8 @@ static u32 tv_si, tv_vmi, tv_class;
 
 static int ti_equal(u32 a, u32 b) {
     if (a == b) return 1;
+    // Typeinfo for library classes is an import slot, which has no name stored inside.
+    if (a >= 0xEF000000u || b >= 0xEF000000u) return 0;
     u32 na = G32(a + 4), nb = G32(b + 4);
     return na == nb || (GS(na)[0] != '*' && !strcmp(GS(na), GS(nb)));
 }
@@ -52,6 +99,7 @@ static int ti_equal(u32 a, u32 b) {
 // Finds dst inside the object whose static type is ti at obj. Returns the guest pointer or 0.
 static u32 find_base(u32 ti, u32 obj, u32 dst) {
     if (ti_equal(ti, dst)) return obj;
+    if (ti >= 0xEF000000u) return 0;
     u32 vp = G32(ti);
     if (vp == tv_si) return find_base(G32(ti + 8), obj, dst);
     if (vp == tv_vmi) {
@@ -73,6 +121,8 @@ static u32 find_base(u32 ti, u32 obj, u32 dst) {
     }
     return 0;
 }
+
+u32 rt_find_base(u32 ti, u32 obj, u32 dst) { return find_base(ti, obj, dst); }
 
 SHIM(__dynamic_cast) {
     u32 src = ARG(0), dst_type = ARG(2);
@@ -105,9 +155,8 @@ static u32 rep_alloc(u32 cap) {
 }
 static void str_release(u32 p) {
     if (p == S_EMPTY) return;
-    i32 rc = (i32)REF(p);
-    if (rc <= 0) rt_guest_free(p - 12);
-    else REF(p) = (u32)(rc - 1);
+    // Inline game code changes this count with lock-prefixed instructions on other threads.
+    if ((i32)__atomic_fetch_sub((u32 *)GP(p - 4), 1, __ATOMIC_SEQ_CST) <= 0) rt_guest_free(p - 12);
 }
 static u32 str_new(const char *s, u32 n, u32 cap) {
     if (!n && !cap) return S_EMPTY;
@@ -121,7 +170,7 @@ static u32 str_new(const char *s, u32 n, u32 cap) {
 static u32 str_share(u32 p) {
     if (p == S_EMPTY) return p;
     if ((i32)REF(p) < 0) return str_new(PCH(p), LEN(p), 0);
-    REF(p)++;
+    __atomic_fetch_add((u32 *)GP(p - 4), 1, __ATOMIC_SEQ_CST);
     return p;
 }
 // Replace the [pos,pos+n1) range of this string with n2 bytes taken from a host copy of s.

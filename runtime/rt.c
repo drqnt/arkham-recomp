@@ -1,11 +1,14 @@
 // Runtime core: guest memory, image loading, dispatch, thread gate, trap reporting, process start.
 #include "rt.h"
+#include <time.h>
+#include <sys/ucontext.h>
 #include "shim.h"
 
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -37,6 +40,31 @@ static void dump_cpu(CPU *c) {
         if (a >= 0x4000u) fprintf(stderr, " %08x", *(u32 *)(rt_mem + a));
     }
     fprintf(stderr, "\n");
+    // Name the C++ objects in the registers and near the top of the stack from their RTTI.
+    u32 regs[8] = {c->eax, c->ecx, c->edx, c->ebx, c->esp, c->ebp, c->esi, c->edi};
+    static const char *const reg_names[8] = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"};
+    for (int i = 0; i < 8; i++) {
+        u32 p = regs[i];
+        if (p < 0x04000000u || p >= 0xE0000000u || (p & 3)) continue;
+        u32 vt = *(u32 *)(rt_mem + p);
+        if (vt < 0x1000u || vt >= 0x04000000u || (vt & 3)) continue;
+        u32 ti = *(u32 *)(rt_mem + vt - 4);
+        if (ti < 0x1000u || ti >= 0x04000000u) continue;
+        u32 nm = *(u32 *)(rt_mem + ti + 4);
+        if (nm < 0x1000u || nm >= 0x04000000u) continue;
+        fprintf(stderr, "  %s %08x is a %.60s\n", reg_names[i], p, (const char *)rt_mem + nm);
+    }
+    for (u32 i = 0; i < 40; i++) {
+        u32 p = *(u32 *)(rt_mem + c->esp + i * 4);
+        if (p < 0x04000000u || p >= 0xE0000000u || (p & 3)) continue;
+        u32 vt = *(u32 *)(rt_mem + p);
+        if (vt < 0x1000u || vt >= 0x04000000u || (vt & 3)) continue;
+        u32 ti = *(u32 *)(rt_mem + vt - 4);
+        if (ti < 0x1000u || ti >= 0x04000000u) continue;
+        u32 nm = *(u32 *)(rt_mem + ti + 4);
+        if (nm < 0x1000u || nm >= 0x04000000u) continue;
+        fprintf(stderr, "  [esp+%x] %08x is a %.60s\n", i * 4, p, (const char *)rt_mem + nm);
+    }
 }
 
 _Noreturn void rt_trap(CPU *c, u32 addr, const char *msg) {
@@ -58,8 +86,95 @@ _Noreturn void rt_unimpl(CPU *c, u32 addr, const char *msg) {
 static __thread CPU *tl_cpu;
 CPU *rt_current_cpu(void) { return tl_cpu; }
 
+int rt_no_frame_limit = 1;  // ARKHAM_FRAME_LIMIT=1 keeps the engine's own limit
+void rt_input_release(void);
+// Load-acquire and store-release fault on a value that crosses a 16-byte boundary. Plain accesses handle those, with fences for
+// the ordering. Returns 1 when the faulting instruction was finished here.
+// ARKHAM_TRACE_UNALIGNED=1 counts these by place and prints the busiest every few seconds: each one costs microseconds, so a
+// loop that keeps landing here should go in UNALIGNED_SITES in tools/lift.py.
+#define UT_N 4096u
+static struct { u64 pc, n; } ut_table[UT_N];
+static int ut_on;
+static void ut_count(u64 pc) {
+    for (u32 i = (u32)(pc >> 2) % UT_N, tries = 0; tries < 64; i = (i + 1) % UT_N, tries++) {
+        u64 cur = __atomic_load_n(&ut_table[i].pc, __ATOMIC_RELAXED);
+        if (!cur && __atomic_compare_exchange_n(&ut_table[i].pc, &cur, pc, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) cur = pc;
+        if (cur == pc) {
+            __atomic_fetch_add(&ut_table[i].n, 1, __ATOMIC_RELAXED);
+            return;
+        }
+    }
+}
+static void *ut_report(void *arg) {
+    (void)arg;
+    static u64 last[UT_N];
+    u64 last_total = 0;
+    for (;;) {
+        sleep(5);
+        u64 total = 0, delta[UT_N];
+        for (u32 i = 0; i < UT_N; i++) {
+            u64 n = ut_table[i].n;
+            total += n;
+            delta[i] = n - last[i];
+            last[i] = n;
+        }
+        if (total == last_total) continue;
+        fprintf(stderr, "[unaligned] %llu in all, %llu since last report\n", total, total - last_total);
+        last_total = total;
+        for (int shown = 0; shown < 14; shown++) {
+            u32 best = UT_N;
+            for (u32 i = 0; i < UT_N; i++)
+                if (delta[i] && (best == UT_N || delta[i] > delta[best])) best = i;
+            if (best == UT_N) break;
+            Dl_info di = {0};
+            const char *nm = dladdr((void *)ut_table[best].pc, &di) && di.dli_sname ? di.dli_sname : "?";
+            fprintf(stderr, "[unaligned]   %10llu %s +%llu\n", delta[best], nm, ut_table[best].pc - (u64)di.dli_saddr);
+            delta[best] = 0;
+        }
+    }
+    return NULL;
+}
+static int finish_unaligned(ucontext_t *uc) {
+    _STRUCT_ARM_THREAD_STATE64 *st = &uc->uc_mcontext->__ss;
+    u32 ins = *(u32 *)st->__pc;
+    if (ut_on) ut_count(st->__pc);
+    u32 rt = ins & 31, rn = (ins >> 5) & 31;
+    int size, load;
+    i64 off = 0;
+    switch (ins & 0xFFFFFC00u) {
+        case 0x78BFC000u: size = 2; load = 1; break;  // ldaprh
+        case 0xB8BFC000u: size = 4; load = 1; break;  // ldapr w
+        case 0x489FFC00u: size = 2; load = 0; break;  // stlrh
+        case 0x889FFC00u: size = 4; load = 0; break;  // stlr w
+        default:
+            switch (ins & 0xFFE00C00u) {
+                case 0x59400000u: size = 2; load = 1; break;  // ldapurh
+                case 0x99400000u: size = 4; load = 1; break;  // ldapur w
+                case 0x59000000u: size = 2; load = 0; break;  // stlurh
+                case 0x99000000u: size = 4; load = 0; break;  // stlur w
+                default: return 0;
+            }
+            off = ((i64)(i32)(ins << 11)) >> 23;
+    }
+    u64 base = rn == 31 ? st->__sp : rn == 29 ? st->__fp : rn == 30 ? st->__lr : st->__x[rn];
+    u8 *p = (u8 *)(base + (u64)off);
+    u64 *reg = rt < 29 ? &st->__x[rt] : rt == 29 ? &st->__fp : &st->__lr;
+    u32 v = 0;
+    if (load) {
+        memcpy(&v, p, (size_t)size);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (rt != 31) *reg = v;
+    } else {
+        if (rt != 31) v = (u32)*reg;
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        memcpy(p, &v, (size_t)size);
+    }
+    st->__pc += 4;
+    return 1;
+}
 static void on_fault(int sig, siginfo_t *si, void *ctx) {
-    (void)ctx;
+    if (sig == SIGBUS && ctx && finish_unaligned(ctx)) return;
+    rt_input_release();  // never leave the player's pointer frozen
     u64 fault = (u64)si->si_addr;
     u64 base = (u64)rt_mem;
     fprintf(stderr, "\n*** signal %d, host fault address %#llx", sig, fault);
@@ -67,6 +182,19 @@ static void on_fault(int sig, siginfo_t *si, void *ctx) {
     if (dladdr((void *)fault, &di) && di.dli_sname) fprintf(stderr, " (%s in %s)", di.dli_sname, di.dli_fname);
     if (fault >= base && fault < base + (1ull << 32)) fprintf(stderr, " = guest %08x", (u32)(fault - base));
     fprintf(stderr, "\n");
+    // A backtrace walks saved frame pointers, so it skips the function that actually faulted: name it from the context.
+    ucontext_t *uc = ctx;
+    if (uc && uc->uc_mcontext) {
+        u64 pc = uc->uc_mcontext->__ss.__pc;
+        Dl_info pi;
+        if (dladdr((void *)pc, &pi) && pi.dli_sname)
+            fprintf(stderr, "  faulted in %s + %llu (pc %#llx)\n", pi.dli_sname, pc - (u64)pi.dli_saddr, pc);
+        fprintf(stderr, "  native x0-x3: %llx %llx %llx %llx lr %llx\n", uc->uc_mcontext->__ss.__x[0], uc->uc_mcontext->__ss.__x[1],
+                uc->uc_mcontext->__ss.__x[2], uc->uc_mcontext->__ss.__x[3], uc->uc_mcontext->__ss.__lr);
+        fprintf(stderr, "  native w8-w17:");
+        for (int i = 8; i < 18; i++) fprintf(stderr, " %08x", (u32)uc->uc_mcontext->__ss.__x[i]);
+        fprintf(stderr, "\n");
+    }
     if (tl_cpu) dump_cpu(tl_cpu);
     dump_backtrace();
     fflush(stderr);
@@ -79,7 +207,14 @@ typedef void (*shim_fn)(CPU *);
 static shim_fn dyn_table[DYN_MAX];
 static u32 dyn_args[DYN_MAX];
 static u32 dyn_n;
-u32 rt_dyn_cur_arg;
+__thread u32 rt_dyn_cur_arg;
+static __thread int tl_holding;
+static u8 dyn_no_gate[DYN_MAX];
+static u8 dyn_glq[DYN_MAX];
+static const char *dyn_names[DYN_MAX];
+u8 rt_glq_kind(const char *name);
+int rt_glq_route(CPU *c, void (*f)(CPU *), u8 kind, int gated, const char *name);
+int rt_shim_no_gate(const char *name);
 
 u32 rt_dyn_import_arg(shim_fn fn, u32 arg) {
     if (dyn_n == DYN_MAX) return 0;
@@ -87,16 +222,25 @@ u32 rt_dyn_import_arg(shim_fn fn, u32 arg) {
     dyn_args[dyn_n] = arg;
     return IMP_BASE + (rt_import_n + dyn_n++) * IMP_STEP;
 }
+// For a shim that handles its own locking, with a value it reads from rt_dyn_cur_arg.
+u32 rt_dyn_import_nogate(shim_fn fn, u32 arg) {
+    if (dyn_n < DYN_MAX) dyn_no_gate[dyn_n] = 1;
+    return rt_dyn_import_arg(fn, arg);
+}
 u32 rt_dyn_import(const char *name, shim_fn fn) {
-    (void)name;
     for (u32 i = 0; i < dyn_n; i++)
         if (dyn_table[i] == fn) return IMP_BASE + (rt_import_n + i) * IMP_STEP;
+    if (dyn_n < DYN_MAX) {
+        dyn_no_gate[dyn_n] = (u8)rt_shim_no_gate(name);
+        dyn_glq[dyn_n] = rt_glq_kind(name);
+        dyn_names[dyn_n] = name ? strdup(name) : NULL;
+    }
     return rt_dyn_import_arg(fn, 0);
 }
 
 // ---------- function table ----------
 
-#define HT_BITS 19
+#define HT_BITS 20
 #define HT_SIZE (1u << HT_BITS)
 static struct { u32 addr; guest_fn fn; } *ht;
 
@@ -122,6 +266,8 @@ static inline guest_fn ht_lookup(u32 a) {
     }
 }
 
+guest_fn rt_guest_fn(u32 addr) { return ht_lookup(addr); }
+
 void rt_dispatch(CPU *c, u32 t) {
     guest_fn f = ht_lookup(t);
     if (__builtin_expect(f != NULL, 1)) {
@@ -134,20 +280,34 @@ void rt_dispatch(CPU *c, u32 t) {
     }
     if (t >= IMP_BASE + rt_import_n * IMP_STEP && t < IMP_BASE + (rt_import_n + dyn_n) * IMP_STEP) {
         u32 k = (t - IMP_BASE) / IMP_STEP - rt_import_n;
+        if (dyn_glq[k] && rt_glq_route(c, dyn_table[k], dyn_glq[k], !dyn_no_gate[k], dyn_names[k])) {
+            c->esp += 4;
+            return;
+        }
+        int lock = !dyn_no_gate[k] && !tl_holding;
+        if (lock) rt_gate_acquire();
         rt_dyn_cur_arg = dyn_args[k];
         dyn_table[k](c);
+        if (lock) rt_gate_release();
         c->esp += 4;
         return;
     }
     if (t == RT_HOST_RETURN) return;
     // A guest function pointer to a host callback slot.
-    if (rt_host_thunk_dispatch(c, t)) return;
+    {
+        int lock = !tl_holding;
+        if (lock) rt_gate_acquire();
+        int done = rt_host_thunk_dispatch(c, t);
+        if (lock) rt_gate_release();
+        if (done) return;
+    }
     rt_trap(c, t, "indirect transfer to an unknown address (add it to config/roots.json)");
 }
 
 void rt_dispatch_jt(CPU *restrict c) { rt_dispatch(c, c->jt); }
 
 // Call a guest function from host code using the guest cdecl convention.
+static int rt_serial;  // ARKHAM_SERIAL=1 on a tools/build.py --serial binary: one guest thread at a time, for telling threading bugs from others
 u32 rt_call_guest(CPU *c, u32 addr, int nargs, const u32 *args) {
     u8 *M = rt_mem;
     u32 esp = c->esp;
@@ -158,7 +318,11 @@ u32 rt_call_guest(CPU *c, u32 addr, int nargs, const u32 *args) {
     esp -= 4;
     *(u32a *)(M + esp) = RT_HOST_RETURN;
     c->esp = esp;
+    // Guest code runs in parallel: the lock protects only the runtime's own state, not this call.
+    int relock = tl_holding && !rt_serial;
+    if (relock) rt_gate_release();
     rt_dispatch(c, addr);
+    if (relock) rt_gate_acquire();
     c->esp = saved;
     return c->eax;
 }
@@ -187,10 +351,42 @@ static void imp_missing(CPU *c, u32 idx) {
     _exit(73);
 }
 
+// ARKHAM_TRACE_IMPORTS: calls per second of each import, to see which shims are hot.
+static u32 *imp_counts;
+static void imp_count(u32 idx) {
+    imp_counts[idx]++;
+    static u64 last;
+    u64 now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000000;
+    if (now - last < 10) return;
+    last = now;
+    fprintf(stderr, "[imports]");
+    for (int n = 0; n < 150; n++) {
+        u32 best = 0;
+        for (u32 i = 1; i < rt_import_n; i++)
+            if (imp_counts[i] > imp_counts[best]) best = i;
+        if (!imp_counts[best]) break;
+        fprintf(stderr, " %s:%u", rt_import_names[best], imp_counts[best] / 10);
+        imp_counts[best] = 0;
+    }
+    fprintf(stderr, "\n");
+    memset(imp_counts, 0, rt_import_n * sizeof(u32));
+}
+static u8 *imp_no_gate;
+static u8 *imp_glq;
+u8 rt_glq_kind(const char *name);
+int rt_glq_route(CPU *c, void (*f)(CPU *), u8 kind, int gated, const char *name);
 void rt_imp(CPU *c, u32 idx) {
     shim_fn f = imp_table[idx];
+    if (__builtin_expect(imp_counts != NULL, 0)) imp_count(idx);
+    if (imp_glq[idx] && f && rt_glq_route(c, f, imp_glq[idx], !imp_no_gate[idx], rt_import_names[idx])) {
+        c->esp += 4;
+        return;
+    }
+    int lock = !imp_no_gate[idx] && !tl_holding;
+    if (lock) rt_gate_acquire();
     if (f) f(c);
     else imp_missing(c, idx);
+    if (lock) rt_gate_release();
     c->esp += 4;  // pop the return address, as the callee's ret would have
 }
 
@@ -207,14 +403,16 @@ u32 rt_import_addr(const char *name) {
 
 // ---------- thread gate: at most one thread runs guest code at a time ----------
 
-// A fair ticket lock. Each ticket sleeps on its own condition variable, so a release wakes only the next thread.
-// rt_gate_wait is the flag guest code polls: a small timer thread raises it once per time slice while anyone waits.
+// In normal running this is a plain lock around shims that touch shared runtime state, and guest code runs in parallel.
+// With ARKHAM_SERIAL=1 it is the old gate: a fair ticket lock held while guest code runs. Each ticket sleeps on its own
+// condition variable, and a small timer thread raises rt_gate_wait, which guest code polls, once per time slice.
 #define GATE_CVS 64
+#include <os/lock.h>
+static os_unfair_lock gate_fast = OS_UNFAIR_LOCK_INIT;
 static pthread_mutex_t gate_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t gate_cv[GATE_CVS];
 static u64 gate_next, gate_serving;
 static u32 gate_waiters;
-static __thread int tl_holding;
 
 int rt_gate_held(void) { return tl_holding; }
 
@@ -228,6 +426,8 @@ static void *gate_slicer(void *arg) {
 }
 
 static void gate_init(void) {
+    rt_serial = getenv("ARKHAM_SERIAL") != NULL;
+    if (!rt_serial) return;
     for (int i = 0; i < GATE_CVS; i++) pthread_cond_init(&gate_cv[i], NULL);
     pthread_t t;
     pthread_create(&t, NULL, gate_slicer, NULL);
@@ -235,6 +435,11 @@ static void gate_init(void) {
 }
 
 void rt_gate_acquire(void) {
+    if (!rt_serial) {
+        os_unfair_lock_lock(&gate_fast);
+        tl_holding = 1;
+        return;
+    }
     tl_holding = 1;
     pthread_mutex_lock(&gate_mu);
     u64 me = gate_next++;
@@ -244,8 +449,18 @@ void rt_gate_acquire(void) {
     pthread_mutex_unlock(&gate_mu);
 }
 
+// For a thread that another one is synchronously waiting on: in serial mode, ask whoever runs now to yield at once.
+void rt_gate_acquire_now(void) {
+    if (rt_serial) __atomic_store_n(&rt_gate_wait, 1, __ATOMIC_RELAXED);
+    rt_gate_acquire();
+}
+
 void rt_gate_release(void) {
     tl_holding = 0;
+    if (!rt_serial) {
+        os_unfair_lock_unlock(&gate_fast);
+        return;
+    }
     pthread_mutex_lock(&gate_mu);
     gate_serving++;
     pthread_cond_broadcast(&gate_cv[gate_serving % GATE_CVS]);
@@ -253,6 +468,13 @@ void rt_gate_release(void) {
 }
 
 void rt_gate_yield(void) {
+    if (!rt_serial) {
+        int held = tl_holding;
+        if (held) rt_gate_release();
+        sched_yield();
+        if (held) rt_gate_acquire();
+        return;
+    }
     __atomic_store_n(&rt_gate_wait, 0, __ATOMIC_RELAXED);
     if (!__atomic_load_n(&gate_waiters, __ATOMIC_RELAXED)) return;
     rt_gate_release();
@@ -321,15 +543,45 @@ void rt_st80(u8 *p, double v) {
 // ---------- guest memory layout ----------
 
 static void map_guest(void) {
-    void *p = mmap(NULL, 1ull << 32, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
-    if (p == MAP_FAILED) {
-        perror("reserving 4 GB of guest address space");
+    void *p = mmap((void *)RT_MEM_BASE, 1ull << 32, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    if (p != (void *)RT_MEM_BASE) {
+        fprintf(stderr, "could not reserve 4 GB of guest address space at %#llx (got %p)\n", RT_MEM_BASE, p);
         exit(1);
     }
     rt_mem = p;
 }
 
 const u8 *rt_header_bytes;
+
+// The Bink library goes at its fixed address and gets slid the way dyld would slide it.
+static void load_bink(const char *game_path) {
+    char path[1200];
+    const char *macos = strstr(game_path, "/MacOS/");
+    if (!macos) {
+        fprintf(stderr, "*** can't work out where the Bink library is from %s\n", game_path);
+        exit(1);
+    }
+    snprintf(path, sizeof path, "%.*s/Frameworks/libBinkMacx86.dylib", (int)(macos - game_path), game_path);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror(path);
+        exit(1);
+    }
+    for (unsigned i = 0; i < rt_bink_segs_n; i++) {
+        const rt_seg_entry *s = &rt_bink_segs[i];
+        size_t got = 0;
+        while (got < s->filesize) {
+            ssize_t r = pread(fd, rt_mem + s->vmaddr + got, s->filesize - got, (off_t)(s->fileoff + got));
+            if (r <= 0) {
+                perror("reading the Bink library");
+                exit(1);
+            }
+            got += (size_t)r;
+        }
+    }
+    close(fd);
+    for (unsigned i = 0; i < rt_bink_rebases_n; i++) *(u32a *)(rt_mem + rt_bink_rebases[i]) += rt_bink_base;
+}
 
 static void load_image(const char *path) {
     int fd = open(path, O_RDONLY);
@@ -355,6 +607,7 @@ static void load_image(const char *path) {
     u8 *hdr = malloc(0xC000);
     memcpy(hdr, rt_mem + 0x1000, 0xC000);
     rt_header_bytes = hdr;
+    load_bink(path);
     for (unsigned i = 0; i < rt_binds_n; i++) {
         u32 v = IMP_BASE + rt_binds[i].import * IMP_STEP + (u32)rt_binds[i].addend;
         *(u32a *)(rt_mem + rt_binds[i].addr) = v;
@@ -423,6 +676,9 @@ static void *guest_main(void *arg) {
     }
     fprintf(stderr, "[rt] entering game start at %08x\n", rt_entry_addr);
     c->esp = esp;
+    if (!rt_serial) rt_gate_release();
+    void rt_d3dq_start(void);
+    rt_d3dq_start();
     rt_dispatch(c, rt_entry_addr);
     fprintf(stderr, "[rt] start returned\n");
     exit(0);
@@ -444,6 +700,14 @@ int main(int argc, char **argv) {
     imp_seen = calloc(rt_import_n, 1);
     rt_register_shims(imp_table);
     stub_all = getenv("ARKHAM_STUB_ALL") != NULL;
+    if (getenv("ARKHAM_TRACE_IMPORTS")) imp_counts = calloc(rt_import_n + 1, sizeof(u32));
+    imp_no_gate = calloc(rt_import_n + 1, 1);
+    imp_glq = calloc(rt_import_n + 1, 1);
+    for (unsigned i = 0; i < rt_import_n; i++) {
+        imp_no_gate[i] = (u8)rt_shim_no_gate(rt_import_names[i]);
+        imp_glq[i] = rt_glq_kind(rt_import_names[i]);
+    }
+    rt_no_frame_limit = getenv("ARKHAM_FRAME_LIMIT") == NULL;
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -456,6 +720,14 @@ int main(int argc, char **argv) {
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGABRT, &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);
+    void rt_hitch_start(void);
+    rt_hitch_start();
+    if (getenv("ARKHAM_TRACE_UNALIGNED")) {
+        ut_on = 1;
+        pthread_t t;
+        pthread_create(&t, NULL, ut_report, NULL);
+        pthread_detach(t);
+    }
 
     // Guest code runs on the real main thread because AppKit requires it. Translated functions mirror guest
     // calls on the native stack, so the linker gives the main thread a large one (see tools/build.py).

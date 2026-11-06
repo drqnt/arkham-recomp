@@ -1,10 +1,12 @@
-// pthreads, semaphores, atomics and GCD. Only one thread runs guest code at a time, so every primitive
-// is plain state in guest memory plus one host-side "something changed" event to sleep on.
+// pthreads, semaphores, atomics and GCD. Guest threads run in parallel. Mutexes and condition variables keep their state in guest
+// memory with atomic operations and sleep on a bucket chosen by address; rarer waits use one "something changed" event.
 #include "shim.h"
 #include "shim_reg.h"
 
 #include <errno.h>
 #include <pthread.h>
+#include <pthread/qos.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/time.h>
@@ -23,6 +25,7 @@ void rt_event_notify(void) {
 }
 
 // Give up the gate until something changes or a short timeout passes.
+void rt_block_a_little(void);
 static void block_a_little(void) {
     pthread_mutex_lock(&ev_mu);
     u64 g = ev_gen;
@@ -43,6 +46,40 @@ static void block_a_little(void) {
     rt_gate_acquire();
 }
 
+void rt_block_a_little(void) { block_a_little(); }
+
+// Threads sleep on a bucket picked by the address they wait for. A waker changes the state first and only then looks for sleepers;
+// a sleeper registers first and only then checks the state. Sequentially consistent operations make one of them see the other.
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    u32 waiters;
+} Park;
+#define PARK_N 64
+static Park parks[PARK_N] = {[0 ... PARK_N - 1] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0}};
+static inline Park *park_of(u64 a) { return &parks[((u32)(a >> 2) * 2654435761u) >> 26]; }
+static inline void park_wake(u64 a) {
+    Park *p = park_of(a);
+    if (__atomic_load_n(&p->waiters, __ATOMIC_SEQ_CST)) {
+        pthread_mutex_lock(&p->mu);
+        pthread_cond_broadcast(&p->cv);
+        pthread_mutex_unlock(&p->mu);
+    }
+}
+// These primitives skip the shim lock, but in ARKHAM_SERIAL mode the thread holds the gate and must give it up to sleep.
+static inline void park_enter(Park *p, int *held) {
+    *held = rt_gate_held();
+    if (*held) rt_gate_release();
+    pthread_mutex_lock(&p->mu);
+    __atomic_add_fetch(&p->waiters, 1, __ATOMIC_SEQ_CST);
+}
+static inline void park_leave(Park *p, int held) {
+    __atomic_sub_fetch(&p->waiters, 1, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&p->mu);
+    if (held) rt_gate_acquire();
+}
+static inline void cpu_relax(void) { __asm__ volatile("isb"); }
+
 // ---------- per-thread data ----------
 #define MAX_KEYS 512
 typedef struct GThread {
@@ -52,6 +89,7 @@ typedef struct GThread {
     u32 retval;
     int done;
     int detached;
+    int suspended;
     u32 tsd[MAX_KEYS];
     u32 tls;
     pthread_t host;
@@ -65,13 +103,16 @@ static u32 key_used[MAX_KEYS];
 
 #define TID_BASE 0xED000000u
 
+static pthread_mutex_t tid_mu = PTHREAD_MUTEX_INITIALIZER;
 static GThread *self_thread(void) {
     if (!tl_self) {
         GThread *t = calloc(1, sizeof *t);
         t->cpu = rt_current_cpu();
-        t->id = next_tid++;
         t->host = pthread_self();
+        pthread_mutex_lock(&tid_mu);
+        t->id = next_tid++;
         threads[t->id] = t;
+        pthread_mutex_unlock(&tid_mu);
         tl_self = t;
     }
     return tl_self;
@@ -99,26 +140,45 @@ SHIM(pthread_mutex_init) {
     RET(0);
 }
 SHIM(pthread_mutex_destroy) { RET(0); }
+static inline int owner_take(u32 *own, u32 me) {
+    u32 cur = 0;
+    return __atomic_compare_exchange_n(own, &cur, me, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED);
+}
 static int mutex_lock(u32 m) {
     u32 me = to_tid(self_thread());
-    if (M_OWNER(m) == me) {
-        if (M_TYPE(m) == PTM_RECURSIVE) {
-            M_COUNT(m)++;
-            return 0;
+    u32 *own = (u32 *)GP(m + 4);
+    if (!owner_take(own, me)) {
+        if (__atomic_load_n(own, __ATOMIC_RELAXED) == me) {
+            if (M_TYPE(m) == PTM_RECURSIVE) {
+                M_COUNT(m)++;
+                return 0;
+            }
+            return 11;  // EDEADLK
         }
-        return 11;  // EDEADLK
+        // Most critical sections are short, so spin briefly before sleeping.
+        int got = 0;
+        for (int i = 0; i < 200 && !got; i++) {
+            cpu_relax();
+            got = !__atomic_load_n(own, __ATOMIC_RELAXED) && owner_take(own, me);
+        }
+        if (!got) {
+            Park *p = park_of(m);
+            int held;
+            park_enter(p, &held);
+            while (!owner_take(own, me)) pthread_cond_wait(&p->cv, &p->mu);
+            park_leave(p, held);
+        }
     }
-    while (M_OWNER(m)) block_a_little();
-    M_OWNER(m) = me;
     M_COUNT(m) = 1;
     return 0;
 }
 static int mutex_unlock(u32 m) {
     u32 me = to_tid(self_thread());
-    if (M_OWNER(m) != me) return 1;
+    u32 *own = (u32 *)GP(m + 4);
+    if (__atomic_load_n(own, __ATOMIC_RELAXED) != me) return 1;
     if (--M_COUNT(m) == 0) {
-        M_OWNER(m) = 0;
-        rt_event_notify();
+        __atomic_store_n(own, 0, __ATOMIC_SEQ_CST);
+        park_wake(m);
     }
     return 0;
 }
@@ -127,55 +187,56 @@ SHIM(pthread_mutex_unlock) { RET(mutex_unlock(ARG(0))); }
 SHIM(pthread_mutex_trylock) {
     u32 m = ARG(0);
     u32 me = to_tid(self_thread());
-    if (M_OWNER(m) == me && M_TYPE(m) == PTM_RECURSIVE) {
-        M_COUNT(m)++;
-        RET(0);
-    } else if (M_OWNER(m)) {
-        RET(16);
-    } else {
-        M_OWNER(m) = me;
+    u32 *own = (u32 *)GP(m + 4);
+    if (owner_take(own, me)) {
         M_COUNT(m) = 1;
         RET(0);
+    } else if (__atomic_load_n(own, __ATOMIC_RELAXED) == me && M_TYPE(m) == PTM_RECURSIVE) {
+        M_COUNT(m)++;
+        RET(0);
+    } else {
+        RET(16);
     }
 }
 
 // ---------- condition variables: a generation counter; POSIX allows spurious wakeups ----------
-#define C_GEN(cv) G32((cv) + 4)
+#define C_GEN(cv) ((u32 *)GP((cv) + 4))
 SHIM(pthread_cond_init) { memset(GP(ARG(0)), 0, 28); RET(0); }
 SHIM(pthread_cond_destroy) { RET(0); }
-SHIM(pthread_cond_signal) { C_GEN(ARG(0))++; rt_event_notify(); RET(0); }
-SHIM(pthread_cond_broadcast) { C_GEN(ARG(0))++; rt_event_notify(); RET(0); }
-SHIM(pthread_cond_wait) {
-    u32 cv = ARG(0), m = ARG(1);
-    u32 g = C_GEN(cv);
-    u32 cnt = M_COUNT(m);
-    M_COUNT(m) = 1;
-    mutex_unlock(m);
-    while (C_GEN(cv) == g) block_a_little();
-    mutex_lock(m);
-    M_COUNT(m) = cnt;
-    RET(0);
+static void cond_wake(u32 cv) {
+    __atomic_add_fetch(C_GEN(cv), 1, __ATOMIC_SEQ_CST);
+    park_wake(cv);
 }
-SHIM(pthread_cond_timedwait) {
-    u32 cv = ARG(0), m = ARG(1), ts = ARG(2);
-    u64 deadline = (u64)G32(ts) * 1000000ull + G32(ts + 4) / 1000;
-    u32 g = C_GEN(cv);
+SHIM(pthread_cond_signal) { cond_wake(ARG(0)); RET(0); }
+SHIM(pthread_cond_broadcast) { cond_wake(ARG(0)); RET(0); }
+// The caller still holds the mutex when it reads the generation, so a signal sent after it unlocks is seen.
+static u32 cond_sleep(u32 cv, u32 m, const struct timespec *deadline) {
+    u32 g = __atomic_load_n(C_GEN(cv), __ATOMIC_SEQ_CST);
     u32 cnt = M_COUNT(m);
     M_COUNT(m) = 1;
     mutex_unlock(m);
+    Park *p = park_of(cv);
+    int held;
     u32 rc = 0;
-    while (C_GEN(cv) == g) {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        if ((u64)tv.tv_sec * 1000000ull + (u64)tv.tv_usec >= deadline) {
-            rc = 60;
+    park_enter(p, &held);
+    while (__atomic_load_n(C_GEN(cv), __ATOMIC_SEQ_CST) == g) {
+        if (!deadline) {
+            pthread_cond_wait(&p->cv, &p->mu);
+        } else if (pthread_cond_timedwait(&p->cv, &p->mu, deadline) == ETIMEDOUT) {
+            if (__atomic_load_n(C_GEN(cv), __ATOMIC_SEQ_CST) == g) rc = 60;
             break;
         }
-        block_a_little();
     }
+    park_leave(p, held);
     mutex_lock(m);
     M_COUNT(m) = cnt;
-    RET(rc);
+    return rc;
+}
+SHIM(pthread_cond_wait) { RET(cond_sleep(ARG(0), ARG(1), NULL)); }
+SHIM(pthread_cond_timedwait) {
+    u32 ts = ARG(2);
+    struct timespec deadline = {(time_t)(i32)G32(ts), (long)G32(ts + 4)};
+    RET(cond_sleep(ARG(0), ARG(1), &deadline));
 }
 
 // ---------- thread lifetime ----------
@@ -183,6 +244,7 @@ static void *thread_tramp(void *p) {
     GThread *t = p;
     rt_gate_acquire();
     tl_self = t;
+    while (t->suspended) block_a_little();
     CPU *c = rt_new_cpu(2u << 20);
     t->cpu = c;
     u32 a[1] = {t->arg};
@@ -195,21 +257,45 @@ static void *thread_tramp(void *p) {
 SHIM(pthread_attr_init) { memset(GP(ARG(0)), 0, 40); RET(0); }
 SHIM(pthread_attr_destroy) { RET(0); }
 SHIM(pthread_attr_setstacksize) { RET(0); }
+static int suspended_create;
 SHIM(pthread_create) {
     GThread *t = calloc(1, sizeof *t);
-    t->id = next_tid++;
     t->start = ARG(2);
     t->arg = ARG(3);
+    t->suspended = suspended_create;
+    pthread_mutex_lock(&tid_mu);
+    t->id = next_tid++;
     threads[t->id] = t;
+    pthread_mutex_unlock(&tid_mu);
     G32(ARG(0)) = to_tid(t);
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 64u << 20);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    // The default class may land on efficiency cores, and the frame rate depends on these threads.
+    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
     int r = pthread_create(&t->host, &attr, thread_tramp, t);
     if (getenv("ARKHAM_TRACE_THREADS")) fprintf(stderr, "[thread] created %u start=%08x\n", t->id, t->start);
     RET(r);
 }
+// The Bink library starts its threads suspended. A thread's Mach port is its id here, so thread_resume can find it.
+SHIM(pthread_create_suspended_np) {
+    suspended_create = 1;
+    shim_pthread_create(c);
+    suspended_create = 0;
+}
+SHIM(thread_resume) {
+    GThread *t = from_tid(ARG(0));
+    if (t) t->suspended = 0;
+    rt_event_notify();
+    RET(0);
+}
+SHIM(thread_policy_set) { RET(0); }
+static void yield_now(void) {
+    if (rt_gate_held()) rt_gate_yield();
+    else sched_yield();
+}
+SHIM(pthread_yield_np) { yield_now(); RET(0); }
 SHIM(pthread_join) {
     GThread *t = from_tid(ARG(0));
     if (!t) {
@@ -231,7 +317,16 @@ SHIM(pthread_exit) {
     rt_gate_release();
     pthread_exit(NULL);
 }
-SHIM(pthread_main_np) { RET(self_thread()->id == 1); }
+// The game hops to the main thread for a few queries that are only reads: the window's frame, whether it is key and the mouse
+// position. It does that hundreds of times a second, and each hop stalls the game thread, so these places run where they are.
+SHIM(pthread_main_np) {
+    u32 from = G32(c->esp);
+    if (from == 0x1c51020u || from == 0x1c50a23u || from == 0x1c40d76u) {
+        RET(1);
+        return;
+    }
+    RET(self_thread()->id == 1);
+}
 SHIM(pthread_kill) { RET(0); }
 SHIM(pthread_cancel) { RET(0); }
 SHIM(pthread_setname_np) { RET(0); }
@@ -240,7 +335,7 @@ SHIM(pthread_getschedparam) { G32(ARG(1)) = 1; G32(ARG(2)) = 31; RET(0); }
 SHIM(pthread_setschedparam) { RET(0); }
 SHIM(sched_get_priority_max) { RET(47); }
 SHIM(sched_get_priority_min) { RET(15); }
-SHIM(sched_yield) { rt_gate_yield(); RET(0); }
+SHIM(sched_yield) { yield_now(); RET(0); }
 SHIM(pthread_mach_thread_np) { RET(ARG(0)); }
 SHIM(mach_thread_self) { RET(to_tid(self_thread())); }
 SHIM(mach_port_deallocate) { RET(0); }
@@ -260,14 +355,33 @@ SHIM(pthread_key_create) {
     RET(35);
 }
 SHIM(pthread_key_delete) { if (ARG(0) < MAX_KEYS) key_used[ARG(0)] = 0; RET(0); }
-SHIM(pthread_getspecific) { RET(ARG(0) < MAX_KEYS ? self_thread()->tsd[ARG(0)] : 0); }
-SHIM(pthread_setspecific) { if (ARG(0) < MAX_KEYS) self_thread()->tsd[ARG(0)] = ARG(1); RET(0); }
+_Static_assert(MAX_KEYS == RT_TSD_MAX, "translated code knows the slot count");
+u32 rt_tsd_get_slow(CPU *c, u32 k) {
+    c->tsd = self_thread()->tsd;
+    return k < MAX_KEYS ? c->tsd[k] : 0;
+}
+void rt_tsd_set_slow(CPU *c, u32 k, u32 v) {
+    c->tsd = self_thread()->tsd;
+    if (k < MAX_KEYS) c->tsd[k] = v;
+}
+SHIM(pthread_getspecific) { RET(rt_tsd_get(c, ARG(0))); }
+SHIM(pthread_setspecific) { rt_tsd_set(c, ARG(0), ARG(1)); RET(0); }
 SHIM(pthread_once) {
     u32 o = ARG(0);
-    if (G32(o + 4) != 0x1BADC0DE) {
-        G32(o + 4) = 0x1BADC0DE;
-        rt_call_guest(c, ARG(1), 0, NULL);
+    // Whoever comes second waits for the first to finish, because it relies on what the routine set up.
+    if (G32(o + 4) == 0x1BADC0DE) {
+        RET(0);
+        return;
     }
+    if (G32(o + 4) == 0x1BADC0DD) {
+        while (G32(o + 4) != 0x1BADC0DE) block_a_little();
+        RET(0);
+        return;
+    }
+    G32(o + 4) = 0x1BADC0DD;
+    rt_call_guest(c, ARG(1), 0, NULL);
+    G32(o + 4) = 0x1BADC0DE;
+    rt_event_notify();
     RET(0);
 }
 
@@ -297,71 +411,85 @@ SHIM(sem_open) {
 }
 SHIM(sem_close) { rt_handle_free(ARG(0)); RET(0); }
 SHIM(sem_unlink) { RET(0); }
-SHIM(sem_post) { NSem *s = rt_handle_get(ARG(0)); s->count++; rt_event_notify(); RET(0); }
-SHIM(sem_wait) {
-    NSem *s = rt_handle_get(ARG(0));
-    while (s->count <= 0) block_a_little();
-    s->count--;
-    RET(0);
+static inline int sem_take(NSem *s) {
+    int n = __atomic_load_n(&s->count, __ATOMIC_SEQ_CST);
+    while (n > 0)
+        if (__atomic_compare_exchange_n(&s->count, &n, n - 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return 1;
+    return 0;
 }
+static void sem_give(NSem *s) {
+    __atomic_add_fetch(&s->count, 1, __ATOMIC_SEQ_CST);
+    park_wake((u64)s);
+}
+// Returns 0 once taken, 1 when the deadline passed. A NULL deadline waits for good.
+static int sem_sleep(NSem *s, const struct timespec *deadline) {
+    if (sem_take(s)) return 0;
+    Park *p = park_of((u64)s);
+    int held, rc = 0;
+    park_enter(p, &held);
+    while (!sem_take(s)) {
+        if (!deadline) {
+            pthread_cond_wait(&p->cv, &p->mu);
+        } else if (pthread_cond_timedwait(&p->cv, &p->mu, deadline) == ETIMEDOUT) {
+            rc = !sem_take(s);
+            break;
+        }
+    }
+    park_leave(p, held);
+    return rc;
+}
+SHIM(sem_post) { sem_give(rt_handle_get(ARG(0))); RET(0); }
+SHIM(sem_wait) { sem_sleep(rt_handle_get(ARG(0)), NULL); RET(0); }
 
 SHIM(dispatch_semaphore_create) {
     NSem *s = calloc(1, sizeof *s);
     s->count = (int)ARG(0);
     RET(rt_handle_new(s));
 }
-SHIM(dispatch_semaphore_signal) { NSem *s = rt_handle_get(ARG(0)); s->count++; rt_event_notify(); RET(0); }
+SHIM(dispatch_semaphore_signal) { sem_give(rt_handle_get(ARG(0))); RET(0); }
 SHIM(dispatch_semaphore_wait) {
     NSem *s = rt_handle_get(ARG(0));
-    u64 timeout = ARGQ(1);
-    u64 waited = 0;
-    while (s->count <= 0) {
-        if (timeout != ~0ull && waited >= 2000000ull) {
-            // Timed waits are approximate: give up after the host-side polling budget.
-            if (waited * 1000 >= timeout) {
-                RET(1);
-                return;
-            }
-        }
-        block_a_little();
-        waited += 2000;
+    u64 timeout = ARGQ(1);  // dispatch_time below just passes the delay through
+    if (timeout == ~0ull) {
+        sem_sleep(s, NULL);
+        RET(0);
+        return;
     }
-    s->count--;
-    RET(0);
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    u64 ns = (u64)tv.tv_sec * 1000000000ull + (u64)tv.tv_usec * 1000ull + timeout;
+    struct timespec deadline = {(time_t)(ns / 1000000000ull), (long)(ns % 1000000000ull)};
+    RET(sem_sleep(s, &deadline) ? 1 : 0);
 }
 SHIM(dispatch_time) { RET64(ARGQ(1)); }
 
-// ---------- atomics: the gate makes plain operations atomic ----------
-SHIM(OSAtomicAdd32) { u32 v = G32(ARG(1)) + ARG(0); G32(ARG(1)) = v; RET(v); }
+// ---------- atomics: guest threads run in parallel, and inline lock-prefixed code touches the same words ----------
+SHIM(OSAtomicAdd32) { RET(__atomic_add_fetch((u32 *)GP(ARG(1)), ARG(0), __ATOMIC_SEQ_CST)); }
 SHIM(OSAtomicAdd64) {
-    u64 v = *(u64a *)GP(ARG(2)) + ARGQ(0);
-    *(u64a *)GP(ARG(2)) = v;
+    u64 v = __atomic_add_fetch((u64 *)GP(ARG(2)), ARGQ(0), __ATOMIC_SEQ_CST);
     RET64(v);
 }
 SHIM(OSAtomicCompareAndSwap32) {
-    if (G32(ARG(2)) == ARG(0)) {
-        G32(ARG(2)) = ARG(1);
-        RET(1);
-    } else {
-        RET(0);
-    }
+    u32 expect = ARG(0);
+    RET(__atomic_compare_exchange_n((u32 *)GP(ARG(2)), &expect, ARG(1), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0);
 }
-SHIM(OSMemoryBarrier) {}
+SHIM(OSMemoryBarrier) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+static int spin_take(u32 l) {
+    u32 expect = 0;
+    return __atomic_compare_exchange_n((u32 *)GP(l), &expect, 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
 SHIM(OSSpinLockLock) {
     u32 l = ARG(0);
-    while (G32(l)) block_a_little();
-    G32(l) = 1;
-}
-SHIM(OSSpinLockTry) {
-    u32 l = ARG(0);
-    if (G32(l)) {
-        RET(0);
-    } else {
-        G32(l) = 1;
-        RET(1);
+    int held = rt_gate_held();
+    if (held) rt_gate_release();
+    for (u32 i = 0; !spin_take(l); i++) {
+        if (i < 2000) cpu_relax();
+        else sched_yield();
     }
+    if (held) rt_gate_acquire();
 }
-SHIM(OSSpinLockUnlock) { G32(ARG(0)) = 0; rt_event_notify(); }
+SHIM(OSSpinLockTry) { RET(spin_take(ARG(0)) ? 1 : 0); }
+SHIM(OSSpinLockUnlock) { __atomic_store_n((u32 *)GP(ARG(0)), 0, __ATOMIC_SEQ_CST); }
 
 // ---------- GCD: blocks are guest structures {isa, flags, reserved, invoke, ...} ----------
 static void call_block(CPU *c, u32 block) {
@@ -382,7 +510,7 @@ typedef struct { u32 fn, arg; int is_block; int heap; } DCtx;
 static void main_queue_tramp(void *p) {
     DCtx *d = p;
     int held = rt_gate_held();
-    if (!held) rt_gate_acquire();
+    if (!held) rt_gate_acquire_now();
     CPU *c = rt_current_cpu();
     if (d->is_block) {
         call_block(c, d->fn);
@@ -405,7 +533,7 @@ static void run_on_main_sync(DCtx *d) {
     }
     rt_gate_release();
     dispatch_sync_f(dispatch_get_main_queue(), d, main_queue_tramp);
-    rt_gate_acquire();
+    rt_gate_acquire_now();
 }
 // Blocks: {isa, flags, reserved, invoke, descriptor, captures...}; descriptor: {reserved, size, copy, dispose}.
 #define BLK_NEEDS_FREE (1u << 24)
@@ -435,8 +563,34 @@ static void run_on_main_async(u32 fn, u32 arg, int is_block) {
     *d = (DCtx){fn, arg, is_block, 1};
     dispatch_async_f(dispatch_get_main_queue(), d, main_queue_tramp);
 }
+// ARKHAM_TRACE_DISPATCH: how often each place in the game synchronously waits for the main thread.
+static void note_main_sync(u32 site) {
+    static int on = -1;
+    static struct { u32 site, n; } sites[64];
+    static u64 last;
+    if (on < 0) on = getenv("ARKHAM_TRACE_DISPATCH") != NULL;
+    if (!on) return;
+    for (int i = 0; i < 64; i++) {
+        if (sites[i].site == site || !sites[i].site) {
+            sites[i].site = site;
+            sites[i].n++;
+            break;
+        }
+    }
+    u64 now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000000;
+    if (now - last >= 5) {
+        last = now;
+        fprintf(stderr, "[dispatch]");
+        for (int i = 0; i < 64 && sites[i].site; i++) {
+            fprintf(stderr, " %08x:%u", sites[i].site, sites[i].n);
+            sites[i].n = 0;
+        }
+        fprintf(stderr, "\n");
+    }
+}
 SHIM(dispatch_sync) {
     if (is_main_queue(ARG(0))) {
+        note_main_sync(G32(c->esp));
         DCtx d = {ARG(1), 0, 1, 0};
         run_on_main_sync(&d);
     } else {
@@ -505,6 +659,7 @@ const ShimReg rt_shims_threads[] = {
     R(pthread_mutexattr_settype) R(pthread_mutex_init) R(pthread_mutex_destroy) R(pthread_mutex_lock) R(pthread_mutex_unlock)
     R(pthread_mutex_trylock) R(pthread_cond_init) R(pthread_cond_destroy) R(pthread_cond_signal) R(pthread_cond_broadcast)
     R(pthread_cond_wait) R(pthread_cond_timedwait) R(pthread_attr_init) R(pthread_attr_destroy) R(pthread_attr_setstacksize)
+    R(pthread_create_suspended_np) R(thread_resume) R(thread_policy_set) R(pthread_yield_np) R2("_pthread_join$UNIX2003", pthread_join)
     R(pthread_create) R(pthread_join) R(pthread_detach) R(pthread_self) R(pthread_equal) R(pthread_exit) R(pthread_main_np)
     R(pthread_kill) R(pthread_cancel) R(pthread_setname_np) R(pthread_getname_np) R(pthread_getschedparam) R(pthread_setschedparam)
     R(sched_get_priority_max) R(sched_get_priority_min) R(sched_yield) R(pthread_mach_thread_np) R(mach_thread_self)

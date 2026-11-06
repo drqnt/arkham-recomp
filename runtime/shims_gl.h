@@ -8,3 +8,4 @@
 #define GL_DRAW_INDIRECT_BUFFER_BINDING 0x8F43
 void *gl_ptr_or_offset(u32 v, unsigned binding);
 void gl_missing(const char *name);
+extern unsigned long rt_gl_draws;

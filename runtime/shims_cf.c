@@ -6,6 +6,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreServices/CoreServices.h>
 #include <dirent.h>
+#include <mach/mach_time.h>
 #include <dlfcn.h>
 #include <mach-o/loader.h>
 #include <stddef.h>
@@ -284,6 +285,8 @@ SHIM(FSIsAliasFile) {
     if (ARG(2)) G8(ARG(2)) = f;
     RET((i32)e);
 }
+SHIM(UpTime) { UInt64 t = mach_absolute_time(); RET64(t); }
+SHIM(AbsoluteToDuration) { RET((u32)(ARGQ(0) / 1000000ull)); }
 SHIM(SecRandomCopyBytes) { arc4random_buf(GP(ARG(2)), ARG(1)); RET(0); }
 
 // Classic process APIs answer as if this process were the game's bundle.
@@ -328,9 +331,27 @@ SHIM(CFBundleCopyBundleLocalizations) { RET(cf_wrap(CFBundleCopyBundleLocalizati
 SHIM(CFBundleCopyPreferredLocalizationsFromArray) { RET(cf_wrap(CFBundleCopyPreferredLocalizationsFromArray((CFArrayRef)O(0)))); }
 SHIM(CFBundleCopyLocalizationsForPreferences) { RET(cf_wrap(CFBundleCopyLocalizationsForPreferences((CFArrayRef)O(0), (CFArrayRef)O(1)))); }
 SHIM(CFBundleCopyLocalizedString) { RET(cf_wrap(CFBundleCopyLocalizedString(B(0), S(1), S(2), S(3)))); }
-SHIM(CFBundleGetFunctionPointerForName) { RET(0); }
-SHIM(CFBundleIsExecutableLoaded) { RET(0); }
-SHIM(CFBundleLoadExecutable) { RET(0); }
+// The game calls some system functions by looking them up by name, free among them. A failed lookup quietly turns such a
+// call into nothing, so every answer comes from the same shims the game's imports use.
+void (*rt_lookup_shim(const char *sym))(CPU *);
+u32 rt_dyn_import(const char *name, void (*fn)(CPU *));
+SHIM(CFBundleGetFunctionPointerForName) {
+    char name[256] = "_";
+    CFStringRef s = S(1);
+    if (!s || !CFStringGetCString(s, name + 1, sizeof name - 1, kCFStringEncodingUTF8)) {
+        RET(0);
+        return;
+    }
+    void (*fn)(CPU *) = rt_lookup_shim(name);
+    if (!fn) {
+        fprintf(stderr, "[cf] no implementation for function looked up by name: %s\n", name + 1);
+        RET(0);
+        return;
+    }
+    RET(rt_dyn_import(name, fn));
+}
+SHIM(CFBundleIsExecutableLoaded) { RET(1); }
+SHIM(CFBundleLoadExecutable) { RET(1); }
 
 // ---------- containers ----------
 static const void *cb_or_null(u32 g, u32 known, const void *host) { return g == known ? host : NULL; }
@@ -435,11 +456,30 @@ SHIM(CFDataCreateMutable) { RET(cf_wrap(CFDataCreateMutable(NULL, (i32)ARG(1))))
 SHIM(CFDataGetLength) { RET(CFDataGetLength((CFDataRef)O(0))); }
 SHIM(CFDataGetBytes) { CFDataGetBytes((CFDataRef)O(0), CFRangeMake((i32)ARG(1), (i32)ARG(2)), GP(ARG(3))); }
 // Host-owned bytes are copied into a guest buffer that stays alive for the object's lifetime in practice.
+// The game does arithmetic between pointers from separate calls, so one data object must always give the same address.
+// Recent objects stay retained, which keeps their addresses from being reused while the guest may still hold the pointer.
+typedef struct { CFDataRef d; u32 g; CFIndex n; } DataCopy;
+#define DATA_COPIES 256
+static DataCopy data_copies[DATA_COPIES];
+static unsigned data_next;
 SHIM(CFDataGetBytePtr) {
     CFDataRef d = (CFDataRef)O(0);
     CFIndex n = CFDataGetLength(d);
+    for (unsigned i = 0; i < DATA_COPIES; i++) {
+        DataCopy *e = &data_copies[i];
+        if (e->d == d && e->n == n) {
+            memcpy(GP(e->g), CFDataGetBytePtr(d), (size_t)n);
+            RET(e->g);
+            return;
+        }
+    }
     u32 g = rt_guest_malloc((u32)n + 1);
     memcpy(GP(g), CFDataGetBytePtr(d), (size_t)n);
+    DataCopy *e = &data_copies[data_next++ % DATA_COPIES];
+    if (e->d) CFRelease(e->d);
+    e->d = CFRetain(d);
+    e->g = g;
+    e->n = n;
     RET(g);
 }
 
@@ -743,7 +783,7 @@ const ShimReg rt_shims_cf[] = {
     R(CFHTTPMessageCopyHeaderFieldValue) R(CFHTTPMessageCopyAllHeaderFields) R(CFHTTPMessageCopyBody) R(CFHTTPMessageAppendBytes)
     R2("_CFNetworkCopySystemProxySettings", cf_noop) R2("_CFNetworkCopyProxiesForURL", cf_noop)
     R(CFAbsoluteTimeGetDayOfWeek) R(CFAbsoluteTimeGetGregorianDate) R(CFGregorianDateGetAbsoluteTime) R(UCConvertCFAbsoluteTimeToLongDateTime)
-    R(UCConvertLongDateTimeToCFAbsoluteTime) R(CFPropertyListCreateFromXMLData) R(GetCurrentProcess) R(GetProcessBundleLocation) R(FSIsAliasFile) R(FSCompareFSRefs) R(FSGetCatalogInfo) R(FSGetVolumeInfo) R(SecRandomCopyBytes)
+    R(UCConvertLongDateTimeToCFAbsoluteTime) R(CFPropertyListCreateFromXMLData) R(GetCurrentProcess) R(GetProcessBundleLocation) R(UpTime) R(AbsoluteToDuration) R(FSIsAliasFile) R(FSCompareFSRefs) R(FSGetCatalogInfo) R(FSGetVolumeInfo) R(SecRandomCopyBytes)
     R(CFURLCreateStringByAddingPercentEscapes) R(CFURLCreateStringByReplacingPercentEscapes)
     R(CFBundleGetMainBundle) R(CFBundleGetBundleWithIdentifier) R(CFBundleCreate) R(CFBundleCopyBundleURL) R(CFBundleCopyResourcesDirectoryURL)
     R(CFBundleCopyPrivateFrameworksURL) R(CFBundleCopyResourceURL) R(CFBundleCopyResourceURLsOfType) R(CFBundleGetInfoDictionary)

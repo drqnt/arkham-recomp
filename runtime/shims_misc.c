@@ -33,6 +33,58 @@ static void add_table(void (**table)(CPU *), const ShimReg *r) {
     }
 }
 
+// Shims that touch nothing shared, or guard it themselves, run without the lock. They are the ones called hundreds of thousands
+// of times a second, and these must never call rt_gate_release.
+int rt_shim_no_gate(const char *name) {
+    static const char *const names[] = {
+        "_memcpy", "_memmove", "_memset", "_memcmp", "_memchr", "___bzero", "_bzero", "___memcpy_chk", "___memmove_chk", "___memset_chk",
+        "_memset_pattern16", "_memset_pattern4", "_memset_pattern8",
+        "_strlen", "_strnlen", "_strcmp", "_strncmp", "_strcpy", "_strncpy", "_strcat", "_strncat", "_strchr", "_strrchr", "_strstr",
+        "_strcasecmp", "_strncasecmp", "_strpbrk", "_strspn", "_strcspn", "___strcpy_chk", "___strcat_chk", "___strncpy_chk", "___strncat_chk",
+        "_strlcpy", "_strlcat", "___strlcpy_chk", "___strlcat_chk",
+        "_wcscmp", "_wcslen", "_wcsncmp", "_wcscpy", "_wcsncpy", "_wcscat", "_wcschr", "_wcsrchr", "_wcsstr",
+        "___tolower", "___toupper", "_tolower", "_toupper", "___maskrune",
+        "_sinf", "_cosf", "_tanf", "_asinf", "_acosf", "_atanf", "_atan2f", "_sqrtf", "_fmodf", "_powf", "_expf", "_logf", "_log10f", "_floorf",
+        "_ceilf", "_fabsf", "_sin", "_cos", "_tan", "_asin", "_acos", "_atan", "_atan2", "_sqrt", "_fmod", "_pow", "_exp", "_log", "_log10",
+        "_floor", "_ceil", "_fabs", "_ldexp", "_frexp", "_modf", "_rint", "_round", "_roundf", "_lrintf", "_lrint", "_hypot",
+        "___isnanf", "___isinff", "___isnand", "___isinfd", "___fpclassifyf", "___fpclassifyd", "___fpclassify",
+        "_mach_absolute_time", "_gettimeofday", "_UpTime", "_AbsoluteToNanoseconds", "_AbsoluteToDuration",
+        "_pthread_self", "_pthread_getspecific", "_pthread_setspecific", "_pthread_main_np", "_pthread_equal",
+        "_pthread_mutex_lock", "_pthread_mutex_unlock", "_pthread_mutex_trylock", "_pthread_cond_signal", "_pthread_cond_broadcast",
+        "_pthread_cond_wait", "_pthread_cond_timedwait", "_pthread_yield_np", "_sched_yield", "_sem_post", "_sem_wait",
+        "_dispatch_semaphore_signal", "_dispatch_semaphore_wait", "_OSSpinLockLock", "_OSSpinLockTry", "_OSSpinLockUnlock",
+        "_OSAtomicAdd32", "_OSAtomicAdd32Barrier", "_OSAtomicAdd64", "_OSAtomicCompareAndSwap32Barrier",
+        "_OSAtomicCompareAndSwapInt", "_OSAtomicCompareAndSwapPtrBarrier", "_OSMemoryBarrier",
+        "_malloc", "_free", "_calloc", "_realloc", "_posix_memalign", "_malloc_size", "__Znwm", "__Znam", "__ZdlPv", "__ZdaPv",
+        "___dynamic_cast", "___cxa_throw", "___cxa_rethrow", "__Unwind_Resume", "___cxa_begin_catch", "___cxa_end_catch",
+        "___cxa_free_exception", "___cxa_allocate_exception", "__ZSt18uncaught_exceptionv",
+        "_CGLSetCurrentContext", "_CGLLockContext", "_CGLUnlockContext",
+        "_read", "_read$UNIX2003", "_pread", "_pread$UNIX2003", "_lseek",
+        NULL,
+    };
+    if (!name) return 0;
+    if (!strncmp(name, "_gl", 3)) {
+        static const char *const locked[] = {"_glMapBuffer", "_glMapBufferRange", "_glUnmapBuffer", "_glFlushMappedBufferRange", "_glFlushMappedBufferRangeAPPLE",
+                                             "_glFenceSync", "_glClientWaitSync", "_glWaitSync", "_glDeleteSync", "_glFinish", NULL};
+        for (const char *const *q = locked; *q; q++)
+            if (!strcmp(*q, name)) return 0;
+        return 1;
+    }
+    for (const char *const *q = names; *q; q++)
+        if (!strcmp(*q, name)) return 1;
+    return 0;
+}
+
+// Find a shim for a function the game asks for by name at run time.
+void (*rt_lookup_shim(const char *sym))(CPU *) {
+    const ShimReg *const tables[] = {rt_shims_libc, rt_shims_threads, rt_shims_cxx, rt_shims_misc, rt_shims_cf, rt_shims_objc,
+                                     rt_shims_gl_gen, rt_shims_gl, rt_shims_text, rt_shims_eh, rt_shims_sys, rt_shims_bink, rt_shims_audio};
+    for (size_t t = 0; t < sizeof tables / sizeof tables[0]; t++)
+        for (const ShimReg *r = tables[t]; r->name; r++)
+            if (!strcmp(r->name, sym)) return r->fn;
+    return NULL;
+}
+
 void rt_register_shims(void (**table)(CPU *)) {
     add_table(table, rt_shims_libc);
     add_table(table, rt_shims_threads);
@@ -42,6 +94,17 @@ void rt_register_shims(void (**table)(CPU *)) {
     add_table(table, rt_shims_objc);
     add_table(table, rt_shims_gl_gen);
     add_table(table, rt_shims_gl);
+    add_table(table, rt_shims_text);
+    add_table(table, rt_shims_eh);
+    add_table(table, rt_shims_sys);
+    add_table(table, rt_shims_bink);
+    add_table(table, rt_shims_audio);
+    add_table(table, rt_shims_bink_exports);
+    // The Bink library's imports have their own numbers; one with the same name as a game import shares its shim.
+    for (unsigned i = 0; i < rt_import_n; i++) {
+        int first = rt_import_index(rt_import_names[i]);
+        if (first >= 0 && (unsigned)first != i && !table[i]) table[i] = table[first];
+    }
 }
 
 // Debug hooks from config/hooks.json: logs arguments, CF strings reachable from them, and the result.
@@ -132,6 +195,7 @@ void rt_shims_process_init(CPU *c, int argc, u32 argv, u32 envp) {
     rt_cxx_init(c);
     rt_objc_init();
     rt_gl_init();
+    rt_text_init();
     rt_cf_init(rt_cfstring_addr, rt_cfstring_addr + rt_cfstring_size);
     // The first host page stays unmapped to catch NULL dereferences, so keep the Mach header readable elsewhere.
     extern const u8 *rt_header_bytes;

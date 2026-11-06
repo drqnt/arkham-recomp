@@ -12,10 +12,13 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV = dict(os.environ, DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer")
-COMMON = ["-std=gnu11", "-fno-strict-aliasing", "-fwrapv", "-w", "-fno-stack-protector", "-fno-exceptions",
+COMMON = ["-std=gnu11", "-fno-strict-aliasing", "-fwrapv", "-w", "-fno-stack-protector", "-fno-exceptions", "-funwind-tables",
           "-fno-math-errno", "-ffp-contract=off", "-mcpu=apple-m1", "-arch", "arm64", "-mmacosx-version-min=14.0",
           f"-I{ROOT}/runtime"]
-FRAMEWORKS = ["CoreFoundation", "CoreServices", "Foundation", "AppKit", "OpenGL", "ApplicationServices", "Carbon", "ImageIO", "CoreGraphics"]
+FRAMEWORKS = ["CoreFoundation", "CoreServices", "Foundation", "AppKit", "OpenGL", "ApplicationServices", "Carbon", "ImageIO", "CoreGraphics", "CoreText", "AudioToolbox", "AudioUnit", "CoreAudio"]
+
+
+EXTRA: list[str] = []
 
 
 def stale(src: str, obj: str, deps: list[str]) -> bool:
@@ -28,18 +31,21 @@ def stale(src: str, obj: str, deps: list[str]) -> bool:
 def compile_one(job):
     src, obj, opt = job
     t0 = time.time()
-    r = subprocess.run(["xcrun", "clang", "-c", opt, *COMMON, src, "-o", obj], env=ENV, capture_output=True, text=True)
+    r = subprocess.run(["xcrun", "clang", "-c", opt, *COMMON, *EXTRA, src, "-o", obj], env=ENV, capture_output=True, text=True)
     return src, r.returncode, r.stderr, time.time() - t0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("-O", dest="opt", default="1")
+    ap.add_argument("-O", dest="opt", default="2")
     ap.add_argument("-j", dest="jobs", type=int, default=os.cpu_count())
     ap.add_argument("--only", default="", help="compile only shards matching this glob and stop")
+    ap.add_argument("--serial", action="store_true", help="for ARKHAM_SERIAL=1 debugging: objects and binary in build/serial")
     args = ap.parse_args()
     opt = f"-O{args.opt}"
-    objdir = os.path.join(ROOT, "build", f"obj{args.opt}")
+    objdir = os.path.join(ROOT, "build", "serial" if args.serial else f"obj{args.opt}")
+    if args.serial:
+        EXTRA.append("-DARKHAM_POLL")
     os.makedirs(objdir, exist_ok=True)
     headers = glob.glob(f"{ROOT}/runtime/*.h")
     gen_headers = [f"{ROOT}/runtime/rt.h", f"{ROOT}/runtime/rt_ops.h"]  # shards depend on these alone
@@ -55,7 +61,7 @@ def main() -> int:
             obj = os.path.join(objdir, "rt_" + os.path.basename(src)[:-2] + ".o")
             objs.append(obj)
             if stale(src, obj, headers):
-                jobs.append((src, obj, "-O1"))
+                jobs.append((src, obj, "-O2"))
     t0 = time.time()
     failed = 0
     slowest = (0.0, "")
@@ -78,8 +84,8 @@ def main() -> int:
     rsp = os.path.join(ROOT, "build", "link.rsp")
     with open(rsp, "w") as fh:
         fh.write("\n".join(objs))
-    out = os.path.join(ROOT, "build", "arkham")
-    cmd = ["xcrun", "clang", "-arch", "arm64", "-mmacosx-version-min=14.0", f"@{rsp}", "-o", out, "-Wl,-w",
+    out = os.path.join(ROOT, "build", "serial", "arkham") if args.serial else os.path.join(ROOT, "build", "arkham")
+    cmd = ["xcrun", "clang", "-arch", "arm64", "-mmacosx-version-min=14.0", f"@{rsp}", "-o", out, "-Wl,-w", "-lz",
            "-Wl,-stack_size,0x10000000"]
     for fw in FRAMEWORKS:
         cmd += ["-framework", fw]

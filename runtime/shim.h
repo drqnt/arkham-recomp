@@ -11,8 +11,10 @@ u32 rt_call_guest(CPU *c, u32 addr, int nargs, const u32 *args);
 int rt_import_index(const char *name);
 u32 rt_import_addr(const char *name);
 void rt_gate_acquire(void);
+void rt_gate_acquire_now(void);
 void rt_gate_release(void);
 int rt_gate_held(void);
+void rt_glq_drain(void);
 int rt_host_thunk_dispatch(CPU *c, u32 target);
 
 // Guest heap and page allocator (lives inside the 4 GB guest window).
@@ -20,6 +22,7 @@ void rt_heap_init(void);
 u32 rt_guest_alloc_pages(u32 size);
 void rt_guest_free_pages(u32 addr, u32 size);
 u32 rt_guest_malloc(u32 size);
+u32 rt_guest_memalign(u32 align, u32 size);
 u32 rt_guest_calloc(u32 n, u32 size);
 u32 rt_guest_realloc(u32 addr, u32 size);
 void rt_guest_free(u32 addr);

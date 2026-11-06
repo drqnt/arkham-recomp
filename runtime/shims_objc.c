@@ -2,6 +2,10 @@
 // type encoding says how to convert each argument between the 32-bit guest stack and arm64 registers.
 // Guest-defined classes (the legacy __OBJC segment) are handled by guest_class.c-style lookup further down.
 #include "shim.h"
+void rt_gl_context_changed(void);
+#include <dispatch/dispatch.h>
+#include <ImageIO/ImageIO.h>
+#include <dlfcn.h>
 #include "shim_reg.h"
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -51,16 +55,14 @@ static const char *skip_quals(const char *t) {
 // Advance past one type in an encoding, including trailing stack-offset digits.
 static const char *next_type(const char *t) {
     t = skip_quals(t);
+    while (*t == '^') t = skip_quals(t + 1);  // a pointer's target is part of the same type
     int depth = 0;
     do {
         char ch = *t;
         if (!ch) return t;
         if (ch == '{' || ch == '(' || ch == '[') depth++;
         else if (ch == '}' || ch == ')' || ch == ']') depth--;
-        else if (ch == '^' && depth == 0) {
-            t++;
-            continue;
-        } else if (ch == '@' && t[1] == '"') {
+        else if (ch == '@' && t[1] == '"') {
             t += 2;
             while (*t && *t != '"') t++;
         } else if (ch == '"') {
@@ -124,6 +126,9 @@ static u32 marshal_args(Method m, const char *sel, u32 ap, Regs *r, OutSlot *out
                     outs[*nout].val = nil;
                     put_x(r, (u64)&outs[*nout].val);
                     (*nout)++;
+                } else if (rt_is_handle(v)) {
+                    // An opaque system object such as a CGImageRef, known to the guest only by its handle.
+                    put_x(r, (u64)rt_handle_get(v));
                 } else {
                     put_x(r, v ? (u64)GP(v) : 0);
                 }
@@ -317,8 +322,22 @@ static int host_send_from(CPU *c, u32 self, u32 selg, u32 ap, u32 stret, Class s
     }
     const char *rt = skip_quals(method_getTypeEncoding(m));
     char k = *rt;
-    rt_gate_release();
-    #define GATE_BACK rt_gate_acquire()
+    // (The bindings OpenGL shims remember belong to the current context.)
+    // Quick reads of window and screen state run in place. Giving up the gate for them would cost a whole time slice each.
+    static const char *const quick[] = {"frame", "isKeyWindow", "contentRectForFrameRect:", "screens", "mainScreen", "objectAtIndex:", "count", "backingScaleFactor", NULL};
+    int keep_gate = 0;
+    for (const char *const *q = quick; *q; q++) {
+        if (!strcmp(sn, *q)) {
+            keep_gate = 1;
+            break;
+        }
+    }
+    if (!strcmp(sn, "makeCurrentContext") || !strcmp(sn, "clearCurrentContext")) {
+        rt_glq_drain();
+        rt_gl_context_changed();
+    }
+    if (!keep_gate) rt_gate_release();
+    #define GATE_BACK do { if (!keep_gate) rt_gate_acquire(); } while (0)
     switch (k) {
         case 'v':
             ((msg_x)fn)(recv, sel, CALLARGS(r));
@@ -732,7 +751,16 @@ typedef void (*msg_v0)(id, SEL);
 typedef void (*msg_vq)(id, SEL, long);
 typedef void (*msg_vb)(id, SEL, signed char);
 static void snap_schedule(void);
+// Holding A or S must walk, not open the accent menu. AppKit's press-and-hold also watches for key up in a way that crashed here.
+static void disable_press_and_hold(void) {
+    id keys[1] = {ns_str("ApplePressAndHoldEnabled")};
+    id vals[1] = {((id(*)(id, SEL, signed char))objc_msgSend)(CLS("NSNumber"), SELR("numberWithBool:"), 0)};
+    id dict = ((id(*)(id, SEL, const id *, const id *, unsigned long))objc_msgSend)(CLS("NSDictionary"), SELR("dictionaryWithObjects:forKeys:count:"), vals, keys, 1);
+    id defaults = ((id(*)(id, SEL))objc_msgSend)(CLS("NSUserDefaults"), SELR("standardUserDefaults"));
+    ((void (*)(id, SEL, id))objc_msgSend)(defaults, SELR("registerDefaults:"), dict);
+}
 SHIM(NSApplicationMain) {
+    disable_press_and_hold();
     // The steps NSApplicationMain performs, using the game's own bundle rather than this process's.
     id app = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
     u32 slot = rt_import_addr("_NSApp");
@@ -912,6 +940,10 @@ void guest_imp_dispatch(HRegs *r) {
             if (stret_buf) {
                 for (int j = 0; j < 4; j++) r->d[j] = *(f32a *)(GMEM + stret_buf + (u32)j * 4);
                 rt_guest_free(stret_buf);
+            } else if (!strncmp(rett, "{_NSRange", 9)) {
+                // Two words in eax:edx, widened; NSNotFound is a different number on each side.
+                r->x[0] = ret == 0x7FFFFFFFu ? 0x7FFFFFFFFFFFFFFFull : ret;
+                r->x[1] = c->edx;
             } else {
                 r->x[0] = ret;
             }
@@ -944,6 +976,38 @@ static void snap_now(const char *path) {
     id app = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), SELR("sharedApplication"));
     id wins = ((id(*)(id, SEL))objc_msgSend)(app, SELR("windows"));
     unsigned long n = ((unsigned long (*)(id, SEL))objc_msgSend)(wins, SELR("count"));
+    // What the window server composites, which is what the player sees: this does include OpenGL surfaces.
+    typedef CGImageRef (*list_image_fn)(CGRect, uint32_t, uint32_t, uint32_t);
+    list_image_fn list_image = (list_image_fn)dlsym(RTLD_DEFAULT, "CGWindowListCreateImage");
+    for (unsigned long i = 0; i < n; i++) {
+        id w = ((id(*)(id, SEL, unsigned long))objc_msgSend)(wins, SELR("objectAtIndex:"), i);
+        CGRect fr = ((CGRect(*)(id, SEL))objc_msgSend)(w, SELR("frame"));
+        id cv = ((id(*)(id, SEL))objc_msgSend)(w, SELR("contentView"));
+        long num = ((long (*)(id, SEL))objc_msgSend)(w, SELR("windowNumber"));
+        long lvl = ((long (*)(id, SEL))objc_msgSend)(w, SELR("level"));
+        fprintf(stderr, "[snap] window %lu #%ld %s frame %.0f,%.0f %.0fx%.0f visible=%d level=%ld key=%d content=%s\n", i, num, class_getName(object_getClass(w)), fr.origin.x, fr.origin.y,
+                fr.size.width, fr.size.height, ((signed char (*)(id, SEL))objc_msgSend)(w, SELR("isVisible")), lvl,
+                ((signed char (*)(id, SEL))objc_msgSend)(w, SELR("isKeyWindow")), cv ? class_getName(object_getClass(cv)) : "nil");
+        if (list_image && ((signed char (*)(id, SEL))objc_msgSend)(w, SELR("isVisible")) && fr.size.height >= 100) {
+            CGImageRef im = list_image(CGRectNull, 8 /* including window */, (uint32_t)num, 1 /* ignore framing */);
+            fprintf(stderr, "[snap] composited image of #%ld: %zux%zu\n", num, im ? CGImageGetWidth(im) : 0, im ? CGImageGetHeight(im) : 0);
+            if (im) {
+                char p2[1100];
+                snprintf(p2, sizeof p2, "%s.window%lu.png", path, i);
+                CFStringRef ps = CFStringCreateWithCString(NULL, p2, kCFStringEncodingUTF8);
+                CFURLRef url = CFURLCreateWithFileSystemPath(NULL, ps, kCFURLPOSIXPathStyle, false);
+                CGImageDestinationRef d = CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL);
+                if (d) {
+                    CGImageDestinationAddImage(d, im, NULL);
+                    CGImageDestinationFinalize(d);
+                    CFRelease(d);
+                }
+                CFRelease(url);
+                CFRelease(ps);
+                CGImageRelease(im);
+            }
+        }
+    }
     for (unsigned long i = 0; i < n; i++) {
         id w = ((id(*)(id, SEL, unsigned long))objc_msgSend)(wins, SELR("objectAtIndex:"), i);
         if (!((signed char (*)(id, SEL))objc_msgSend)(w, SELR("isVisible"))) continue;
@@ -960,6 +1024,39 @@ static void snap_now(const char *path) {
     }
     fprintf(stderr, "[snap] no visible window\n");
 }
+// On-screen frame rate (ARKHAM_FPS=1): a small panel attached above the game's window, updated once a second.
+static id fps_panel, fps_label;
+void rt_fps_overlay(double fps, double worst_ms) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("ARKHAM_FPS") != NULL;
+    if (!enabled) return;
+    char text[64];
+    snprintf(text, sizeof text, "%.0f FPS  %.0f ms", fps, worst_ms);
+    char *copy = strdup(text);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id app = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), SELR("sharedApplication"));
+        id win = ((id(*)(id, SEL))objc_msgSend)(app, SELR("keyWindow"));
+        if (!win) win = ((id(*)(id, SEL))objc_msgSend)(app, SELR("mainWindow"));
+        if (win && !fps_panel) {
+            CGRect r = CGRectMake(0, 0, 170, 26);
+            fps_panel = ((id(*)(id, SEL, CGRect, unsigned long, unsigned long, signed char))objc_msgSend)(((id(*)(id, SEL))objc_msgSend)(CLS("NSPanel"), SELR("alloc")),
+                SELR("initWithContentRect:styleMask:backing:defer:"), r, 128 /* non-activating */, 2, 0);
+            ((void (*)(id, SEL, signed char))objc_msgSend)(fps_panel, SELR("setIgnoresMouseEvents:"), 1);
+            ((void (*)(id, SEL, id))objc_msgSend)(fps_panel, SELR("setBackgroundColor:"), ((id(*)(id, SEL))objc_msgSend)(CLS("NSColor"), SELR("blackColor")));
+            ((void (*)(id, SEL, double))objc_msgSend)(fps_panel, SELR("setAlphaValue:"), 0.8);
+            fps_label = ((id(*)(id, SEL, id))objc_msgSend)(CLS("NSTextField"), SELR("labelWithString:"), ns_str(""));
+            ((void (*)(id, SEL, id))objc_msgSend)(fps_label, SELR("setTextColor:"), ((id(*)(id, SEL))objc_msgSend)(CLS("NSColor"), SELR("whiteColor")));
+            ((void (*)(id, SEL, CGRect))objc_msgSend)(fps_label, SELR("setFrame:"), CGRectMake(8, 4, 160, 18));
+            ((void (*)(id, SEL, id))objc_msgSend)(((id(*)(id, SEL))objc_msgSend)(fps_panel, SELR("contentView")), SELR("addSubview:"), fps_label);
+            CGRect f = ((CGRect(*)(id, SEL))objc_msgSend)(win, SELR("frame"));
+            ((void (*)(id, SEL, CGPoint))objc_msgSend)(fps_panel, SELR("setFrameOrigin:"), CGPointMake(f.origin.x + f.size.width - 190, f.origin.y + f.size.height - 46));
+            ((void (*)(id, SEL, id, long))objc_msgSend)(win, SELR("addChildWindow:ordered:"), fps_panel, 1);
+        }
+        if (fps_label) ((void (*)(id, SEL, id))objc_msgSend)(fps_label, SELR("setStringValue:"), ns_str(copy));
+        free(copy);
+    });
+}
+
 // Debug aid: press the launcher's Play button by script after a delay (ARKHAM_AUTO_PLAY=secs).
 static id the_webview;
 void rt_note_webview(id v) { the_webview = v; }
@@ -976,8 +1073,126 @@ static void auto_play_schedule(void) {
     CFRunLoopAddTimer(CFRunLoopGetMain(), t, kCFRunLoopCommonModes);
     CFRelease(t);
 }
+// Debug aid: scripted input for test runs. ARKHAM_INPUT="40:key:36,45:click:900:600,50:move:10:10" posts real AppKit events
+// at those seconds after launch. Coordinates are points from the window's top left corner.
+void rt_set_scripted_mouse(double x, double y);
+static id script_window(void) {
+    id app = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), SELR("sharedApplication"));
+    id w = ((id(*)(id, SEL))objc_msgSend)(app, SELR("keyWindow"));
+    if (w) return w;
+    w = ((id(*)(id, SEL))objc_msgSend)(app, SELR("mainWindow"));
+    if (w) return w;
+    id all = ((id(*)(id, SEL))objc_msgSend)(app, SELR("windows"));
+    return ((id(*)(id, SEL))objc_msgSend)(all, SELR("firstObject"));
+}
+static void script_post(id ev) {
+    id app = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), SELR("sharedApplication"));
+    ((void (*)(id, SEL, id, signed char))objc_msgSend)(app, SELR("postEvent:atStart:"), ev, 0);
+}
+// One key event: type is 10 for down and 11 for up.
+static void script_key_event(int code, unsigned long type) {
+    id w = script_window();
+    long num = w ? ((long (*)(id, SEL))objc_msgSend)(w, SELR("windowNumber")) : 0;
+    unsigned short ch = code == 36 ? 13 : code == 53 ? 27 : code == 49 ? 32 : code == 126 ? 0xF700 : code == 125 ? 0xF701 : code == 123 ? 0xF702 : code == 124 ? 0xF703 :
+                        code == 13 ? 'w' : code == 0 ? 'a' : code == 1 ? 's' : code == 2 ? 'd' : 0;
+    id str = ((id(*)(id, SEL, const unsigned short *, unsigned long))objc_msgSend)(CLS("NSString"), SELR("stringWithCharacters:length:"), &ch, ch ? 1 : 0);
+    typedef id (*key_fn)(id, SEL, unsigned long, CGPoint, unsigned long, double, long, id, id, id, signed char, unsigned short);
+    SEL sel = SELR("keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:");
+    id ev = ((key_fn)objc_msgSend)(CLS("NSEvent"), sel, type, CGPointZero, 0, CFAbsoluteTimeGetCurrent(), num, nil, str, str, 0, (unsigned short)code);
+    // With no key window, because a test run is not the active app, AppKit would drop the key and beep. Hand it to the window.
+    id app = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), SELR("sharedApplication"));
+    if (w && !((id(*)(id, SEL))objc_msgSend)(app, SELR("keyWindow"))) ((void (*)(id, SEL, id))objc_msgSend)(w, SELR("sendEvent:"), ev);
+    else script_post(ev);
+}
+static void script_key(int code) {
+    script_key_event(code, 10);
+    script_key_event(code, 11);
+    fprintf(stderr, "[input] key %d\n", code);
+}
+// Relative mouse motion, which is what steers the camera in play.
+void rt_scripted_mouse_get(double *x, double *y);
+static void script_look(double dx, double dy) {
+    // The engine turns the camera by how far the pointer is from where it last warped it.
+    double x = 0, y = 0;
+    rt_scripted_mouse_get(&x, &y);
+    rt_set_scripted_mouse(x + dx, y + dy);
+    fprintf(stderr, "[input] look %.0f %.0f\n", dx, dy);
+}
+static void script_mouse(int type, double x, double y) {
+    id w = script_window();
+    if (!w) return;
+    long num = ((long (*)(id, SEL))objc_msgSend)(w, SELR("windowNumber"));
+    CGRect fr = ((CGRect(*)(id, SEL))objc_msgSend)(w, SELR("frame"));
+    id cv = ((id(*)(id, SEL))objc_msgSend)(w, SELR("contentView"));
+    CGRect b = ((CGRect(*)(id, SEL))objc_msgSend)(cv, SELR("bounds"));
+    rt_set_scripted_mouse(fr.origin.x + x, y);
+    typedef id (*mouse_fn)(id, SEL, unsigned long, CGPoint, unsigned long, double, long, id, long, long, float);
+    SEL sel = SELR("mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:");
+    CGPoint at = CGPointMake(x, b.size.height - y);
+    script_post(((mouse_fn)objc_msgSend)(CLS("NSEvent"), sel, (unsigned long)type, at, 0, CFAbsoluteTimeGetCurrent(), num, nil, 0, type == 5 ? 0 : 1, type == 5 ? 0.0f : 1.0f));
+}
+// A left click where the pointer already is, which skips movies. Moving the pointer would turn the camera.
+void rt_scripted_mouse_get(double *x, double *y);
+static void script_press(void) {
+    double x = 0, y = 0;
+    rt_scripted_mouse_get(&x, &y);
+    id w = script_window();
+    if (!w) return;
+    long num = ((long (*)(id, SEL))objc_msgSend)(w, SELR("windowNumber"));
+    id cv = ((id(*)(id, SEL))objc_msgSend)(w, SELR("contentView"));
+    CGRect b = ((CGRect(*)(id, SEL))objc_msgSend)(cv, SELR("bounds"));
+    CGRect fr = ((CGRect(*)(id, SEL))objc_msgSend)(w, SELR("frame"));
+    typedef id (*mouse_fn)(id, SEL, unsigned long, CGPoint, unsigned long, double, long, id, long, long, float);
+    SEL sel = SELR("mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:");
+    CGPoint at = CGPointMake(x - fr.origin.x, b.size.height - y);
+    for (unsigned long type = 1; type <= 2; type++)
+        script_post(((mouse_fn)objc_msgSend)(CLS("NSEvent"), sel, type, at, 0, CFAbsoluteTimeGetCurrent(), num, nil, 0, 1, type == 1 ? 1.0f : 0.0f));
+}
+static void input_schedule(void) {
+    const char *spec = getenv("ARKHAM_INPUT");
+    if (!spec) return;
+    // A scripted run leaves the player's real cursor alone.
+    rt_set_scripted_mouse(900, 565);
+    char *copy = strdup(spec), *save = NULL;
+    double start = CFAbsoluteTimeGetCurrent();
+    for (char *item = strtok_r(copy, ",", &save); item; item = strtok_r(NULL, ",", &save)) {
+        double secs = 0, x = 0, y = 0;
+        char kind[16] = "";
+        if (sscanf(item, "%lf:%15[a-z]:%lf:%lf", &secs, kind, &x, &y) < 3) continue;
+        int is_key = !strcmp(kind, "key"), is_click = !strcmp(kind, "click");
+        int is_down = !strcmp(kind, "down"), is_up = !strcmp(kind, "up"), is_look = !strcmp(kind, "look"), is_quit = !strcmp(kind, "quit"), is_press = !strcmp(kind, "press");
+        CFRunLoopTimerRef t = CFRunLoopTimerCreateWithHandler(NULL, start + secs, 0, 0, 0, ^(CFRunLoopTimerRef tt) {
+            (void)tt;
+            if (is_press) {
+                script_press();
+            } else if (is_quit) {
+                fprintf(stderr, "[input] quit\n");
+                id app = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), SELR("sharedApplication"));
+                ((void (*)(id, SEL, id))objc_msgSend)(app, SELR("terminate:"), nil);
+            } else if (is_key) {
+                script_key((int)x);
+            } else if (is_down || is_up) {
+                script_key_event((int)x, is_down ? 10 : 11);
+                fprintf(stderr, "[input] key %d %s\n", (int)x, is_down ? "down" : "up");
+            } else if (is_look) {
+                script_look(x, y);
+            } else {
+                script_mouse(5, x, y);
+                if (is_click) {
+                    script_mouse(1, x, y);
+                    script_mouse(2, x, y);
+                }
+                fprintf(stderr, "[input] mouse %s %.0f,%.0f\n", is_click ? "click" : "move", x, y);
+            }
+        });
+        CFRunLoopAddTimer(CFRunLoopGetMain(), t, kCFRunLoopCommonModes);
+        CFRelease(t);
+    }
+    free(copy);
+}
 static void snap_schedule(void) {
     auto_play_schedule();
+    input_schedule();
     const char *path = getenv("ARKHAM_SNAP");
     if (!path) return;
     const char *after = getenv("ARKHAM_SNAP_AFTER");
@@ -1029,6 +1244,14 @@ static void register_guest_classes(void) {
                 }
             }
             objc_registerClassPair(k);
+            // The legacy class metadata isn't read for protocols. Without this one, AppKit doesn't deliver typed characters
+            // to the view and plays the error sound for each of them.
+            const char *ignored;
+            if (gclass_method_types(g, "insertText:replacementRange:", 0, &ignored)) {
+                Protocol *tic = objc_getProtocol("NSTextInputClient");
+                if (tic) class_addProtocol(k, tic);
+                else fprintf(stderr, "[objc] NSTextInputClient protocol not found\n");
+            }
             done[i] = 1;
         }
     }

@@ -3,6 +3,7 @@
 C code the lifter emits, compiled for arm64. Compares registers, XMM state and defined flags."""
 import os
 import random
+import re
 import struct
 import subprocess
 import sys
@@ -109,6 +110,17 @@ for imm in ("0x1b", "0xe4", "0x0", "0xff"):
     t(f"pshuflw xmm1, xmm2, {imm}", 0)
     t(f"pshufhw xmm1, xmm2, {imm}", 0)
 t("shufpd xmm1, xmm2, 0x1", 0)
+t("paddsw xmm1, xmm2", 0)
+# MMX: the registers are loaded from and stored back through xmm1 and xmm2's low halves.
+for op in "paddw paddsw psubw psubusw pmulhw pand por pxor punpcklbw punpcklwd punpckldq punpckhbw punpckhwd punpckhdq packuswb".split():
+    t(f"{op} mm1, mm2", 0)
+for op in "psllw pslld psllq psrlw psrld psrlq".split():
+    for count in ("0x1", "0x7", "0x10", "0x21"):
+        t(f"{op} mm1, {count}", 0)
+    t(f"{op} mm1, mm2", 0)
+t("movq mm1, mm2", 0)
+t("movd mm1, eax", 0)
+t("movd ecx, mm2", 0)
 t("palignr xmm1, xmm2, 0x5", 0)
 for op, c in (("psllw", "3"), ("pslld", "7"), ("psllq", "33"), ("psrlw", "3"), ("psrld", "7"), ("psrlq", "33"), ("psraw", "3"), ("psrad", "7"), ("pslldq", "3"), ("psrldq", "5"), ("pslld", "40"), ("psrad", "40")):
     t(f"{op} xmm1, {c}", 0)
@@ -172,6 +184,10 @@ def make_states(n, seed=1234):
 STRUCT = """typedef struct { unsigned regs[6]; unsigned long long flags; unsigned char xmm[8][16]; } State;\n"""
 
 
+def is_mmx(text):
+    return re.search(r"\bmm[0-7]\b", text) is not None
+
+
 def gen_x86(path, states):
     with open(path, "w") as f:
         f.write('#include <stdio.h>\n' + STRUCT)
@@ -183,7 +199,11 @@ def gen_x86(path, states):
             for j in range(8):
                 f.write(f'" movups xmm{j}, xmmword ptr [r12+{32 + j * 16}]\\n"\n')
             f.write('" push qword ptr [r12+24]\\n popfq\\n"\n')
+            if is_mmx(text):
+                f.write('" movdq2q mm1, xmm1\\n movdq2q mm2, xmm2\\n"\n')
             f.write(f'" {text}\\n"\n')
+            if is_mmx(text):
+                f.write('" movq2dq xmm1, mm1\\n movq2dq xmm2, mm2\\n emms\\n"\n')
             f.write('" pushfq\\n pop qword ptr [r12+24]\\n"\n')
             for j, reg in enumerate(R):
                 f.write(f'" mov dword ptr [r12+{j * 4}], {reg}\\n"\n')
@@ -236,6 +256,9 @@ def gen_arm(path, states):
             mn, _, ops = text.partition(" ")
             ins = parse_lines([f"  1000:   \t{mn}\t{ops}", "  1010:   \tnop"])[0]
             body = emit(ins, ALL)
+            if is_mmx(text):
+                body = (f"c->mm[1]=X(1).q[0];c->mm[2]=X(2).q[0];{body}"
+                        "X(1).q[0]=c->mm[1];X(1).q[1]=0;X(2).q[0]=c->mm[2];X(2).q[1]=0;")
             f.write(f"static void t_{k}(State *s){{CPU cc={{0}};CPU *restrict c=&cc;cc.mxcsr=0x1f80;load(c,s);LOCALS;"
                     "cf=s->flags&1;pf=(s->flags>>2)&1;af=(s->flags>>4)&1;zf=(s->flags>>6)&1;sf=(s->flags>>7)&1;of=(s->flags>>11)&1;\n"
                     f"{body}\nSAVE;store(c,s,cf,zf,sf,of,pf,af);}}\n")

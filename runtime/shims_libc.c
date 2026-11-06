@@ -1,5 +1,6 @@
 // libSystem: strings, memory, stdio, files, time, math. Guest pointers are 32-bit offsets into rt_mem.
 #include "shim.h"
+#include <pthread.h>
 #include "shim_reg.h"
 
 #include <ctype.h>
@@ -21,9 +22,14 @@
 #include <wchar.h>
 
 // ---------- errno ----------
-static u32 errno_slot;
-SHIM(__error) { RET(errno_slot); }
-static inline void set_errno(void) { G32(errno_slot) = (u32)errno; }
+// Each guest thread has its own errno.
+static __thread u32 tl_errno;
+static u32 errno_addr(void) {
+    if (!tl_errno) tl_errno = rt_guest_calloc(1, 16);
+    return tl_errno;
+}
+SHIM(__error) { RET(errno_addr()); }
+static inline void set_errno(void) { int e = errno; G32(errno_addr()) = (u32)e; }
 
 // ---------- handles for opaque host pointers ----------
 #define HANDLE_BASE 0xEE000000u
@@ -31,13 +37,16 @@ static inline void set_errno(void) { G32(errno_slot) = (u32)errno; }
 static void *handles[HANDLE_MAX];
 static u32 handle_next = 1;
 
+static pthread_mutex_t handle_mu = PTHREAD_MUTEX_INITIALIZER;
 u32 rt_handle_new(void *p) {
     if (!p) return 0;
+    pthread_mutex_lock(&handle_mu);
     for (u32 i = 0; i < HANDLE_MAX; i++) {
         u32 k = (handle_next + i) % HANDLE_MAX;
         if (k && !handles[k]) {
             handles[k] = p;
             handle_next = k + 1;
+            pthread_mutex_unlock(&handle_mu);
             return HANDLE_BASE + k * 16;
         }
     }
@@ -102,12 +111,7 @@ SHIM(realloc) { RET(rt_guest_realloc(ARG(0), ARG(1))); }
 SHIM(free) { rt_guest_free(ARG(0)); }
 SHIM(malloc_size) { RET(rt_guest_block_size(ARG(0))); }
 SHIM(posix_memalign) {
-    u32 al = ARG(1), sz = ARG(2);
-    u32 raw = rt_guest_malloc(sz + al + 16);
-    u32 a = (raw + al - 1) & ~(al - 1);
-    // Plain free() is not supported for over-aligned blocks unless the alignment is 16.
-    if (al <= 16) a = raw;
-    G32(ARG(0)) = a;
+    G32(ARG(0)) = rt_guest_memalign(ARG(1), ARG(2));
     RET(0);
 }
 
@@ -370,6 +374,52 @@ static int gscanf(const char *s, const char *fmt, u32 va) {
 }
 SHIM(sscanf) { RET(gscanf(GS(ARG(0)), GS(ARG(1)), VAP(2))); }
 
+// The same for wide strings. The engine parses bone names with this, so a stub silently loses cape and rig data.
+static int gwscanf(const wchar_t *s, const wchar_t *fmt, u32 va) {
+    wchar_t f2[1024];
+    size_t k = 0;
+    void *p[16] = {0};
+    int np = 0;
+    for (const wchar_t *q = fmt; *q && k < 1022; q++) {
+        if (*q != L'%') {
+            f2[k++] = *q;
+            continue;
+        }
+        f2[k++] = *q++;
+        if (*q == L'%') {
+            f2[k++] = *q;
+            continue;
+        }
+        int star = 0;
+        if (*q == L'*') {
+            star = 1;
+            f2[k++] = *q++;
+        }
+        while (*q >= L'0' && *q <= L'9') f2[k++] = *q++;
+        int ell = 0;
+        if (*q == L'l' && q[1] != L'l') {
+            ell = 1;
+            q++;
+        } else if (*q == L'z' || *q == L't') {
+            q++;
+        }
+        while (*q && wcschr(L"hlqjL", *q)) f2[k++] = *q++;
+        // A guest long is 32 bits, so "l" stays only where it changes the type on both sides.
+        if (ell && wcschr(L"feEgGaAsc[", *q)) f2[k++] = L'l';
+        if (*q == L'[') {
+            while (*q && *q != L']') f2[k++] = *q++;
+        }
+        f2[k++] = *q;
+        if (!star && np < 16) {
+            p[np++] = GP(G32(va));
+            va += 4;
+        }
+    }
+    f2[k] = 0;
+    return swscanf(s, f2, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+}
+SHIM(vswscanf) { RET(gwscanf((const wchar_t *)GP(ARG(0)), (const wchar_t *)GP(ARG(1)), ARG(2))); }
+
 // ---------- number parsing ----------
 static void set_endp(u32 endp, u32 gbase, const char *base, const char *e) {
     if (endp) G32(endp) = gbase + (u32)(e - base);
@@ -512,17 +562,13 @@ SHIM(open) {
 }
 SHIM(close) { RET(close((int)ARG(0))); }
 SHIM(read) {
-    rt_gate_release();
     ssize_t r = read((int)ARG(0), GP(ARG(1)), ARG(2));
-    rt_gate_acquire();
     if (r < 0) set_errno();
     RET((i32)r);
 }
 SHIM(write) { ssize_t r = write((int)ARG(0), GS(ARG(1)), ARG(2)); if (r < 0) set_errno(); RET((i32)r); }
 SHIM(pread) {
-    rt_gate_release();
     ssize_t r = pread((int)ARG(0), GP(ARG(1)), ARG(2), (off_t)ARGQ(3));
-    rt_gate_acquire();
     if (r < 0) set_errno();
     RET((i32)r);
 }
@@ -690,6 +736,7 @@ SHIM(abort) {
 }
 SHIM(_Exit) { _exit((int)ARG(0)); }
 SHIM(exit) {
+    rt_glq_drain();
     fprintf(stderr, "[rt] guest exit(%d)\n", (int)ARG(0));
     void *frames[48];
     int n = backtrace(frames, 48);
@@ -1023,7 +1070,6 @@ SHIM(_dyld_register_func_for_remove_image) {}
 
 void rt_libc_init(CPU *c) {
     trace_fs = getenv("ARKHAM_TRACE_FS") != NULL;
-    errno_slot = rt_guest_malloc(16);
     u32 s = rt_import_addr("___stderrp");
     if (s) G32(s) = rt_handle_new(stderr);
     s = rt_import_addr("___stdoutp");
@@ -1044,12 +1090,12 @@ const ShimReg rt_shims_libc[] = {
     R(memcpy) R(__memcpy_chk) R(memmove) R(memset) R(__bzero) R(memcmp) R(memchr) R(memset_pattern16)
     R(wcslen) R(wcscmp) R(wcsncmp) R(mbstowcs) R(malloc) R(calloc) R(realloc) R(free) R(malloc_size) R(posix_memalign)
     R(printf) R(fprintf) R(vfprintf) R(sprintf) R(snprintf) R(vsprintf) R(vsnprintf) R(__sprintf_chk) R(__snprintf_chk)
-    R(asprintf) R(puts) R(putchar) R(fputs) R2("_fputs$UNIX2003", fputs) R(sscanf) R(atoi) R(atof) R(strtol) R(strtoul) R(strtoll)
+    R(asprintf) R(puts) R(putchar) R(fputs) R2("_fputs$UNIX2003", fputs) R(sscanf) R(vswscanf) R(atoi) R(atof) R(strtol) R(strtoul) R(strtoll)
     R(strtoull) R(strtod) R2("_strtod$UNIX2003", strtod) R2("_strtof$UNIX2003", strtof)
     R(__tolower) R(__toupper) R(__maskrune) R(btowc) R(wctob)
     R(fopen) R2("_fopen$UNIX2003", fopen) R(fdopen) R(fclose) R(fread) R(fwrite) R2("_fwrite$UNIX2003", fwrite) R(fseek) R(fseeko)
     R(ftell) R(ftello) R(fflush) R(fgets) R(feof) R(ferror) R(fileno) R(getc) R(ungetc) R(rewind) R(setvbuf) R(clearerr)
-    R(open) R(close) R2("_close$UNIX2003", close) R(read) R(write) R(pread) R(pwrite) R(lseek) R(access) R(mkdir) R(rmdir)
+    R(open) R2("_open$UNIX2003", open) R(close) R2("_close$UNIX2003", close) R(read) R2("_read$UNIX2003", read) R(write) R(pread) R(pwrite) R(lseek) R(access) R(mkdir) R(rmdir)
     R(unlink) R(remove) R(rename) R(chmod) R(ftruncate) R(truncate) R(fsync) R(isatty) R(dup) R(dup2) R(fcntl) R(umask) R(readlink)
     R2("_realpath$DARWIN_EXTSN", realpath)
     R2("_stat$INODE64", stat64) R2("_stat64", stat64) R2("_lstat", lstat32) R2("_stat", stat32) R2("_fstat", fstat32) R2("_fstat64", fstat64)

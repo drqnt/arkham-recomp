@@ -49,6 +49,18 @@ def size_of(op: Op, default: int = 4) -> int:
     return op.size or default
 
 
+# Set while emitting a function in UNALIGNED_FUNCTIONS (tools/lift.py).
+plain_memory = False
+
+
+def is_shared(op: Op) -> bool:
+    """Memory that other threads may see. x86 keeps loads and stores in order, so these accesses must stay ordered here.
+    Accesses through the stack and frame pointers are the thread's own."""
+    if plain_memory:
+        return False
+    return op.base not in ("esp", "ebp") or op.seg == "gs"
+
+
 def rd(op: Op, size: int = 0) -> str:
     k = op.kind
     if k == "r32":
@@ -62,6 +74,8 @@ def rd(op: Op, size: int = 0) -> str:
         return hx(op.val & ((1 << (8 * s)) - 1)) if s < 4 else hx(op.val)
     if k == "mem":
         s = op.size or size or 4
+        if s <= 4 and is_shared(op):
+            return f"RA{BITS[s]}({addr(op)})"
         return f"R{BITS[s]}({addr(op)})"
     raise Unsupported(f"rd {k}")
 
@@ -77,7 +91,10 @@ def wr(op: Op, expr: str) -> str:
             return f"{op.reg}=({op.reg}&0xffff00ffu)|((u32)(u8)({expr})<<8);"
         return f"{op.reg}=({op.reg}&0xffffff00u)|(u8)({expr});"
     if k == "mem":
-        return f"R{BITS[op.size or 4]}({addr(op)})={expr};"
+        s = op.size or 4
+        if s <= 4 and is_shared(op):
+            return f"WA{BITS[s]}({addr(op)},{expr});"
+        return f"R{BITS[s]}({addr(op)})={expr};"
     raise Unsupported(f"wr {k}")
 
 
@@ -222,6 +239,8 @@ def e_inc(i: Ins, live: int) -> str:
         f += f"of=(r==(({T})1<<{b - 1}));"
     if live & A:
         f += "af=(r&0xf)==0;"
+    if d.kind == "mem" and i.lock:
+        return f"{{{T} r=({T})(__atomic_fetch_add(({T} *)(M+(u32)({addr(d)})),1,__ATOMIC_SEQ_CST)+1);{f}}}"
     return f"{{{T} r=({T})({rd(d, sz)}+1);{wr(d, 'r')}{f}}}"
 
 
@@ -234,6 +253,8 @@ def e_dec(i: Ins, live: int) -> str:
         f += f"of=(r==({T})(({T})1<<{b - 1})-1);"
     if live & A:
         f += "af=(r&0xf)==0xf;"
+    if d.kind == "mem" and i.lock:
+        return f"{{{T} r=({T})(__atomic_fetch_sub(({T} *)(M+(u32)({addr(d)})),1,__ATOMIC_SEQ_CST)-1);{f}}}"
     return f"{{{T} r=({T})({rd(d, sz)}-1);{wr(d, 'r')}{f}}}"
 
 
@@ -486,6 +507,10 @@ def e_xchg(i: Ins, live: int) -> str:
     T = TYPES[sz]
     if d == s:
         return ""
+    # An exchange with memory is always atomic on x86, lock prefix or not.
+    if d.kind == "mem" or s.kind == "mem":
+        m, r = (d, s) if d.kind == "mem" else (s, d)
+        return f"{{{T} a=__atomic_exchange_n(({T} *)(M+(u32)({addr(m)})),{rd(r, sz)},__ATOMIC_SEQ_CST);{wr(r, 'a')}}}"
     return f"{{{T} a={rd(d, sz)},b={rd(s, sz)};{wr(d, 'b')}{wr(s, 'a')}}}"
 
 
@@ -500,6 +525,9 @@ def e_xadd(i: Ins, live: int) -> str:
         f += f"of=(((a^r)&(b^r))>>{b - 1})&1;"
     if live & A:
         f += "af=((a^b^r)>>4)&1;"
+    if d.kind == "mem" and i.lock:
+        return (f"{{{T} b={rd(s, sz)};{T} a=__atomic_fetch_add(({T} *)(M+(u32)({addr(d)})),b,__ATOMIC_SEQ_CST);"
+                f"{T} r=({T})(a+b);{wr(s, 'a')}{f}}}")
     return f"{{{T} a={rd(d, sz)},b={rd(s, sz)};{T} r=({T})(a+b);{wr(s, 'a')}{wr(d, 'r')}{f}}}"
 
 
@@ -515,6 +543,9 @@ def e_cmpxchg(i: Ins, live: int) -> str:
         f += f"of=(((a^b)&(a^r))>>{b - 1})&1;"
     if live & A:
         f += "af=((a^b^r)>>4)&1;"
+    if d.kind == "mem" and i.lock:
+        return (f"{{{T} a={rd(acc)};{T} b=a;__atomic_compare_exchange_n(({T} *)(M+(u32)({addr(d)})),&b,{rd(s, sz)},0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST);"
+                f"{T} r=({T})(a-b);if(a!=b){{{wr(acc, 'b')}}}{f}}}")
     return (f"{{{T} a={rd(acc)},b={rd(d, sz)};{T} r=({T})(a-b);if(a==b){{{wr(d, rd(s, sz))}}}"
             f"else{{{wr(acc, 'b')}}}{f}}}")
 
@@ -524,6 +555,9 @@ def e_cmpxchg8b(i: Ins, live: int) -> str:
     a = addr(m)
     z = "zf=1;" if live & Z else ""
     nz = "zf=0;" if live & Z else ""
+    if i.lock:
+        return (f"{{u64 q=((u64)edx<<32)|eax;if(__atomic_compare_exchange_n((u64 *)(M+(u32)({a})),&q,((u64)ecx<<32)|ebx,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST)){{{z}}}"
+                f"else{{eax=(u32)q;edx=(u32)(q>>32);{nz}}}}}")
     return (f"{{u64 q=R64({a});if(q==(((u64)edx<<32)|eax)){{R64({a})=((u64)ecx<<32)|ebx;{z}}}"
             f"else{{eax=(u32)q;edx=(u32)(q>>32);{nz}}}}}")
 
@@ -1033,11 +1067,13 @@ def e_lahf(i: Ins, live: int) -> str:
 
 
 def e_pushfd(i: Ins, live: int) -> str:
-    return ("esp-=4;R32(esp)=(of<<11)|(c->df<<10)|(sf<<7)|(zf<<6)|(af<<4)|(pf<<2)|2u|cf;")
+    # The ID flag has no effect here, but CPU detection code checks that it can be toggled.
+    return ("esp-=4;R32(esp)=(of<<11)|(c->df<<10)|(sf<<7)|(zf<<6)|(af<<4)|(pf<<2)|2u|cf|c->id_flag;")
 
 
 def e_popfd(i: Ins, live: int) -> str:
-    return ("{u32 v=R32(esp);esp+=4;of=(v>>11)&1;c->df=(v>>10)&1;sf=(v>>7)&1;zf=(v>>6)&1;af=(v>>4)&1;pf=(v>>2)&1;cf=v&1;}")
+    return ("{u32 v=R32(esp);esp+=4;of=(v>>11)&1;c->df=(v>>10)&1;sf=(v>>7)&1;zf=(v>>6)&1;af=(v>>4)&1;pf=(v>>2)&1;cf=v&1;"
+            "c->id_flag=v&0x200000u;}")
 
 
 def e_static(text: str):
@@ -1061,11 +1097,11 @@ EMIT = {
     "bswap": e_bswap, "bt": e_bt("bt"), "bts": e_bt("bts"), "btr": e_bt("btr"), "btc": e_bt("btc"),
     "bsf": e_bsf, "bsr": e_bsr, "cdq": e_cdq, "cwde": e_cwde, "cbw": e_cbw, "cwd": e_cwd,
     "nop": e_nop, "prefetcht0": e_nop, "prefetcht1": e_nop, "prefetcht2": e_nop, "prefetchnta": e_nop,
-    "mfence": e_nop, "lfence": e_nop, "sfence": e_nop, "emms": e_nop, "wait": e_nop, "fwait": e_nop,
+    "mfence": e_static("__atomic_thread_fence(__ATOMIC_SEQ_CST);"), "lfence": e_nop, "sfence": e_nop, "emms": e_nop, "wait": e_nop, "fwait": e_nop,
     "cld": e_static("c->df=0;"), "std": e_static("c->df=1;"),
     "clc": e_static("cf=0;"), "stc": e_static("cf=1;"), "cmc": e_static("cf=!cf;"),
     "sahf": e_sahf, "lahf": e_lahf, "pushfd": e_pushfd, "popfd": e_popfd, "cpuid": e_cpuid,
-    "pause": e_static("POLL;"),
+    "pause": e_static("CPU_PAUSE;"),
     "movsb": e_string, "movsw": e_string, "stosb": e_string, "stosw": e_string, "stosd": e_string,
     "lodsb": e_string, "lodsw": e_string, "lodsd": e_string, "scasb": e_string, "scasw": e_string, "scasd": e_string,
     "cmpsb": e_string, "cmpsw": e_string,
@@ -1108,7 +1144,7 @@ for _cc in CONDS:
 for _n in ("addps subps mulps divps minps maxps andps orps xorps andnps addpd subpd mulpd divpd minpd maxpd andpd orpd "
            "xorpd andnpd pand por pxor pandn paddb paddw paddd paddq psubb psubw psubd psubq psubusw psubusb paddusw "
            "paddusb pmullw pmulhw pmuludq pmaddwd pavgb pavgw pminub pmaxub pminsw pmaxsw psadbw pcmpeqb pcmpeqw pcmpeqd "
-           "pcmpgtb pcmpgtw pcmpgtd punpcklbw punpcklwd punpckldq punpcklqdq punpckhbw punpckhwd punpckhdq punpckhqdq "
+           "paddsw pcmpgtb pcmpgtw pcmpgtd punpcklbw punpcklwd punpckldq punpcklqdq punpckhbw punpckhwd punpckhdq punpckhqdq "
            "packuswb packsswb packssdw unpcklps unpckhps unpcklpd unpckhpd haddps haddpd phaddd pshufb").split():
     EMIT[_n] = e_pack(_n)
 for _n in ("sqrtps sqrtpd rsqrtps rcpps cvtdq2ps cvttps2dq cvtps2dq cvtps2pd cvtpd2ps cvtdq2pd cvttpd2dq").split():
@@ -1130,8 +1166,45 @@ def is_string_form(i: Ins) -> bool:
     return "es:[" in i.text or "ds:[" in i.text
 
 
+# MMX registers live in the CPU struct. Only the operations the Bink library uses are implemented.
+MMX_BIN = set("paddw paddsw psubw psubusw pmulhw pand por pxor punpcklbw punpcklwd punpckldq punpckhbw punpckhwd "
+              "punpckhdq packuswb".split())
+MMX_SHIFT = set("psllw pslld psllq psrlw psrld psrlq".split())
+
+
+def _mm_src(o: Op) -> str:
+    if o.kind == "mm":
+        return f"c->mm[{o.val}]"
+    if o.kind == "x":
+        return f"X({o.val}).q[0]"
+    return f"R64({addr(o)})"
+
+
+def e_mmx(i: Ins, live: int) -> str:
+    mn = i.mn
+    d, s = i.ops
+    if mn == "movq":
+        if d.kind == "mm":
+            return f"{{u64 v={_mm_src(s)};c->mm[{d.val}]=v;}}"
+        if d.kind == "x":
+            return f"{{u64 v=c->mm[{s.val}];X({d.val}).q[0]=v;X({d.val}).q[1]=0;}}"
+        return f"R64({addr(d)})=c->mm[{s.val}];"
+    if mn == "movd":
+        if d.kind == "mm":
+            return f"c->mm[{d.val}]=(u64)(u32)({rd(s, 4)});"
+        return wr(d, f"(u32)c->mm[{s.val}]")
+    if mn in MMX_BIN:
+        return f"{{u64 b_={_mm_src(s)};c->mm[{d.val}]=mmx_{mn}(c->mm[{d.val}],b_);}}"
+    if mn in MMX_SHIFT:
+        count = f"(u64){s.val & 0xFF}u" if s.kind == "imm" else _mm_src(s)
+        return f"{{u64 b_={count};c->mm[{d.val}]=mmx_{mn}(c->mm[{d.val}],b_);}}"
+    raise Unsupported(f"mmx {mn}")
+
+
 def emit(i: Ins, live: int) -> str:
     mn = i.mn
+    if any(o.kind == "mm" for o in i.ops):
+        return e_mmx(i, live)
     if mn == "movsd":
         return e_string(i, live) if is_string_form(i) else e_movsd(i, live)
     if mn == "cmpsd" and is_string_form(i):

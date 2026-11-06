@@ -63,6 +63,7 @@ BITOP(pand, &) BITOP(por, |) BITOP(pxor, ^) ANDN(pandn)
 INTOP(paddb, b, 16, u8, x + y) INTOP(paddw, w, 8, u16, x + y) INTOP(paddd, u, 4, u32, x + y) INTOP(paddq, q, 2, u64, x + y)
 INTOP(psubb, b, 16, u8, x - y) INTOP(psubw, w, 8, u16, x - y) INTOP(psubd, u, 4, u32, x - y) INTOP(psubq, q, 2, u64, x - y)
 INTOP(psubusb, b, 16, u8, x > y ? x - y : 0) INTOP(psubusw, w, 8, u16, x > y ? x - y : 0)
+INTOP(paddsw, s, 8, i16, (i32)x + y > 32767 ? 32767 : (i32)x + y < -32768 ? -32768 : x + y)
 INTOP(paddusb, b, 16, u8, (u32)x + y > 255 ? 255 : x + y) INTOP(paddusw, w, 8, u16, (u32)x + y > 65535 ? 65535 : x + y)
 INTOP(pmullw, s, 8, i16, (i32)x * y) INTOP(pmulhw, s, 8, i16, ((i32)x * y) >> 16)
 INTOP(pavgb, b, 16, u8, ((u32)x + y + 1) >> 1) INTOP(pavgw, w, 8, u16, ((u32)x + y + 1) >> 1)
@@ -278,3 +279,64 @@ static inline void rt_fcom(CPU *c, double a, double b) {
     c->fsw = s;
 }
 static inline u16 rt_fsw(CPU *c) { return (u16)((c->fsw & 0xC7FFu) | ((c->top & 7) << 11)); }
+
+// ---------- MMX: 64-bit registers, one helper per operation the Bink library uses ----------
+typedef union { u64 q; u32 u[2]; u16 w[4]; i16 s[4]; u8 b[8]; } mmv;
+#define MMX_W(name, expr) static inline u64 mmx_##name(u64 a_, u64 b_) { \
+    mmv a = {a_}, b = {b_}, r; \
+    for (int i = 0; i < 4; i++) { i32 x = a.s[i], y = b.s[i]; u32 ux = a.w[i], uy = b.w[i]; (void)x; (void)y; (void)ux; (void)uy; r.w[i] = (u16)(expr); } \
+    return r.q; }
+MMX_W(paddw, ux + uy)
+MMX_W(psubw, ux - uy)
+MMX_W(paddsw, x + y > 32767 ? 32767 : x + y < -32768 ? -32768 : x + y)
+MMX_W(psubusw, ux > uy ? ux - uy : 0)
+MMX_W(pmulhw, (x * y) >> 16)
+static inline u64 mmx_pand(u64 a, u64 b) { return a & b; }
+static inline u64 mmx_por(u64 a, u64 b) { return a | b; }
+static inline u64 mmx_pxor(u64 a, u64 b) { return a ^ b; }
+static inline u64 mmx_punpcklbw(u64 a_, u64 b_) {
+    mmv a = {a_}, b = {b_}, r;
+    for (int i = 0; i < 4; i++) { r.b[i * 2] = a.b[i]; r.b[i * 2 + 1] = b.b[i]; }
+    return r.q;
+}
+static inline u64 mmx_punpckhbw(u64 a_, u64 b_) {
+    mmv a = {a_}, b = {b_}, r;
+    for (int i = 0; i < 4; i++) { r.b[i * 2] = a.b[i + 4]; r.b[i * 2 + 1] = b.b[i + 4]; }
+    return r.q;
+}
+static inline u64 mmx_punpcklwd(u64 a_, u64 b_) {
+    mmv a = {a_}, b = {b_}, r;
+    for (int i = 0; i < 2; i++) { r.w[i * 2] = a.w[i]; r.w[i * 2 + 1] = b.w[i]; }
+    return r.q;
+}
+static inline u64 mmx_punpckhwd(u64 a_, u64 b_) {
+    mmv a = {a_}, b = {b_}, r;
+    for (int i = 0; i < 2; i++) { r.w[i * 2] = a.w[i + 2]; r.w[i * 2 + 1] = b.w[i + 2]; }
+    return r.q;
+}
+static inline u64 mmx_punpckldq(u64 a, u64 b) { return (a & 0xFFFFFFFFull) | (b << 32); }
+static inline u64 mmx_punpckhdq(u64 a, u64 b) { return (a >> 32) | (b & 0xFFFFFFFF00000000ull); }
+static inline u64 mmx_packuswb(u64 a_, u64 b_) {
+    mmv a = {a_}, b = {b_}, r;
+    for (int i = 0; i < 4; i++) {
+        i32 x = a.s[i], y = b.s[i];
+        r.b[i] = (u8)(x < 0 ? 0 : x > 255 ? 255 : x);
+        r.b[i + 4] = (u8)(y < 0 ? 0 : y > 255 ? 255 : y);
+    }
+    return r.q;
+}
+// A count beyond the element width clears the register, and the whole 64-bit count operand decides that.
+#define MMX_SHIFT_W(name, op) static inline u64 mmx_##name(u64 a_, u64 n) { \
+    if (n > 15) return 0; \
+    mmv a = {a_}, r; \
+    for (int i = 0; i < 4; i++) r.w[i] = (u16)((u32)a.w[i] op n); \
+    return r.q; }
+#define MMX_SHIFT_D(name, op) static inline u64 mmx_##name(u64 a_, u64 n) { \
+    if (n > 31) return 0; \
+    mmv a = {a_}, r; \
+    for (int i = 0; i < 2; i++) r.u[i] = a.u[i] op n; \
+    return r.q; }
+MMX_SHIFT_W(psllw, <<) MMX_SHIFT_W(psrlw, >>)
+MMX_SHIFT_D(pslld, <<) MMX_SHIFT_D(psrld, >>)
+static inline u64 mmx_psllq(u64 a, u64 n) { return n > 63 ? 0 : a << n; }
+static inline u64 mmx_psrlq(u64 a, u64 n) { return n > 63 ? 0 : a >> n; }

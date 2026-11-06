@@ -11,7 +11,6 @@ SHIM(glAttachShader) { static void (*f)(unsigned int, unsigned int); if (!f) { f
 SHIM(glBeginQuery) { static void (*f)(unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glBeginQuery"); if (!f) { gl_missing("glBeginQuery"); return; } } f(ARG(0), ARG(1)); }
 SHIM(glBeginTransformFeedback) { static void (*f)(unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glBeginTransformFeedback"); if (!f) { gl_missing("glBeginTransformFeedback"); return; } } f(ARG(0)); }
 SHIM(glBindAttribLocation) { static void (*f)(unsigned int, unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glBindAttribLocation"); if (!f) { gl_missing("glBindAttribLocation"); return; } } f(ARG(0), ARG(1), NP(ARG(2))); }
-SHIM(glBindBuffer) { static void (*f)(unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glBindBuffer"); if (!f) { gl_missing("glBindBuffer"); return; } } f(ARG(0), ARG(1)); }
 SHIM(glBindBufferBase) { static void (*f)(unsigned int, unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glBindBufferBase"); if (!f) { gl_missing("glBindBufferBase"); return; } } f(ARG(0), ARG(1), ARG(2)); }
 SHIM(glBindBufferRange) { static void (*f)(unsigned int, unsigned int, unsigned int, long, long); if (!f) { f = dlsym(RTLD_DEFAULT, "glBindBufferRange"); if (!f) { gl_missing("glBindBufferRange"); return; } } f(ARG(0), ARG(1), ARG(2), (long)(i32)ARG(3), (long)(i32)ARG(4)); }
 SHIM(glBindFragDataLocation) { static void (*f)(unsigned int, unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glBindFragDataLocation"); if (!f) { gl_missing("glBindFragDataLocation"); return; } } f(ARG(0), ARG(1), NP(ARG(2))); }
@@ -21,7 +20,6 @@ SHIM(glBindProgramPipeline) { static void (*f)(unsigned int); if (!f) { f = dlsy
 SHIM(glBindRenderbuffer) { static void (*f)(unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glBindRenderbuffer"); if (!f) { gl_missing("glBindRenderbuffer"); return; } } f(ARG(0), ARG(1)); }
 SHIM(glBindSampler) { static void (*f)(unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glBindSampler"); if (!f) { gl_missing("glBindSampler"); return; } } f(ARG(0), ARG(1)); }
 SHIM(glBindTexture) { static void (*f)(unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glBindTexture"); if (!f) { gl_missing("glBindTexture"); return; } } f(ARG(0), ARG(1)); }
-SHIM(glBindVertexArray) { static void (*f)(unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glBindVertexArray"); if (!f) { gl_missing("glBindVertexArray"); return; } } f(ARG(0)); }
 SHIM(glBlendColor) { static void (*f)(float, float, float, float); if (!f) { f = dlsym(RTLD_DEFAULT, "glBlendColor"); if (!f) { gl_missing("glBlendColor"); return; } } f(ARGF(0), ARGF(1), ARGF(2), ARGF(3)); }
 SHIM(glBlendEquation) { static void (*f)(unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glBlendEquation"); if (!f) { gl_missing("glBlendEquation"); return; } } f(ARG(0)); }
 SHIM(glBlendEquationSeparate) { static void (*f)(unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glBlendEquationSeparate"); if (!f) { gl_missing("glBlendEquationSeparate"); return; } } f(ARG(0), ARG(1)); }
@@ -52,7 +50,6 @@ SHIM(glColorMaskIndexedEXT) { static void (*f)(unsigned int, unsigned int, unsig
 SHIM(glColorMaski) { static void (*f)(unsigned int, unsigned int, unsigned int, unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glColorMaski"); if (!f) { gl_missing("glColorMaski"); return; } } f(ARG(0), ARG(1), ARG(2), ARG(3), ARG(4)); }
 SHIM(glColorMaterial) { static void (*f)(unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glColorMaterial"); if (!f) { gl_missing("glColorMaterial"); return; } } f(ARG(0), ARG(1)); }
 SHIM(glColorPointer) { static void (*f)(unsigned int, unsigned int, unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glColorPointer"); if (!f) { gl_missing("glColorPointer"); return; } } f(ARG(0), ARG(1), ARG(2), gl_ptr_or_offset(ARG(3), GL_ARRAY_BUFFER_BINDING)); }
-SHIM(glCompileShader) { static void (*f)(unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glCompileShader"); if (!f) { gl_missing("glCompileShader"); return; } } f(ARG(0)); }
 SHIM(glCompressedTexImage1D) { static void (*f)(unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glCompressedTexImage1D"); if (!f) { gl_missing("glCompressedTexImage1D"); return; } } f(ARG(0), ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), gl_ptr_or_offset(ARG(6), GL_PIXEL_UNPACK_BUFFER_BINDING)); }
 SHIM(glCompressedTexImage2D) { static void (*f)(unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glCompressedTexImage2D"); if (!f) { gl_missing("glCompressedTexImage2D"); return; } } f(ARG(0), ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6), gl_ptr_or_offset(ARG(7), GL_PIXEL_UNPACK_BUFFER_BINDING)); }
 SHIM(glCompressedTexImage3D) { static void (*f)(unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glCompressedTexImage3D"); if (!f) { gl_missing("glCompressedTexImage3D"); return; } } f(ARG(0), ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6), ARG(7), gl_ptr_or_offset(ARG(8), GL_PIXEL_UNPACK_BUFFER_BINDING)); }
@@ -65,7 +62,6 @@ SHIM(glCopyTexSubImage2D) { static void (*f)(unsigned int, unsigned int, unsigne
 SHIM(glCreateProgram) { static unsigned int (*f)(void); if (!f) { f = dlsym(RTLD_DEFAULT, "glCreateProgram"); if (!f) { gl_missing("glCreateProgram"); return; } } RET(f()); }
 SHIM(glCreateShader) { static unsigned int (*f)(unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glCreateShader"); if (!f) { gl_missing("glCreateShader"); return; } } RET(f(ARG(0))); }
 SHIM(glCullFace) { static void (*f)(unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glCullFace"); if (!f) { gl_missing("glCullFace"); return; } } f(ARG(0)); }
-SHIM(glDeleteBuffers) { static void (*f)(unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glDeleteBuffers"); if (!f) { gl_missing("glDeleteBuffers"); return; } } f(ARG(0), NP(ARG(1))); }
 SHIM(glDeleteFencesAPPLE) { static void (*f)(unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glDeleteFencesAPPLE"); if (!f) { gl_missing("glDeleteFencesAPPLE"); return; } } f(ARG(0), NP(ARG(1))); }
 SHIM(glDeleteFramebuffers) { static void (*f)(unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glDeleteFramebuffers"); if (!f) { gl_missing("glDeleteFramebuffers"); return; } } f(ARG(0), NP(ARG(1))); }
 SHIM(glDeleteProgram) { static void (*f)(unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDeleteProgram"); if (!f) { gl_missing("glDeleteProgram"); return; } } f(ARG(0)); }
@@ -86,18 +82,18 @@ SHIM(glDisableClientState) { static void (*f)(unsigned int); if (!f) { f = dlsym
 SHIM(glDisableIndexedEXT) { static void (*f)(unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDisableIndexedEXT"); if (!f) { gl_missing("glDisableIndexedEXT"); return; } } f(ARG(0), ARG(1)); }
 SHIM(glDisableVertexAttribArray) { static void (*f)(unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDisableVertexAttribArray"); if (!f) { gl_missing("glDisableVertexAttribArray"); return; } } f(ARG(0)); }
 SHIM(glDisablei) { static void (*f)(unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDisablei"); if (!f) { gl_missing("glDisablei"); return; } } f(ARG(0), ARG(1)); }
-SHIM(glDrawArrays) { static void (*f)(unsigned int, unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawArrays"); if (!f) { gl_missing("glDrawArrays"); return; } } f(ARG(0), ARG(1), ARG(2)); }
-SHIM(glDrawArraysIndirect) { static void (*f)(unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawArraysIndirect"); if (!f) { gl_missing("glDrawArraysIndirect"); return; } } f(ARG(0), gl_ptr_or_offset(ARG(1), GL_DRAW_INDIRECT_BUFFER_BINDING)); }
-SHIM(glDrawArraysInstanced) { static void (*f)(unsigned int, unsigned int, unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawArraysInstanced"); if (!f) { gl_missing("glDrawArraysInstanced"); return; } } f(ARG(0), ARG(1), ARG(2), ARG(3)); }
+SHIM(glDrawArrays) { rt_gl_draws++; static void (*f)(unsigned int, unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawArrays"); if (!f) { gl_missing("glDrawArrays"); return; } } f(ARG(0), ARG(1), ARG(2)); }
+SHIM(glDrawArraysIndirect) { rt_gl_draws++; static void (*f)(unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawArraysIndirect"); if (!f) { gl_missing("glDrawArraysIndirect"); return; } } f(ARG(0), gl_ptr_or_offset(ARG(1), GL_DRAW_INDIRECT_BUFFER_BINDING)); }
+SHIM(glDrawArraysInstanced) { rt_gl_draws++; static void (*f)(unsigned int, unsigned int, unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawArraysInstanced"); if (!f) { gl_missing("glDrawArraysInstanced"); return; } } f(ARG(0), ARG(1), ARG(2), ARG(3)); }
 SHIM(glDrawBuffer) { static void (*f)(unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawBuffer"); if (!f) { gl_missing("glDrawBuffer"); return; } } f(ARG(0)); }
 SHIM(glDrawBuffers) { static void (*f)(unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawBuffers"); if (!f) { gl_missing("glDrawBuffers"); return; } } f(ARG(0), NP(ARG(1))); }
-SHIM(glDrawElements) { static void (*f)(unsigned int, unsigned int, unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawElements"); if (!f) { gl_missing("glDrawElements"); return; } } f(ARG(0), ARG(1), ARG(2), gl_ptr_or_offset(ARG(3), GL_ELEMENT_ARRAY_BUFFER_BINDING)); }
-SHIM(glDrawElementsBaseVertex) { static void (*f)(unsigned int, unsigned int, unsigned int, void *, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawElementsBaseVertex"); if (!f) { gl_missing("glDrawElementsBaseVertex"); return; } } f(ARG(0), ARG(1), ARG(2), gl_ptr_or_offset(ARG(3), GL_ELEMENT_ARRAY_BUFFER_BINDING), ARG(4)); }
-SHIM(glDrawElementsIndirect) { static void (*f)(unsigned int, unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawElementsIndirect"); if (!f) { gl_missing("glDrawElementsIndirect"); return; } } f(ARG(0), ARG(1), gl_ptr_or_offset(ARG(2), GL_DRAW_INDIRECT_BUFFER_BINDING)); }
-SHIM(glDrawElementsInstanced) { static void (*f)(unsigned int, unsigned int, unsigned int, void *, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawElementsInstanced"); if (!f) { gl_missing("glDrawElementsInstanced"); return; } } f(ARG(0), ARG(1), ARG(2), gl_ptr_or_offset(ARG(3), GL_ELEMENT_ARRAY_BUFFER_BINDING), ARG(4)); }
-SHIM(glDrawElementsInstancedBaseVertex) { static void (*f)(unsigned int, unsigned int, unsigned int, void *, unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawElementsInstancedBaseVertex"); if (!f) { gl_missing("glDrawElementsInstancedBaseVertex"); return; } } f(ARG(0), ARG(1), ARG(2), gl_ptr_or_offset(ARG(3), GL_ELEMENT_ARRAY_BUFFER_BINDING), ARG(4), ARG(5)); }
-SHIM(glDrawRangeElements) { static void (*f)(unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawRangeElements"); if (!f) { gl_missing("glDrawRangeElements"); return; } } f(ARG(0), ARG(1), ARG(2), ARG(3), ARG(4), gl_ptr_or_offset(ARG(5), GL_ELEMENT_ARRAY_BUFFER_BINDING)); }
-SHIM(glDrawRangeElementsBaseVertex) { static void (*f)(unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, void *, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawRangeElementsBaseVertex"); if (!f) { gl_missing("glDrawRangeElementsBaseVertex"); return; } } f(ARG(0), ARG(1), ARG(2), ARG(3), ARG(4), gl_ptr_or_offset(ARG(5), GL_ELEMENT_ARRAY_BUFFER_BINDING), ARG(6)); }
+SHIM(glDrawElements) { rt_gl_draws++; static void (*f)(unsigned int, unsigned int, unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawElements"); if (!f) { gl_missing("glDrawElements"); return; } } f(ARG(0), ARG(1), ARG(2), gl_ptr_or_offset(ARG(3), GL_ELEMENT_ARRAY_BUFFER_BINDING)); }
+SHIM(glDrawElementsBaseVertex) { rt_gl_draws++; static void (*f)(unsigned int, unsigned int, unsigned int, void *, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawElementsBaseVertex"); if (!f) { gl_missing("glDrawElementsBaseVertex"); return; } } f(ARG(0), ARG(1), ARG(2), gl_ptr_or_offset(ARG(3), GL_ELEMENT_ARRAY_BUFFER_BINDING), ARG(4)); }
+SHIM(glDrawElementsIndirect) { rt_gl_draws++; static void (*f)(unsigned int, unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawElementsIndirect"); if (!f) { gl_missing("glDrawElementsIndirect"); return; } } f(ARG(0), ARG(1), gl_ptr_or_offset(ARG(2), GL_DRAW_INDIRECT_BUFFER_BINDING)); }
+SHIM(glDrawElementsInstanced) { rt_gl_draws++; static void (*f)(unsigned int, unsigned int, unsigned int, void *, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawElementsInstanced"); if (!f) { gl_missing("glDrawElementsInstanced"); return; } } f(ARG(0), ARG(1), ARG(2), gl_ptr_or_offset(ARG(3), GL_ELEMENT_ARRAY_BUFFER_BINDING), ARG(4)); }
+SHIM(glDrawElementsInstancedBaseVertex) { rt_gl_draws++; static void (*f)(unsigned int, unsigned int, unsigned int, void *, unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawElementsInstancedBaseVertex"); if (!f) { gl_missing("glDrawElementsInstancedBaseVertex"); return; } } f(ARG(0), ARG(1), ARG(2), gl_ptr_or_offset(ARG(3), GL_ELEMENT_ARRAY_BUFFER_BINDING), ARG(4), ARG(5)); }
+SHIM(glDrawRangeElements) { rt_gl_draws++; static void (*f)(unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawRangeElements"); if (!f) { gl_missing("glDrawRangeElements"); return; } } f(ARG(0), ARG(1), ARG(2), ARG(3), ARG(4), gl_ptr_or_offset(ARG(5), GL_ELEMENT_ARRAY_BUFFER_BINDING)); }
+SHIM(glDrawRangeElementsBaseVertex) { rt_gl_draws++; static void (*f)(unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, void *, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glDrawRangeElementsBaseVertex"); if (!f) { gl_missing("glDrawRangeElementsBaseVertex"); return; } } f(ARG(0), ARG(1), ARG(2), ARG(3), ARG(4), gl_ptr_or_offset(ARG(5), GL_ELEMENT_ARRAY_BUFFER_BINDING), ARG(6)); }
 SHIM(glEnable) { static void (*f)(unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glEnable"); if (!f) { gl_missing("glEnable"); return; } } f(ARG(0)); }
 SHIM(glEnableClientState) { static void (*f)(unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glEnableClientState"); if (!f) { gl_missing("glEnableClientState"); return; } } f(ARG(0)); }
 SHIM(glEnableIndexedEXT) { static void (*f)(unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glEnableIndexedEXT"); if (!f) { gl_missing("glEnableIndexedEXT"); return; } } f(ARG(0), ARG(1)); }
@@ -162,7 +158,6 @@ SHIM(glLightModelfv) { static void (*f)(unsigned int, void *); if (!f) { f = dls
 SHIM(glLightModeli) { static void (*f)(unsigned int, unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glLightModeli"); if (!f) { gl_missing("glLightModeli"); return; } } f(ARG(0), ARG(1)); }
 SHIM(glLightf) { static void (*f)(unsigned int, unsigned int, float); if (!f) { f = dlsym(RTLD_DEFAULT, "glLightf"); if (!f) { gl_missing("glLightf"); return; } } f(ARG(0), ARG(1), ARGF(2)); }
 SHIM(glLightfv) { static void (*f)(unsigned int, unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glLightfv"); if (!f) { gl_missing("glLightfv"); return; } } f(ARG(0), ARG(1), NP(ARG(2))); }
-SHIM(glLinkProgram) { static void (*f)(unsigned int); if (!f) { f = dlsym(RTLD_DEFAULT, "glLinkProgram"); if (!f) { gl_missing("glLinkProgram"); return; } } f(ARG(0)); }
 SHIM(glLoadIdentity) { static void (*f)(void); if (!f) { f = dlsym(RTLD_DEFAULT, "glLoadIdentity"); if (!f) { gl_missing("glLoadIdentity"); return; } } f(); }
 SHIM(glLoadMatrixf) { static void (*f)(void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glLoadMatrixf"); if (!f) { gl_missing("glLoadMatrixf"); return; } } f(NP(ARG(0))); }
 SHIM(glMaterialfv) { static void (*f)(unsigned int, unsigned int, void *); if (!f) { f = dlsym(RTLD_DEFAULT, "glMaterialfv"); if (!f) { gl_missing("glMaterialfv"); return; } } f(ARG(0), ARG(1), NP(ARG(2))); }
@@ -250,7 +245,6 @@ const ShimReg rt_shims_gl_gen[] = {
     R(glBeginQuery)
     R(glBeginTransformFeedback)
     R(glBindAttribLocation)
-    R(glBindBuffer)
     R(glBindBufferBase)
     R(glBindBufferRange)
     R(glBindFragDataLocation)
@@ -260,7 +254,6 @@ const ShimReg rt_shims_gl_gen[] = {
     R(glBindRenderbuffer)
     R(glBindSampler)
     R(glBindTexture)
-    R(glBindVertexArray)
     R(glBlendColor)
     R(glBlendEquation)
     R(glBlendEquationSeparate)
@@ -291,7 +284,6 @@ const ShimReg rt_shims_gl_gen[] = {
     R(glColorMaski)
     R(glColorMaterial)
     R(glColorPointer)
-    R(glCompileShader)
     R(glCompressedTexImage1D)
     R(glCompressedTexImage2D)
     R(glCompressedTexImage3D)
@@ -304,7 +296,6 @@ const ShimReg rt_shims_gl_gen[] = {
     R(glCreateProgram)
     R(glCreateShader)
     R(glCullFace)
-    R(glDeleteBuffers)
     R(glDeleteFencesAPPLE)
     R(glDeleteFramebuffers)
     R(glDeleteProgram)
@@ -401,7 +392,6 @@ const ShimReg rt_shims_gl_gen[] = {
     R(glLightModeli)
     R(glLightf)
     R(glLightfv)
-    R(glLinkProgram)
     R(glLoadIdentity)
     R(glLoadMatrixf)
     R(glMaterialfv)

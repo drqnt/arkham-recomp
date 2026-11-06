@@ -13,3 +13,7 @@ def game_root() -> str:
 def game_binary() -> str:
     root = game_root()
     return os.path.join(root, "Batman Arkham Asylum GOTY.app/Contents/MacOS/Batman Arkham Asylum GOTY")
+
+
+def game_bink() -> str:
+    return os.path.join(game_root(), "Batman Arkham Asylum GOTY.app/Contents/Frameworks/libBinkMacx86.dylib")
