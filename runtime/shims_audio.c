@@ -23,6 +23,7 @@ typedef struct {
     _Atomic u32 rd, wr;
     _Atomic float gain_l, gain_r;
     _Atomic int paused;
+    _Atomic u32 silent;  // frames the system asked for that weren't ready: what the player hears as a gap
     dispatch_semaphore_t space;
 } Ring;
 
@@ -55,6 +56,7 @@ static OSStatus ring_render(Ring *r, UInt32 frames, AudioBufferList *io) {
         for (u32 k = 0; k < ch; k++) out[i * ch + k] = s[k] * (k == 1 ? gr : gl);
     }
     memset(out + (size_t)n * ch, 0, (size_t)(frames - n) * ch * sizeof(float));
+    if (!atomic_load(&r->paused)) atomic_fetch_add(&r->silent, frames - n);
     atomic_store(&r->rd, rd + n);
     dispatch_semaphore_signal(r->space);
     return noErr;
@@ -224,12 +226,21 @@ static void *out_pump(void *p) {
     u32 g_buf = rt_guest_calloc(1, bytes);
     rt_gate_release();
     double sample_time = 0;
+    u64 last_report = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     while (atomic_load(&o->running)) {
+        u64 now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (now - last_report >= 1000000000ull) {
+            last_report = now;
+            u32 gap = atomic_exchange(&o->ring.silent, 0);
+            if (gap) fprintf(stderr, "[audio] gap of %u frames\n", gap);
+        }
         if (ring_fill(&o->ring) >= OUT_TARGET) {
             dispatch_semaphore_wait(o->ring.space, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC));
             continue;
         }
-        rt_gate_acquire();
+        // Nothing here touches the runtime's shared state, and waiting for its lock is what a player hears as a gap in the sound when
+        // some other call takes long. Only one-at-a-time mode needs it, to run guest code at all.
+        rt_gate_acquire_serial();
         G32(g_flags) = 0;
         *(f64a *)GP(g_ts) = sample_time;
         G32(g_ts + 56) = kAudioTimeStampSampleTimeValid;
@@ -240,7 +251,7 @@ static void *out_pump(void *p) {
         u32 a[6] = {o->refcon, g_flags, g_ts, 0, OUT_CHUNK, g_list};
         rt_call_guest(c, o->proc, 6, a);
         ring_push(&o->ring, (const float *)GP(g_buf), OUT_CHUNK);
-        rt_gate_release();
+        rt_gate_release_serial();
         sample_time += OUT_CHUNK;
     }
     return NULL;
@@ -504,13 +515,13 @@ static void *snd_thread(void *p) {
         if (cmd.cmd == SND_BUFFER) {
             snd_play_buffer(s, cmd.p2);
         } else if (cmd.cmd == SND_CALLBACK) {
-            rt_gate_acquire();
+            rt_gate_acquire_serial();
             G16(g_cmd) = cmd.cmd;
             G16(g_cmd + 2) = (u16)cmd.p1;
             G32(g_cmd + 4) = cmd.p2;
             u32 a[2] = {s->handle, g_cmd};
             rt_call_guest(c, s->callback, 2, a);
-            rt_gate_release();
+            rt_gate_release_serial();
         }
     }
 }

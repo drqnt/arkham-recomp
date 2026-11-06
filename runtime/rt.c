@@ -209,6 +209,8 @@ static u32 dyn_args[DYN_MAX];
 static u32 dyn_n;
 __thread u32 rt_dyn_cur_arg;
 static __thread int tl_holding;
+static __thread const char *rt_gate_who;  // for ARKHAM_TRACE_GATE
+static int gate_trace;
 static u8 dyn_no_gate[DYN_MAX];
 static u8 dyn_glq[DYN_MAX];
 static const char *dyn_names[DYN_MAX];
@@ -383,7 +385,10 @@ void rt_imp(CPU *c, u32 idx) {
         return;
     }
     int lock = !imp_no_gate[idx] && !tl_holding;
-    if (lock) rt_gate_acquire();
+    if (lock) {
+        rt_gate_who = rt_import_names[idx];
+        rt_gate_acquire();
+    }
     if (f) f(c);
     else imp_missing(c, idx);
     if (lock) rt_gate_release();
@@ -407,6 +412,7 @@ u32 rt_import_addr(const char *name) {
 // With ARKHAM_SERIAL=1 it is the old gate: a fair ticket lock held while guest code runs. Each ticket sleeps on its own
 // condition variable, and a small timer thread raises rt_gate_wait, which guest code polls, once per time slice.
 #define GATE_CVS 64
+#include <mach/mach_time.h>
 #include <os/lock.h>
 static os_unfair_lock gate_fast = OS_UNFAIR_LOCK_INIT;
 static pthread_mutex_t gate_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -427,6 +433,7 @@ static void *gate_slicer(void *arg) {
 
 static void gate_init(void) {
     rt_serial = getenv("ARKHAM_SERIAL") != NULL;
+    gate_trace = getenv("ARKHAM_TRACE_GATE") != NULL;
     if (!rt_serial) return;
     for (int i = 0; i < GATE_CVS; i++) pthread_cond_init(&gate_cv[i], NULL);
     pthread_t t;
@@ -434,8 +441,59 @@ static void gate_init(void) {
     pthread_detach(t);
 }
 
+// ARKHAM_TRACE_GATE=1: what holds this lock for over 2 ms and what waits that long for it, every five seconds. Sound needs the lock too, so
+// anything that holds it for long is heard as a gap.
+static __thread u64 tl_gate_since;
+#define GATE_NAMES 64
+static struct {
+    const char *name;
+    u64 held_ticks, wait_ticks, worst_hold, worst_wait;
+    u32 holds, waits;
+} gate_stats[GATE_NAMES];
+static os_unfair_lock gate_stats_lock = OS_UNFAIR_LOCK_INIT;
+static void gate_note(u64 ticks, int waited) {
+    const char *name = rt_gate_who ? rt_gate_who : "(runtime)";
+    os_unfair_lock_lock(&gate_stats_lock);
+    for (int i = 0; i < GATE_NAMES; i++) {
+        if (gate_stats[i].name == name || !gate_stats[i].name) {
+            gate_stats[i].name = name;
+            if (waited) {
+                gate_stats[i].wait_ticks += ticks;
+                gate_stats[i].waits++;
+                if (ticks > gate_stats[i].worst_wait) gate_stats[i].worst_wait = ticks;
+            } else {
+                gate_stats[i].held_ticks += ticks;
+                gate_stats[i].holds++;
+                if (ticks > gate_stats[i].worst_hold) gate_stats[i].worst_hold = ticks;
+            }
+            break;
+        }
+    }
+    static u64 last;
+    u64 now = mach_absolute_time();
+    if (now - last > 24000000ull * 5) {
+        last = now;
+        for (int i = 0; i < GATE_NAMES && gate_stats[i].name; i++) {
+            if (gate_stats[i].holds || gate_stats[i].waits)
+                fprintf(stderr, "[gate] %s: held %u times %.0f ms worst %.0f, waited %u times %.0f ms worst %.0f\n", gate_stats[i].name, gate_stats[i].holds, (double)gate_stats[i].held_ticks / 24000.0,
+                        (double)gate_stats[i].worst_hold / 24000.0, gate_stats[i].waits, (double)gate_stats[i].wait_ticks / 24000.0, (double)gate_stats[i].worst_wait / 24000.0);
+            const char *keep = gate_stats[i].name;
+            memset(&gate_stats[i], 0, sizeof gate_stats[i]);
+            gate_stats[i].name = keep;
+        }
+    }
+    os_unfair_lock_unlock(&gate_stats_lock);
+}
 void rt_gate_acquire(void) {
     if (!rt_serial) {
+        if (__builtin_expect(gate_trace, 0)) {
+            u64 t0 = mach_absolute_time();
+            os_unfair_lock_lock(&gate_fast);
+            tl_holding = 1;
+            tl_gate_since = mach_absolute_time();
+            if (tl_gate_since - t0 > 48000) gate_note(tl_gate_since - t0, 1);
+            return;
+        }
         os_unfair_lock_lock(&gate_fast);
         tl_holding = 1;
         return;
@@ -458,13 +516,22 @@ void rt_gate_acquire_now(void) {
 void rt_gate_release(void) {
     tl_holding = 0;
     if (!rt_serial) {
+        u64 held = __builtin_expect(gate_trace, 0) ? mach_absolute_time() - tl_gate_since : 0;
         os_unfair_lock_unlock(&gate_fast);
+        if (held > 48000) gate_note(held, 0);
         return;
     }
     pthread_mutex_lock(&gate_mu);
     gate_serving++;
     pthread_cond_broadcast(&gate_cv[gate_serving % GATE_CVS]);
     pthread_mutex_unlock(&gate_mu);
+}
+
+void rt_gate_acquire_serial(void) {
+    if (rt_serial) rt_gate_acquire();
+}
+void rt_gate_release_serial(void) {
+    if (rt_serial) rt_gate_release();
 }
 
 void rt_gate_yield(void) {

@@ -44,6 +44,18 @@ enum {
     Q_DRAW_INDEXED,
     Q_DRAW_RANGE,
     Q_DRAW_ARRAYS,
+    Q_CLEAR,
+    Q_BIND_FBO,
+    Q_FBO_RENDERBUFFER,
+    Q_FBO_TEXTURE,
+    Q_SCISSOR,
+    Q_ENABLE,
+    Q_DISABLE,
+    Q_STENCIL_MASK,
+    Q_STENCIL_MASK_SEPARATE,
+    Q_CLEAR_STENCIL,
+    Q_BLIT,
+    Q_RB_GONE,   // what a pending stencil clear applies to is being replaced
     Q_PAYLOAD,   // and up: an array argument copied into the ring, see payloads[]
 };
 
@@ -84,6 +96,14 @@ u8 rt_glq_kind(const char *name) {
         return Q_SYNC;
     }
     if (strncmp(name, "_gl", 3)) return Q_NONE;
+    static const struct { const char *name; u8 kind; } tracked[] = {
+        {"_glClear", Q_CLEAR}, {"_glBindFramebuffer", Q_BIND_FBO}, {"_glFramebufferRenderbuffer", Q_FBO_RENDERBUFFER}, {"_glFramebufferTexture2D", Q_FBO_TEXTURE},
+        {"_glScissor", Q_SCISSOR}, {"_glEnable", Q_ENABLE}, {"_glDisable", Q_DISABLE}, {"_glStencilMask", Q_STENCIL_MASK}, {"_glStencilMaskSeparate", Q_STENCIL_MASK_SEPARATE},
+        {"_glClearStencil", Q_CLEAR_STENCIL}, {"_glBlitFramebuffer", Q_BLIT}, {"_glDeleteRenderbuffers", Q_RB_GONE}, {"_glRenderbufferStorage", Q_RB_GONE},
+        {"_glRenderbufferStorageMultisample", Q_RB_GONE}, {"_glDeleteFramebuffers", Q_RB_GONE},
+    };
+    for (unsigned i = 0; i < sizeof tracked / sizeof tracked[0]; i++)
+        if (!strcmp(tracked[i].name, name)) return tracked[i].kind;
     for (const char *const *q = async_names; *q; q++)
         if (!strcmp(*q, name)) return Q_ASYNC;
     for (unsigned i = 0; i < N_PAYLOADS; i++)
@@ -132,6 +152,11 @@ static int trace;
 static void *adopt_ctx;
 static int time_cmds;
 void rt_hitch_note_call(const char *name, u64 ticks);
+void rt_pipe_note_slow_draw(const char *name, u64 ticks);
+extern int rt_pipe_capturing;
+extern int rt_pipe_frame_map;
+void rt_pipe_frame_note(const char *name, const u32 *args);
+void rt_pipe_capture_program(const u32 *args);
 // Real context locks this thread holds, and how many of them announced it to the worker. A thread can lock before the worker exists
 // and unlock after, or lock as the render thread (nothing real happens) and unlock after another thread has taken over presenting.
 static __thread u32 tl_locks, tl_announced;
@@ -211,11 +236,17 @@ static void *worker_main(void *arg) {
                     if (held) CGLLockContext(held);
                 }
                 w->esp = ring_guest + off + (u32)offsetof(Cmd, args) - 4u;
+                if (__builtin_expect(rt_pipe_capturing, 0) && cmd->name && !strcmp(cmd->name, "_glProgramStringARB")) rt_pipe_capture_program(cmd->args);
                 u64 t0 = time_cmds ? mach_absolute_time() : 0;
                 if (cmd->gated) rt_gate_acquire();
                 cmd->fn(w);
                 if (cmd->gated) rt_gate_release();
-                if (time_cmds) rt_hitch_note_call(cmd->name, mach_absolute_time() - t0);
+                if (__builtin_expect(rt_pipe_frame_map != 0, 0)) rt_pipe_frame_note(cmd->name, cmd->args);
+                if (time_cmds) {
+                    u64 took = mach_absolute_time() - t0;
+                    rt_hitch_note_call(cmd->name, took);
+                    if (took >= 24000 && cmd->name && !strncmp(cmd->name, "_glDraw", 7)) rt_pipe_note_slow_draw(cmd->name, took);
+                }
                 // The caller of a synchronous command reads these once it sees the tail move past it.
                 __atomic_store_n(&cmd->args[0], w->eax, __ATOMIC_RELAXED);
                 __atomic_store_n(&cmd->args[1], w->edx, __ATOMIC_RELAXED);
@@ -317,8 +348,110 @@ static inline void run_async(CPU *c, shim_fn f, int gated) {
     commit(cmd->size);
     if (trace) n_async++;
 }
+// A clear of the whole stencil buffer in the middle of a render pass makes the GPU load and store every tile of the target, about 1.6 ms at 4x
+// on a multisampled 2560x1600 target. As the first thing in a pass it costs 0.05 ms. The game clears stencil at the end of each shadowed light's
+// pass, seven times a frame in the first level, and the next thing that happens is usually a change of target. So a stencil clear waits here
+// until a draw is going to read stencil, which is nearly always the first draw of a pass, or is dropped if the buffer gets cleared anyway.
+// ARKHAM_STENCIL_NOW=1 turns this off.
+#define TRACKED_FBOS 64
+static int stencil_now = -1;
+static u32 s_draw_fbo, s_read_fbo;
+static u32 s_stencil_rb[TRACKED_FBOS];  // the renderbuffer holding each framebuffer's stencil, or 0
+static int s_scissor_on, s_stencil_on;
+static u32 s_scissor[4], s_stencil_mask = 0xFFFFFFFFu, s_clear_stencil;
+static struct {
+    int on;
+    u32 fbo, rb;
+    int scissor_on;
+    u32 scissor[4], mask, value;
+} pending;
+static u64 n_clear_moved, n_clear_dropped, n_clear_forced;
+
+static void emit(const char *sym, u32 a0, u32 a1, u32 a2, u32 a3) {
+    shim_fn f = rt_lookup_shim(sym);
+    if (!f) return;
+    u32 size = (u32)((sizeof(Cmd) + 15u) & ~15u);
+    Cmd *cmd = reserve(size);
+    cmd->fn = f;
+    cmd->name = sym;
+    cmd->size = size;
+    cmd->gated = 0;
+    cmd->setctx = 0;
+    cmd->keep = 0;
+    cmd->args[0] = a0;
+    cmd->args[1] = a1;
+    cmd->args[2] = a2;
+    cmd->args[3] = a3;
+    commit(size);
+}
+static void set_scissor_on(int on) { emit(on ? "_glEnable" : "_glDisable", 0x0C11u, 0, 0, 0); }
+static void flush_stencil_clear(void) {
+    if (!pending.on) return;
+    pending.on = 0;
+    // Whichever framebuffer holds the buffer now will do, and normally that's the one bound.
+    u32 fbo = s_draw_fbo < TRACKED_FBOS && s_stencil_rb[s_draw_fbo] == pending.rb ? s_draw_fbo : pending.fbo;
+    int rebind = fbo != s_draw_fbo, reattach = fbo < TRACKED_FBOS && s_stencil_rb[fbo] != pending.rb;
+    if (rebind) emit("_glBindFramebuffer", 0x8CA9u, fbo, 0, 0);
+    if (reattach) emit("_glFramebufferRenderbuffer", 0x8CA9u, 0x821Au, 0x8D41u, pending.rb);
+    int other_scissor = pending.scissor_on != s_scissor_on;
+    int other_box = pending.scissor_on && memcmp(pending.scissor, s_scissor, sizeof s_scissor);
+    if (other_scissor) set_scissor_on(pending.scissor_on);
+    if (other_box) emit("_glScissor", pending.scissor[0], pending.scissor[1], pending.scissor[2], pending.scissor[3]);
+    if (pending.mask != s_stencil_mask) emit("_glStencilMaskSeparate", 0x0404u, pending.mask, 0, 0);
+    if (pending.value != s_clear_stencil) emit("_glClearStencil", pending.value, 0, 0, 0);
+    emit("_glClear", 0x400u, 0, 0, 0);
+    if (pending.value != s_clear_stencil) emit("_glClearStencil", s_clear_stencil, 0, 0, 0);
+    if (pending.mask != s_stencil_mask) emit("_glStencilMaskSeparate", 0x0404u, s_stencil_mask, 0, 0);
+    if (other_box) emit("_glScissor", s_scissor[0], s_scissor[1], s_scissor[2], s_scissor[3]);
+    if (other_scissor) set_scissor_on(s_scissor_on);
+    if (reattach) emit("_glFramebufferRenderbuffer", 0x8CA9u, 0x821Au, 0x8D41u, s_stencil_rb[fbo]);
+    if (rebind) emit("_glBindFramebuffer", 0x8CA9u, s_draw_fbo, 0, 0);
+}
+static inline void before_draw(void) {
+    if (__builtin_expect(pending.on, 0) && s_stencil_on && s_draw_fbo < TRACKED_FBOS && s_stencil_rb[s_draw_fbo] == pending.rb) {
+        n_clear_moved++;
+        flush_stencil_clear();
+    }
+}
+// Returns 1 if the clear was dealt with here.
+static int stencil_clear_route(u32 mask) {
+    if (stencil_now < 0) stencil_now = getenv("ARKHAM_STENCIL_NOW") != NULL;
+    if (!(mask & 0x400u)) return 0;
+    u32 rb = s_draw_fbo < TRACKED_FBOS ? s_stencil_rb[s_draw_fbo] : 0;
+    if (pending.on && pending.rb == rb && !s_scissor_on && (s_stencil_mask & 0xFFu) == 0xFFu) {
+        // This clear covers everything the waiting one would have.
+        pending.on = 0;
+        n_clear_dropped++;
+    } else if (pending.on) {
+        n_clear_forced++;
+        flush_stencil_clear();
+    }
+    if (mask != 0x400u || stencil_now || !rb || rb == 0xFFFFFFFFu) return 0;
+    pending.on = 1;
+    pending.fbo = s_draw_fbo;
+    pending.rb = rb;
+    pending.scissor_on = s_scissor_on;
+    memcpy(pending.scissor, s_scissor, sizeof s_scissor);
+    pending.mask = s_stencil_mask;
+    pending.value = s_clear_stencil;
+    return 1;
+}
+static inline u32 fbo_of_target(u32 target) { return target == 0x8CA8u ? s_read_fbo : s_draw_fbo; }
+static void stencil_attached(u32 target, u32 attachment, u32 what) {
+    if (attachment != 0x821Au && attachment != 0x8D20u) return;
+    u32 fbo = fbo_of_target(target);
+    // Attaching a different buffer to the framebuffer that was going to do the clear: it has to happen first.
+    if (pending.on && fbo == pending.fbo && what && what != pending.rb) {
+        n_clear_forced++;
+        flush_stencil_clear();
+    }
+    if (fbo < TRACKED_FBOS) s_stencil_rb[fbo] = what;
+}
+
 // What was set before the worker took over counts too: the movie player sets its vertex arrays once, ahead of the first frame.
+static void read_tracked_state(void);
 static void read_context_state(void) {
+    read_tracked_state();
     GLint v = 0;
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &v);
     s_array = (u32)v;
@@ -351,11 +484,29 @@ static void read_context_state(void) {
         }
     }
 }
+static void read_tracked_state(void) {
+    GLint v = 0, box[4] = {0};
+    glGetIntegerv(0x8CA6, &v);  // GL_DRAW_FRAMEBUFFER_BINDING
+    s_draw_fbo = (u32)v;
+    glGetIntegerv(0x8CAA, &v);  // GL_READ_FRAMEBUFFER_BINDING
+    s_read_fbo = (u32)v;
+    s_scissor_on = glIsEnabled(GL_SCISSOR_TEST);
+    s_stencil_on = glIsEnabled(GL_STENCIL_TEST);
+    glGetIntegerv(GL_SCISSOR_BOX, box);
+    memcpy(s_scissor, box, sizeof box);
+    glGetIntegerv(GL_STENCIL_WRITEMASK, &v);
+    s_stencil_mask = (u32)v;
+    glGetIntegerv(GL_STENCIL_CLEAR_VALUE, &v);
+    s_clear_stencil = (u32)v;
+    memset(s_stencil_rb, 0, sizeof s_stencil_rb);
+    pending.on = 0;
+}
 // The context moves to the worker the first time a thread presents a frame, and if another thread takes over presenting.
 static void adopt(void) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     void start_worker(void);
     pthread_once(&once, start_worker);
+    if (glq_client) flush_stencil_clear();
     drain_to(q_head);
     adopt_ctx = CGLGetCurrentContext();
     // The usual pattern is lock, present, unlock, and from here on this thread's unlock will not reach the real lock.
@@ -491,6 +642,13 @@ int rt_glq_route(CPU *c, void (*f)(CPU *), u8 kind, int gated, const char *name)
             return 1;
         case Q_SETCTX:
             c->eax = 0;
+            // Feral's layer lets go of the context and takes it back about 2500 times a frame. Each time would mean giving up the context's lock
+            // and forgetting the bindings on the worker, for nothing: no other thread is waiting for it. ARKHAM_CTX_RELEASE=1 passes these on.
+            {
+                static int release = -1;
+                if (release < 0) release = getenv("ARKHAM_CTX_RELEASE") != NULL;
+                if (!a0 && !release) return 1;
+            }
             if (a0 == s_last_ctx) return 1;
             s_last_ctx = a0;
             {
@@ -512,6 +670,57 @@ int rt_glq_route(CPU *c, void (*f)(CPU *), u8 kind, int gated, const char *name)
             return 1;
         case Q_ASYNC:
             run_async(c, f, gated);
+            return 1;
+        case Q_CLEAR:
+            if (stencil_clear_route(a0)) return 1;
+            run_async(c, f, gated);
+            return 1;
+        case Q_BIND_FBO: {
+            u32 id = G32(c->esp + 8);
+            if (a0 != 0x8CA8u) s_draw_fbo = id;
+            if (a0 != 0x8CA9u) s_read_fbo = id;
+            run_async(c, f, gated);
+            return 1;
+        }
+        case Q_FBO_RENDERBUFFER:
+            stencil_attached(a0, G32(c->esp + 8), G32(c->esp + 16));
+            run_async(c, f, gated);
+            return 1;
+        case Q_FBO_TEXTURE:
+            // Stencil in a texture can be read without a draw, so its clears aren't delayed.
+            stencil_attached(a0, G32(c->esp + 8), G32(c->esp + 16) ? 0xFFFFFFFFu : 0);
+            run_async(c, f, gated);
+            return 1;
+        case Q_SCISSOR:
+            memcpy(s_scissor, GP(c->esp + 4), sizeof s_scissor);
+            run_async(c, f, gated);
+            return 1;
+        case Q_ENABLE:
+        case Q_DISABLE:
+            if (a0 == 0x0C11u) s_scissor_on = kind == Q_ENABLE;
+            else if (a0 == 0x0B90u) s_stencil_on = kind == Q_ENABLE;
+            run_async(c, f, gated);
+            return 1;
+        case Q_STENCIL_MASK:
+            s_stencil_mask = a0;
+            run_async(c, f, gated);
+            return 1;
+        case Q_STENCIL_MASK_SEPARATE:
+            if (a0 != 0x0405u) s_stencil_mask = G32(c->esp + 8);  // glClear uses the front face's mask
+            run_async(c, f, gated);
+            return 1;
+        case Q_CLEAR_STENCIL:
+            s_clear_stencil = a0;
+            run_async(c, f, gated);
+            return 1;
+        case Q_BLIT:
+            if (G32(c->esp + 4 + 32) & 0x400u) flush_stencil_clear();  // the mask: it copies stencil
+            run_async(c, f, gated);
+            return 1;
+        case Q_RB_GONE:
+            // The buffer's contents go away with it, but telling that apart isn't worth it for something this rare.
+            flush_stencil_clear();
+            run_sync(c, f, gated, name);
             return 1;
         case Q_BIND_BUFFER: {
             u32 target = a0, buf = G32(c->esp + 8);
@@ -559,6 +768,7 @@ int rt_glq_route(CPU *c, void (*f)(CPU *), u8 kind, int gated, const char *name)
             return 1;
         case Q_DRAW_ARRAYS: {
             u32 first = G32(c->esp + 8), count = G32(c->esp + 12);
+            before_draw();
             if (count && !s_client_states && queue_guest_attribs(first + count - 1)) run_async(c, f, gated);
             else run_sync(c, f, gated, "draw arrays from guest memory");
             return 1;
@@ -567,6 +777,7 @@ int rt_glq_route(CPU *c, void (*f)(CPU *), u8 kind, int gated, const char *name)
             // mode, start, end, count, type, indices, and for the BaseVertex form a base vertex added to every index
             u32 end = G32(c->esp + 12), count = G32(c->esp + 16), type = G32(c->esp + 20), indices = G32(c->esp + 24);
             u32 base = !strcmp(name, "_glDrawRangeElementsBaseVertex") ? G32(c->esp + 28) : 0;
+            before_draw();
             if (s_client_states || (i32)base < 0 || !s_element_known || !queue_guest_attribs(end + base)) {
                 run_sync(c, f, gated, "draw from guest memory");
                 return 1;
@@ -588,10 +799,12 @@ int rt_glq_route(CPU *c, void (*f)(CPU *), u8 kind, int gated, const char *name)
             return 1;
         }
         case Q_DRAW_INDEXED:
+            before_draw();
             if (s_client_states || (s_client_attribs & s_enabled_attribs) || !s_element_known || !s_element) run_sync(c, f, gated, "draw from guest memory");
             else run_async(c, f, gated);
             return 1;
         case Q_SYNC:
+            if (__builtin_expect(pending.on, 0) && !strcmp(name, "_glReadPixels")) flush_stencil_clear();
             run_sync(c, f, gated, name);
             return 1;
         default: {
@@ -612,3 +825,4 @@ int rt_glq_route(CPU *c, void (*f)(CPU *), u8 kind, int gated, const char *name)
 void rt_glq_drain(void) {
     if (glq_client) drain_to(__atomic_load_n(&q_head, __ATOMIC_SEQ_CST));
 }
+void rt_glq_report(void) { fprintf(stderr, "[glq] stencil clears: %llu moved to a draw, %llu covered by a later clear, %llu forced\n", n_clear_moved, n_clear_dropped, n_clear_forced); }

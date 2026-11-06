@@ -85,8 +85,10 @@ def main() -> int:
     with open(rsp, "w") as fh:
         fh.write("\n".join(objs))
     out = os.path.join(ROOT, "build", "serial", "arkham") if args.serial else os.path.join(ROOT, "build", "arkham")
+    # With a bundle identifier Metal keeps its shader cache in a folder of its own, instead of the one most of the system shares.
+    bundle = ["-Wl,-sectcreate,__TEXT,__info_plist," + os.path.join(ROOT, "runtime", "Info.plist")]
     cmd = ["xcrun", "clang", "-arch", "arm64", "-mmacosx-version-min=14.0", f"@{rsp}", "-o", out, "-Wl,-w", "-lz",
-           "-Wl,-stack_size,0x10000000"]
+           "-Wl,-stack_size,0x10000000", *bundle]
     for fw in FRAMEWORKS:
         cmd += ["-framework", fw]
     r = subprocess.run(cmd, env=ENV, capture_output=True, text=True)
@@ -94,6 +96,13 @@ def main() -> int:
         print(r.stderr[:4000], file=sys.stderr)
         return 1
     print(f"linked {out} {os.path.getsize(out) / 1e6:.0f} MB in {time.time() - t1:.0f}s")
+    tool, tool_src = os.path.join(ROOT, "build", "warm_shaders"), os.path.join(ROOT, "tools", "warm_shaders.c")
+    if not args.serial and stale(tool_src, tool, []):
+        r = subprocess.run(["xcrun", "clang", "-O2", "-arch", "arm64", "-mcpu=apple-m1", "-mmacosx-version-min=14.0", "-Wno-deprecated-declarations", tool_src, "-framework", "OpenGL", *bundle, "-o", tool],
+                           env=ENV, capture_output=True, text=True)
+        if r.returncode:
+            print(r.stderr[:2000], file=sys.stderr)
+            return 1
     return 0
 
 

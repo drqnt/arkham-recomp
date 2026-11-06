@@ -870,25 +870,30 @@ SHIM(time) {
     RET(t);
 }
 SHIM(clock) { RET((u32)clock()); }
+// Sleeping needs no lock, and the sound mixer sleeps between chunks: it mustn't have to wait for the lock to wake up. These only give up the
+// gate in one-at-a-time mode, where a running thread holds it.
 SHIM(usleep) {
     u32 us = ARG(0);
-    rt_gate_release();
+    int held = rt_gate_held();
+    if (held) rt_gate_release();
     usleep(us);
-    rt_gate_acquire();
+    if (held) rt_gate_acquire();
     RET(0);
 }
 SHIM(sleep) {
     u32 s = ARG(0);
-    rt_gate_release();
+    int held = rt_gate_held();
+    if (held) rt_gate_release();
     sleep(s);
-    rt_gate_acquire();
+    if (held) rt_gate_acquire();
     RET(0);
 }
 SHIM(nanosleep) {
     struct timespec ts = {(time_t)G32(ARG(0)), (long)G32(ARG(0) + 4)};
-    rt_gate_release();
+    int held = rt_gate_held();
+    if (held) rt_gate_release();
     nanosleep(&ts, NULL);
-    rt_gate_acquire();
+    if (held) rt_gate_acquire();
     RET(0);
 }
 static void put_tm(u32 g, const struct tm *t) {

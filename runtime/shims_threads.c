@@ -624,6 +624,7 @@ SHIM(dispatch_group_create) { RET(0xEC000030u); }
 SHIM(dispatch_group_async) { call_block(c, ARG(2)); }
 SHIM(dispatch_group_wait) { RET(0); }
 SHIM(dispatch_release) {}
+u32 rt_block_copy(CPU *c, u32 b) { return block_copy(c, b); }
 SHIM(_Block_copy) { RET(block_copy(c, ARG(0))); }
 SHIM(_Block_release) {}
 // Called by copy helpers: dest, source, kind. Kinds: 3 object, 7 block, 8 __block variable, plus weak/helper bits.

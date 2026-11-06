@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 typedef void (*shim_fn)(CPU *);
 u32 rt_dyn_import_nogate(shim_fn fn, u32 arg);
@@ -177,6 +178,8 @@ static CPU *worker_cpu;
 static int trace;
 static u32 presents_pending;
 
+static int trace_shaders;
+static u32 method_create_vs = ~0u, method_create_ps = ~0u;
 static int pipe_on;
 static u64 pipe_t[6][256];
 static u32 pipe_n[6];
@@ -203,6 +206,97 @@ static inline void call_on_worker(CPU *w, guest_fn fn, const u32 *args, u32 top)
     w->esp = esp;
     fn(w);
 }
+// ARKHAM_SHADER_EXTRACT=out ARKHAM_SHADER_SOURCES=a;b: runs every shader in the game's shader caches through the layer's translator, once the
+// device exists, so that the programs it hands to OpenGL can be collected ahead of play (rt_pipe_capture_program), and exits.
+// The layer translates when a shader is created, from its bytecode alone, so what comes out is exactly what the game will ask for later.
+void rt_pipe_capture_start(const char *path);
+void rt_pipe_capture_stop(void);
+void rt_glq_drain(void);
+static const Method *method_named(const char *name) {
+    for (u32 i = 0; i < n_methods; i++)
+        if (!strcmp(methods[i].name, name)) return &methods[i];
+    return NULL;
+}
+static u32 shader_words(const u32 *t, u32 max) {
+    u32 i = 1;
+    while (i < max) {
+        u32 tok = t[i];
+        if (tok == 0x0000FFFFu) return i + 1;
+        if ((tok & 0xFFFFu) == 0xFFFEu) i += 1 + (tok >> 16);
+        else i += 1 + ((tok >> 24) & 0xFu);
+    }
+    return 0;
+}
+static void extract_shaders(CPU *w, u32 top, u32 device) {
+    const Method *create_ps = method_named("Device.CreatePixelShader"), *create_vs = method_named("Device.CreateVertexShader");
+    const Method *release_ps = method_named("PixelShader.slot3"), *release_vs = method_named("VertexShader.slot3");
+    const char *sources = getenv("ARKHAM_SHADER_SOURCES");
+    if (!create_ps || !create_vs || !release_ps || !release_vs || !sources) {
+        fprintf(stderr, "[extract] missing what it needs\n");
+        _exit(3);
+    }
+    rt_pipe_capture_start(getenv("ARKHAM_SHADER_EXTRACT"));
+    u32 scratch = rt_guest_alloc_pages(1u << 20), out = scratch + (1u << 20) - 64;
+    enum { SEEN = 1 << 18 };
+    u64 *seen = calloc(SEEN, sizeof(u64));
+    u32 n = 0, dup = 0, failed = 0;
+    u64 t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    char *list = strdup(sources), *save = NULL;
+    for (char *path = strtok_r(list, ";", &save); path; path = strtok_r(NULL, ";", &save)) {
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            fprintf(stderr, "[extract] can't open a source\n");
+            continue;
+        }
+        fseek(f, 0, SEEK_END);
+        size_t size = (size_t)ftell(f);
+        fseek(f, 0, SEEK_SET);
+        u8 *data = malloc(size);
+        fread(data, 1, size, f);
+        fclose(f);
+        for (size_t i = 0; i + 16 < size; i++) {
+            if (data[i] != 0x00 || data[i + 1] != 0x03 || data[i + 3] != 0xFF || (data[i + 2] != 0xFF && data[i + 2] != 0xFE)) continue;
+            if (data[i + 4] != 0xFE || data[i + 5] != 0xFF || memcmp(data + i + 8, "CTAB", 4)) continue;
+            u32 room = (u32)((size - i) / 4), limit = room < (1u << 17) ? room : (1u << 17);
+            u8 *copy = GP(scratch);
+            memcpy(copy, data + i, (size_t)limit * 4);
+            u32 words = shader_words((const u32 *)copy, limit);
+            if (!words) {
+                failed++;
+                continue;
+            }
+            u64 h = 0xcbf29ce484222325ull;
+            for (u32 k = 0; k < words * 4; k++) h = (h ^ copy[k]) * 0x100000001b3ull;
+            if (!h) h = 1;
+            u32 slot = (u32)(h % SEEN);
+            while (seen[slot] && seen[slot] != h) slot = (slot + 1) % SEEN;
+            if (seen[slot]) {
+                dup++;
+                continue;
+            }
+            seen[slot] = h;
+            int pixel = data[i + 2] == 0xFF;
+            u32 args[ARG_WORDS] = {device, scratch, out};
+            G32(out) = 0;
+            call_on_worker(w, (pixel ? create_ps : create_vs)->fn, args, top);
+            u32 shader = G32(out);
+            if (w->eax || !shader) {
+                failed++;
+                continue;
+            }
+            u32 rel[ARG_WORDS] = {shader};
+            call_on_worker(w, (pixel ? release_ps : release_vs)->fn, rel, top);
+            if (++n % 1000 == 0) fprintf(stderr, "[extract] %u shaders, %.0f s\n", n, (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9);
+            i += (size_t)words * 4 - 1;
+        }
+        free(data);
+    }
+    rt_glq_drain();
+    rt_pipe_capture_stop();
+    fprintf(stderr, "[extract] done: %u shaders, %u repeated, %u failed, %.0f s\n", n, dup, failed, (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9);
+    fflush(stderr);
+    _exit(0);
+}
 static void *worker_main(void *arg) {
     (void)arg;
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -227,7 +321,14 @@ static void *worker_main(void *arg) {
             Cmd *cmd = (Cmd *)(ring + (u32)(tail % RING_SIZE));
             if (cmd->fn) {
                 call_on_worker(w, cmd->fn, cmd->args, top);
+                if (trace_shaders && (cmd->method == method_create_vs || cmd->method == method_create_ps)) {
+                    const u32 *t = (const u32 *)GP(cmd->args[1]);
+                    u32 words = 0;
+                    while (t[words] != 0x0000FFFFu && words < (1u << 20)) words++;
+                    fprintf(stderr, "[d3dshader] %s words=%u t=%.3f\n", cmd->method == method_create_vs ? "vs" : "ps", words, (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9);
+                }
                 if (pipe_on && methods[cmd->method].kind == K_PRESENT) rt_pipe_mark(3);
+                if (methods[cmd->method].kind == K_PRESENT && getenv("ARKHAM_SHADER_EXTRACT")) extract_shaders(w, top, cmd->args[0]);
                 if (cmd->result) {
                     cmd->result->eax = w->eax;
                     cmd->result->edx = w->edx;
@@ -609,6 +710,8 @@ static void add_method(u32 vtable, u32 slot, const char *cls, const char *method
     }
     if (slot == 2 || slot == 3) m->kind = K_REF;
     if (slot == 2 && !strcmp(cls, "Surface")) surface_addref_method = n_methods;
+    if (!strcmp(name, "Device.CreateVertexShader")) method_create_vs = n_methods;
+    if (!strcmp(name, "Device.CreatePixelShader")) method_create_ps = n_methods;
     G32(where) = rt_dyn_import_nogate(method_shim, n_methods);
     n_methods++;
 }
@@ -616,6 +719,7 @@ void rt_d3dq_start(void) {
     if (getenv("ARKHAM_D3D_DIRECT")) return;
     trace = getenv("ARKHAM_TRACE_D3DQ") != NULL;
     pipe_on = getenv("ARKHAM_TRACE_PIPE") != NULL;
+    trace_shaders = getenv("ARKHAM_TRACE_PIPES") != NULL;
     ring_guest = rt_guest_alloc_pages(RING_SIZE);
     ring = rt_mem + ring_guest;
     pthread_t t;

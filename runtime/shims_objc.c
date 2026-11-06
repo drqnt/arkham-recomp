@@ -266,6 +266,30 @@ static void proxy_forget(id h);
 
 // stret points at the guest's hidden return buffer for struct-returning messages. start_class, when set,
 // begins method lookup there (super calls into a system class) and dispatches straight to that implementation.
+// The game's dialogs watch events with a block. A guest block means nothing to the system, and going through unconverted it became a monitor with
+// no handler, which crashes AppKit at the next matching event: the key coming up after Cmd+Q, say.
+u32 rt_block_copy(CPU *c, u32 b);
+static void event_monitor_send(CPU *c, id recv, u32 ap) {
+    // The mask is one word in this build's SDK and two in later ones, where the second is zero for any mask but "everything".
+    u32 w0 = G32(ap), w1 = G32(ap + 4), w2 = G32(ap + 8);
+    int wide = !w1 || w1 == 0xFFFFFFFFu;
+    u32 block = rt_block_copy(c, wide ? w2 : w1);
+    unsigned long long mask = wide ? ((unsigned long long)w1 << 32 | w0) : w0;
+    id handler = (id) ^ id(id ev) {
+        int held = rt_gate_held();
+        if (!held) rt_gate_acquire();
+        CPU *cpu = rt_current_cpu();
+        if (!cpu) cpu = rt_new_cpu(2u << 20);
+        u32 a[2] = {block, obj_wrap(ev)};
+        u32 ret = rt_call_guest(cpu, G32(block + 12), 2, a);
+        id out = host_receiver(ret);
+        if (!held) rt_gate_release();
+        return out;
+    };
+    id monitor = ((id(*)(id, SEL, unsigned long long, id))objc_msgSend)(recv, sel_registerName("addLocalMonitorForEventsMatchingMask:handler:"), mask, handler);
+    fprintf(stderr, "[objc] the game watches events with mask %llx\n", mask);
+    RET(obj_wrap(monitor));
+}
 static int host_send_from(CPU *c, u32 self, u32 selg, u32 ap, u32 stret, Class start_class) {
     id recv = host_receiver(self);
     const char *sn = GS(selg);
@@ -277,6 +301,10 @@ static int host_send_from(CPU *c, u32 self, u32 selg, u32 ap, u32 stret, Class s
     if (!strcmp(sn, "runModal") && getenv("ARKHAM_AUTO_ALERT")) {
         fprintf(stderr, "[objc] auto-answering runModal with the first button\n");
         RET(1000);
+        return 1;
+    }
+    if (!strcmp(sn, "addLocalMonitorForEventsMatchingMask:handler:")) {
+        event_monitor_send(c, recv, ap);
         return 1;
     }
     if (!strcmp(sn, "setMainFrameURL:")) rt_note_webview(recv);
@@ -1104,6 +1132,26 @@ static void script_key_event(int code, unsigned long type) {
     if (w && !((id(*)(id, SEL))objc_msgSend)(app, SELR("keyWindow"))) ((void (*)(id, SEL, id))objc_msgSend)(w, SELR("sendEvent:"), ev);
     else script_post(ev);
 }
+// Pressing Cmd by itself: the game answers by watching for key-ups, which the system doesn't deliver while Cmd is down.
+static void script_command_flag(void) {
+    CGEventRef cg = CGEventCreateKeyboardEvent(NULL, 55, true);
+    CGEventSetType(cg, kCGEventFlagsChanged);
+    CGEventSetFlags(cg, kCGEventFlagMaskCommand | 0x8);
+    id ev = ((id(*)(id, SEL, CGEventRef))objc_msgSend)(CLS("NSEvent"), SELR("eventWithCGEvent:"), cg);
+    CFRelease(cg);
+    id w = script_window();
+    if (w) ((void (*)(id, SEL, id))objc_msgSend)(w, SELR("sendEvent:"), ev);
+}
+// Cmd+Q through the application's event queue, the way the real key arrives: AppKit routes it to the menu.
+static void script_command_q(unsigned long type) {
+    unsigned short ch = 'q';
+    id str = ((id(*)(id, SEL, const unsigned short *, unsigned long))objc_msgSend)(CLS("NSString"), SELR("stringWithCharacters:length:"), &ch, 1);
+    typedef id (*key_fn)(id, SEL, unsigned long, CGPoint, unsigned long, double, long, id, id, id, signed char, unsigned short);
+    SEL sel = SELR("keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:");
+    id w = script_window();
+    long num = w ? ((long (*)(id, SEL))objc_msgSend)(w, SELR("windowNumber")) : 0;
+    script_post(((key_fn)objc_msgSend)(CLS("NSEvent"), sel, type, CGPointZero, 1ul << 20, CFAbsoluteTimeGetCurrent(), num, nil, str, str, 0, (unsigned short)12));
+}
 static void script_key(int code) {
     script_key_event(code, 10);
     script_key_event(code, 11);
@@ -1160,11 +1208,16 @@ static void input_schedule(void) {
         char kind[16] = "";
         if (sscanf(item, "%lf:%15[a-z]:%lf:%lf", &secs, kind, &x, &y) < 3) continue;
         int is_key = !strcmp(kind, "key"), is_click = !strcmp(kind, "click");
-        int is_down = !strcmp(kind, "down"), is_up = !strcmp(kind, "up"), is_look = !strcmp(kind, "look"), is_quit = !strcmp(kind, "quit"), is_press = !strcmp(kind, "press");
+        int is_down = !strcmp(kind, "down"), is_up = !strcmp(kind, "up"), is_look = !strcmp(kind, "look"), is_quit = !strcmp(kind, "quit"), is_press = !strcmp(kind, "press"), is_cmdq = !strcmp(kind, "cmdq");
         CFRunLoopTimerRef t = CFRunLoopTimerCreateWithHandler(NULL, start + secs, 0, 0, 0, ^(CFRunLoopTimerRef tt) {
             (void)tt;
             if (is_press) {
                 script_press();
+            } else if (is_cmdq) {
+                fprintf(stderr, "[input] cmd-q\n");
+                script_command_flag();
+                script_command_q(10);
+                script_command_q(11);
             } else if (is_quit) {
                 fprintf(stderr, "[input] quit\n");
                 id app = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), SELR("sharedApplication"));

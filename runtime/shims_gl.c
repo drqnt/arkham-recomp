@@ -444,6 +444,8 @@ SHIM(CGLFlushDrawable) {
             CGLSetParameter(ctx, kCGLCPSwapInterval, &zero);
         }
         fprintf(stderr, "[gl] swap interval was %d\n", cur);
+        void rt_pipe_log_cache_file(void);
+        rt_pipe_log_cache_file();
     }
     unsigned long draws = rt_gl_draws - last_draws;
     last_draws = rt_gl_draws;
@@ -457,6 +459,11 @@ SHIM(CGLFlushDrawable) {
     if (now - fps_start >= 1000000000ull) {
         double secs = (double)(now - fps_start) / 1e9, fps = (double)fps_frames / secs;
         fprintf(stderr, "[fps] %.1f, worst frame %.1f ms, %lu draws\n", fps, (double)fps_worst / 1e6, draws);
+        {
+            void rt_glq_report(void);
+            static int reports;
+            if (++reports % 30 == 0) rt_glq_report();
+        }
         rt_fps_overlay(fps, (double)fps_worst / 1e6);
         fps_start = now;
         fps_frames = 0;

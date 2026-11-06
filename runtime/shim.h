@@ -13,6 +13,8 @@ u32 rt_import_addr(const char *name);
 void rt_gate_acquire(void);
 void rt_gate_acquire_now(void);
 void rt_gate_release(void);
+void rt_gate_acquire_serial(void);  // these two only do something with ARKHAM_SERIAL, when running guest code takes the gate
+void rt_gate_release_serial(void);
 int rt_gate_held(void);
 void rt_glq_drain(void);
 int rt_host_thunk_dispatch(CPU *c, u32 target);

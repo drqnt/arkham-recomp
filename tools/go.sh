@@ -5,7 +5,9 @@ if ! python3 -I tools/build.py > logs/build.log 2>&1; then
   grep -E 'FAILED|error:|failed=[1-9]|ld:|Undefined|"_' logs/build.log | head -20 | cut -c1-200
   exit 1
 fi
-export ARKHAM_STUB_ALL=1 ARKHAM_AUTO_ALERT=1 ARKHAM_AUTO_PLAY=${AUTO_PLAY:-10} ARKHAM_TRACE_FS=1
+export ARKHAM_STUB_ALL=1 ARKHAM_AUTO_ALERT=1 ARKHAM_AUTO_PLAY=${AUTO_PLAY:-10}
+# File tracing writes tens of thousands of log lines under the runtime's lock, so it is only on when asked for: FS=1.
+[ -n "$FS" ] && export ARKHAM_TRACE_FS=1
 [ -n "$SNAP" ] && export ARKHAM_SNAP="$SNAP" ARKHAM_SNAP_AFTER="${SNAP_AFTER:-40}"
 timeout "${1:-90}" build/arkham > logs/run.out 2> logs/run.err
 echo "exit=$?"

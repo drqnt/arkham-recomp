@@ -76,6 +76,25 @@ static void sample_all(void) {
     for (mach_msg_type_number_t i = 0; i < count; i++) {
         thread_act_t t = list[i];
         if (t == self) continue;
+        // The system's sound thread has a deadline, and stopping it to look at it could be heard.
+        static thread_act_t skip[8];
+        static u32 n_skip, n_checked;
+        static thread_act_t checked[256];
+        int skipping = 0;
+        for (u32 k = 0; k < n_skip; k++) skipping |= skip[k] == t;
+        if (skipping) continue;
+        int seen = 0;
+        for (u32 k = 0; k < n_checked; k++) seen |= checked[k] == t;
+        if (!seen && n_checked < 256) {
+            checked[n_checked++] = t;
+            char name[64] = "";
+            pthread_t pt = pthread_from_mach_thread_np(t);
+            if (pt) pthread_getname_np(pt, name, sizeof name);
+            if (strstr(name, "com.apple.audio") && n_skip < 8) {
+                skip[n_skip++] = t;
+                continue;
+            }
+        }
         Track *tr = NULL;
         for (u32 k = 0; k < n_tracks; k++)
             if (tracks[k].port == t) tr = &tracks[k];

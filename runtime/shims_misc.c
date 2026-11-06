@@ -60,6 +60,9 @@ int rt_shim_no_gate(const char *name) {
         "___cxa_free_exception", "___cxa_allocate_exception", "__ZSt18uncaught_exceptionv",
         "_CGLSetCurrentContext", "_CGLLockContext", "_CGLUnlockContext",
         "_read", "_read$UNIX2003", "_pread", "_pread$UNIX2003", "_lseek",
+        "_usleep", "_usleep$UNIX2003", "_nanosleep", "_nanosleep$UNIX2003", "_sleep", "_sleep$UNIX2003",
+        "___udivdi3", "___umoddi3", "___divdi3", "___moddi3", "___fixunssfdi", "___fixunsdfdi", "___fixsfdi", "___fixdfdi", "___floatdidf", "___floatdisf",
+        "___floatundidf", "___floatundisf", "__Block_object_dispose",
         NULL,
     };
     if (!name) return 0;
