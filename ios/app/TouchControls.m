@@ -546,7 +546,7 @@ static void open_settings(void);
 }
 // A grey from white (ink 0) to black (ink 1).
 static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithWhite:1 - ink alpha:alpha]; }
-// How much of a button shows: the settings' "Заметность" as the whole button's opacity, all of it while pressed, and the close button never faint.
+// How much of a button shows: the opposite of the settings' "Прозрачность кнопок", as the whole button's opacity, all of it while pressed, and the close button never faint.
 - (CGFloat)opacityOf:(PadButton *)b {
     if (self.editing) return b.hiddenByPlayer ? 0.35 : 1;
     CGFloat o = setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.8);
@@ -1264,7 +1264,8 @@ static UIView *gear_view;
     [self section:@"Кнопки" footer:@"Кнопки светлеют над тёмной картинкой и темнеют над светлой. Глаз в углу прячет их все для скриншота; вернуть — коснуться экрана."];
     [self choice:@"Вид" items:@[@"PlayStation", @"Xbox", @"Иконки"] value:(NSInteger)setting(@"buttonStyle", "ARKHAM_TOUCH_STYLE", STYLE_PS) action:@selector(styleChanged:)];
     size_value = [self slider:@"Размер" min:0.7 max:1.5 value:setting(@"buttonScale", "ARKHAM_TOUCH_SIZE", 1.0) action:@selector(sizeChanged:)];
-    opacity_value = [self slider:@"Заметность" min:0.2 max:1.0 value:setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.8) action:@selector(opacityChanged:)];
+    // Shown as transparency, as its name says; kept as the opacity, from 20% to all of it.
+    opacity_value = [self slider:@"Прозрачность кнопок" min:0 max:0.8 value:1 - setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.8) action:@selector(opacityChanged:)];
     [self toggle:@"Прятать вне игры" on:setting(@"hideInMenus", "ARKHAM_TOUCH_HIDE", 1) > 0 action:@selector(hideChanged:)];
     [self action:@"Расположение кнопок" selector:@selector(editLayout)];
 
@@ -1277,7 +1278,7 @@ static UIView *gear_view;
 }
 - (void)showValues {
     size_value.text = [NSString stringWithFormat:@"%.0f %%", setting(@"buttonScale", "ARKHAM_TOUCH_SIZE", 1.0) * 100];
-    opacity_value.text = [NSString stringWithFormat:@"%.0f %%", setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.8) * 100];
+    opacity_value.text = [NSString stringWithFormat:@"%.0f %%", (1 - setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.8)) * 100];
     look_value.text = [NSString stringWithFormat:@"%.0f° на экран", setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT * 951];
 }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)t { return (NSInteger)rows.count; }
@@ -1305,7 +1306,7 @@ static UIView *gear_view;
     [controls restyle];
 }
 - (void)opacityChanged:(UISlider *)s {
-    set_setting(@"opacity", s.value);
+    set_setting(@"opacity", 1 - s.value);
     [self showValues];
     [controls restyle];
 }

@@ -317,7 +317,8 @@ app goes to the background.
   Motion the game hasn't taken for 250 ms is dropped. The log has a `[mouse] touch camera` line every 10 s. `ARKHAM_MOUSE_AS_PAD` is now only for
   the Mac's own mouse.
 - **"Заметность"** set only 70% to 100% of the icons' alpha, so the slider seemed to do nothing. It is now the whole button's opacity, all of it
-  while pressed, the stick's too, with a default of 80%.
+  while pressed, the stick's too, with a default of 80%. At the user's wish it's called "Прозрачность кнопок" and shown as transparency
+  (0 to 80%, more to the right); the setting stored is still the opacity.
 - **The Metal HUD switch** had no effect: `developerHUDProperties` only shows and hides the HUD in a process it was enabled for from the launch.
   The switch's state now decides that at launch (`MTL_HUD_ENABLED` and Metal's `MetalForceHudEnabled` default). Then the switch shows and hides
   it live. Turned on in a game started without it, it says the HUD comes at the next launch.
