@@ -153,6 +153,16 @@ After those, the layer was read through for mistakes of the same kind, that go w
   `xcrun xctrace record --template 'Metal System Trace' --attach <pid> --time-limit 5s --output file.trace` with the full Xcode as `DEVELOPER_DIR`, then `xctrace export` of the
   `metal-gpu-intervals` table.
 - `ARKHAM_TRACE_RESOLVE=1`: why an average of a 4x target needed a pass of its own.
+- `ARKHAM_MTL_SAMPLES=n` and `ARKHAM_MTL_CHEAP_PS=1` (every pixel shader one gray color) take work off the GPU, so a run shows the CPU side's limit. The `[fps]` line ends with
+  the three busiest guest threads' CPU time a frame and the address each started at: 1c260f0 is the engine's render thread, 1dab9d0 its game thread. Time spent spinning
+  while waiting counts as CPU time there.
+- `ARKHAM_TRACE_SLEEP=1`: who in the game sleeps, how often and how long, every 5 s.
+- `tools/build.py --define ARKHAM_PLAIN_MEMORY` builds the translated code with unordered memory into objects of its own, only to measure what x86 ordering costs.
+
+On the capsule route with multisampling off and one-color pixels, the game gives 238 FPS and stops at 240, with the render thread polling Feral's wait for the GPU
+(F_040a930, usleep(10) about 26,000 times a second). With `ARKHAM_MTL_NOPRESENT=1` the same run gives 283 FPS, peaks of 338 and no polling: the cap comes from presenting.
+The likely cause: the copy into a drawable waits on the GPU until the display lets the drawable go, and the queue runs in order, so everything after it waits too. Without
+anything presented, the render thread is the limit, about 3.5 ms of CPU a frame. Unordered memory changed nothing measurable in that test.
 - `ARKHAM_FPS_CAP=n`: a frame limit, as on OpenGL.
 - `ARKHAM_MTLSNAP=dir`: the back buffer at frames 30, 120 and every 600th. It stalls those frames.
 - `MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_ERROR_MODE=nslog MTL_DEBUG_LAYER_WARNING_MODE=ignore`: Metal's own checking. Clean so far.

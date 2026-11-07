@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <mach/mach_time.h>
 #include <mach-o/dyld.h>
+#include <os/lock.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -925,8 +926,41 @@ SHIM(time) {
 SHIM(clock) { RET((u32)clock()); }
 // Sleeping needs no lock, and the sound mixer sleeps between chunks: it mustn't have to wait for the lock to wake up. These only give up the
 // gate in one-at-a-time mode, where a running thread holds it.
+// ARKHAM_TRACE_SLEEP=1: every 5 s, who in the game slept, how often and for how long, by return address. For finding a frame limiter.
+static void note_sleep(CPU *c, u32 us) {
+    static int on = -1;
+    if (on < 0) on = getenv("ARKHAM_TRACE_SLEEP") != NULL;
+    if (!on) return;
+    enum { SLOTS = 32 };
+    static struct {
+        u32 from, n;
+        u64 us;
+    } seen[SLOTS];
+    static u64 last;
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    u32 from = G32(c->esp);
+    os_unfair_lock_lock(&lock);
+    for (int i = 0; i < SLOTS; i++) {
+        if (seen[i].from == from || !seen[i].from) {
+            seen[i].from = from;
+            seen[i].n++;
+            seen[i].us += us;
+            break;
+        }
+    }
+    u64 now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000000u;
+    if (now - last >= 5) {
+        last = now;
+        fprintf(stderr, "[sleep] per second:");
+        for (int i = 0; i < SLOTS && seen[i].from; i++) fprintf(stderr, " from %#x %u times, %.1f ms;", seen[i].from, seen[i].n / 5, (double)seen[i].us / 5000.0);
+        fprintf(stderr, "\n");
+        memset(seen, 0, sizeof seen);
+    }
+    os_unfair_lock_unlock(&lock);
+}
 SHIM(usleep) {
     u32 us = ARG(0);
+    note_sleep(c, us);
     int held = rt_gate_held();
     if (held) rt_gate_release();
     usleep(us);
@@ -943,6 +977,7 @@ SHIM(sleep) {
 }
 SHIM(nanosleep) {
     struct timespec ts = {(time_t)G32(ARG(0)), (long)G32(ARG(0) + 4)};
+    note_sleep(c, (u32)(ts.tv_sec * 1000000 + ts.tv_nsec / 1000));
     int held = rt_gate_held();
     if (held) rt_gate_release();
     nanosleep(&ts, NULL);

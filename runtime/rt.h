@@ -102,12 +102,22 @@ typedef double __attribute__((aligned(1), may_alias)) f64a;
 #define R64(a) (*(u64a *)(M + (u32)(a)))
 // Guest memory other threads can see. x86 keeps loads and stores in order, and game code depends on it, so these use
 // load-acquire and store-release. A value crossing a 16-byte boundary faults and rt.c finishes the access.
+#ifndef ARKHAM_PLAIN_MEMORY
 #define RA8(a) __atomic_load_n((u8 *)(M + (u32)(a)), __ATOMIC_ACQUIRE)
 #define RA16(a) __atomic_load_n((u16 *)(M + (u32)(a)), __ATOMIC_ACQUIRE)
 #define RA32(a) __atomic_load_n((u32 *)(M + (u32)(a)), __ATOMIC_ACQUIRE)
 #define WA8(a, v) __atomic_store_n((u8 *)(M + (u32)(a)), (u8)(v), __ATOMIC_RELEASE)
 #define WA16(a, v) __atomic_store_n((u16 *)(M + (u32)(a)), (u16)(v), __ATOMIC_RELEASE)
 #define WA32(a, v) __atomic_store_n((u32 *)(M + (u32)(a)), (u32)(v), __ATOMIC_RELEASE)
+#else
+// tools/build.py --define ARKHAM_PLAIN_MEMORY: the same accesses unordered, only to measure what the ordering costs. Threads can then see each other's writes out of order.
+#define RA8(a) R8(a)
+#define RA16(a) R16(a)
+#define RA32(a) R32(a)
+#define WA8(a, v) (R8(a) = (u8)(v))
+#define WA16(a, v) (R16(a) = (u16)(v))
+#define WA32(a, v) (R32(a) = (u32)(v))
+#endif
 #define RF(a) (*(f32a *)(M + (u32)(a)))
 #define RD(a) (*(f64a *)(M + (u32)(a)))
 #define X(n) (c->x[n])

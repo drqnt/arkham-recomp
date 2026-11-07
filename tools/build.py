@@ -41,9 +41,11 @@ def main() -> int:
     ap.add_argument("-j", dest="jobs", type=int, default=os.cpu_count())
     ap.add_argument("--only", default="", help="compile only shards matching this glob and stop")
     ap.add_argument("--serial", action="store_true", help="for ARKHAM_SERIAL=1 debugging: objects and binary in build/serial")
+    ap.add_argument("--define", action="append", default=[], help="an experiment's macro, as -D: its objects go in a folder of their own, so the usual build isn't redone")
     args = ap.parse_args()
     opt = f"-O{args.opt}"
-    objdir = os.path.join(ROOT, "build", "serial" if args.serial else f"obj{args.opt}")
+    objdir = os.path.join(ROOT, "build", "serial" if args.serial else f"obj{args.opt}" + "".join("-" + d.split("=")[0].lower() for d in args.define))
+    EXTRA.extend(f"-D{d}" for d in args.define)
     if args.serial:
         EXTRA.append("-DARKHAM_POLL")
     os.makedirs(objdir, exist_ok=True)

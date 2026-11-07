@@ -1193,7 +1193,16 @@ static id<MTLRenderPipelineState> pipeline_for(const PipeKey *k, Obj *vs, Obj *p
             id<MTLLibrary> vlib = vs_library_for(vs, ps ? ps->info.varyings : 0);
             d.vertexFunction = [[vlib newFunctionWithName:@"vs_main" constantValues:cv error:&err] autorelease];
             if (!d.vertexFunction) fprintf(stderr, "[mtl] vertex function: %s\n", err.localizedDescription.UTF8String);
-            if (ps && library_of(ps)) {
+            // ARKHAM_MTL_CHEAP_PS=1: every pixel shader replaced by one color, so the GPU has almost nothing to shade and a run shows what limits the CPU side.
+            static int cheap = -1;
+            static id<MTLFunction> cheap_fn;
+            if (cheap < 0) {
+                cheap = getenv("ARKHAM_MTL_CHEAP_PS") != NULL;
+                if (cheap) cheap_fn = [compile_msl("#include <metal_stdlib>\nfragment float4 cheap_ps() { return float4(0.5, 0.5, 0.5, 1.0); }\n") newFunctionWithName:@"cheap_ps"];
+            }
+            if (cheap && ps) {
+                d.fragmentFunction = cheap_fn;
+            } else if (ps && library_of(ps)) {
                 d.fragmentFunction = [[ps->lib newFunctionWithName:@"ps_main" constantValues:cv error:&err] autorelease];
                 if (!d.fragmentFunction) fprintf(stderr, "[mtl] fragment function: %s\n", err.localizedDescription.UTF8String);
             }
@@ -2511,10 +2520,13 @@ static void note_frame(u64 draws) {
         double secs = (double)(now - fps_start) / 1e9, fps = (double)fps_frames / secs;
         double per_frame = 125.0 / 3.0 / 1e6 / (double)fps_frames;
         u64 shown = atomic_exchange(&n_shown, 0);
-        fprintf(stderr, "[fps] %.1f, worst frame %.1f ms, %llu draws, %llu passes; ms a frame: thread busy %.1f, gpu %.1f, drawable %.2f, waiting for gpu %.2f, engine waiting for queries %.1f; %llu quad clears, %llu not needed, %llu resolves in pass; %llu of %llu shaders compiled in %.0f ms, %llu not from the cache, %u pipelines in %.0f ms; on screen %.1f a second, %llu dropped, longest gap %.1f ms, %.1f ms from present\n",
+        char threads[96];
+        void rt_thread_cpu_report(char *out, size_t cap, double frames);
+        rt_thread_cpu_report(threads, sizeof threads, (double)fps_frames);
+        fprintf(stderr, "[fps] %.1f, worst frame %.1f ms, %llu draws, %llu passes; ms a frame: thread busy %.1f, gpu %.1f, drawable %.2f, waiting for gpu %.2f, engine waiting for queries %.1f; %llu quad clears, %llu not needed, %llu resolves in pass; %llu of %llu shaders compiled in %.0f ms, %llu not from the cache, %u pipelines in %.0f ms; on screen %.1f a second, %llu dropped, longest gap %.1f ms, %.1f ms from present; guest threads, CPU ms a frame: %s\n",
                 fps, (double)fps_worst / 1e6, draws_seen, n_passes / fps_frames, (double)rt_d3dq_busy_ticks * per_frame, (double)atomic_exchange(&gpu_ns, 0) / 1e6 / (double)fps_frames, (double)ticks_drawable * per_frame,
                 (double)ticks_inflight * per_frame, (double)ticks_query_wait * per_frame, n_quad_clears / fps_frames, n_skipped_clears / fps_frames, n_resolves_in_pass / fps_frames, n_compiled, n_created, (double)compile_ticks * 125.0 / 3.0 / 1e6, n_uncached, n_pipes, (double)pipe_ticks * 125.0 / 3.0 / 1e6,
-                (double)shown / secs, atomic_exchange(&n_not_shown, 0), (double)atomic_exchange(&shown_worst_us, 0) / 1e3, shown ? (double)atomic_exchange(&shown_wait_us, 0) / 1e3 / (double)shown : 0.0);
+                (double)shown / secs, atomic_exchange(&n_not_shown, 0), (double)atomic_exchange(&shown_worst_us, 0) / 1e3, shown ? (double)atomic_exchange(&shown_wait_us, 0) / 1e3 / (double)shown : 0.0, threads);
         rt_d3dq_busy_ticks = ticks_drawable = ticks_inflight = ticks_query_wait = 0;
         n_passes = n_quad_clears = n_skipped_clears = n_resolves_in_pass = 0;
         rt_fps_overlay(fps, (double)fps_worst / 1e6);

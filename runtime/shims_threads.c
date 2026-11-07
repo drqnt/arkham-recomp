@@ -4,6 +4,8 @@
 #include "shim_reg.h"
 
 #include <errno.h>
+#include <mach/mach.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <sched.h>
@@ -240,8 +242,50 @@ SHIM(pthread_cond_timedwait) {
 }
 
 // ---------- thread lifetime ----------
+// CPU time of the guest's threads, for the [fps] line: which one is the limit, measured instead of guessed from frame rates the GPU also sets.
+#define TRACKED 64
+static struct {
+    thread_t port;
+    u32 start;
+    u64 last_us;
+} tracked[TRACKED];
+static _Atomic int n_tracked;
+static void track_thread(u32 start) {
+    int i = atomic_fetch_add(&n_tracked, 1);
+    if (i >= TRACKED) return;
+    tracked[i].start = start;
+    tracked[i].port = mach_thread_self();
+}
+// The busiest guest threads since the last call, as CPU time a frame, with the address each started at.
+void rt_thread_cpu_report(char *out, size_t cap, double frames) {
+    struct {
+        double ms;
+        u32 start;
+    } top[3] = {{0, 0}, {0, 0}, {0, 0}};
+    int n = atomic_load(&n_tracked);
+    if (n > TRACKED) n = TRACKED;
+    for (int i = 0; i < n; i++) {
+        if (!tracked[i].port) continue;
+        thread_basic_info_data_t info;
+        mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+        if (thread_info(tracked[i].port, THREAD_BASIC_INFO, (thread_info_t)&info, &count) != KERN_SUCCESS) continue;
+        u64 us = (u64)info.user_time.seconds * 1000000u + (u64)info.user_time.microseconds + (u64)info.system_time.seconds * 1000000u + (u64)info.system_time.microseconds;
+        double ms = (double)(us - tracked[i].last_us) / 1000.0 / (frames > 0 ? frames : 1);
+        tracked[i].last_us = us;
+        for (int k = 0; k < 3; k++) {
+            if (ms > top[k].ms) {
+                for (int m = 2; m > k; m--) top[m] = top[m - 1];
+                top[k].ms = ms;
+                top[k].start = tracked[i].start;
+                break;
+            }
+        }
+    }
+    snprintf(out, cap, "%.2f (%x), %.2f (%x), %.2f (%x)", top[0].ms, top[0].start, top[1].ms, top[1].start, top[2].ms, top[2].start);
+}
 static void *thread_tramp(void *p) {
     GThread *t = p;
+    track_thread(t->start);
     rt_gate_acquire();
     tl_self = t;
     while (t->suspended) block_a_little();
