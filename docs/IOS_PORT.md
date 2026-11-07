@@ -372,3 +372,44 @@ app goes to the background.
   - `jit:n`: the fake pad's held sticks wander like a thumb;
   - `mpeek`: shows the values a memory scan kept;
   - `ARKHAM_TOUCH_TURN=1` with `ARKHAM_TOUCH_MOUSE_INI=1`: the phone's bindings.
+
+## Controls v12 to v15: walking by the keyboard's names, the map, the hidden cursor; new icons, 2026-11-08
+
+- **v13, the frame rate:** the drop to 37 FPS that v12 showed came from Feral's own `Preferences Data`: after a launch on the folded phone's outer screen it fell back to
+  the full pixels, 2848 x 2000 on the inner screen. The phone now reads ScreenW/ScreenH there as half the screen's pixels (1424 x 1000),
+  and half is the default display mode.
+- **Why the swipe camera hardly turned while walking.** Measured on the Mac with the same route twice and the phone's settings
+  (`ARKHAM_TOUCH_MOUSE_INI=1`, so both runs had the same sensitivity): a 400-pixel turn while walking with the pad's left stick came
+  out at about a fifth (21 points against 117), while walking with the W key it came out whole. The game damps the camera's turning while
+  Batman walks by the pad's left stick keys (`XboxTypeS_LeftX/LeftY`), from any source; marking those events as not a pad's, or sending
+  them past the pad, didn't help. Sensitivity wasn't the cause.
+- **v14, the fix:** the touch stick's position goes to the engine each frame as `StrafeRight`/`MoveForward` (`aStrafe`/`aBaseY`, analog),
+  the keyboard's movement names, and as `TurnRight`/`TurnLeft` rebound on the phone to the raw left stick axes (`aRawLHJoyRight`,
+  `aRawLHJoyUp`) that the keyboard also feeds. The pad the game sees keeps its stick in the middle in play. The names are found in the
+  engine's name table at startup. The user's verdict: the camera behaves while standing, walking and running.
+- **v15 (built, not on the phone yet), the map:** walking goes straight to the engine only while the game warps the cursor each frame, which it does only in play. The
+  map and menus get the pad's stick again, so the map pans.
+- **v15, the menus' cursor:** the interface draws it into the frame itself, as the frame's last two draws (the arrow's fill, 12 vertices and
+  10 triangles, and its outline, 16 and 24, 8-byte vertices, the 1024 x 1024 L8 shape cache as texture 0). Found on the Mac with
+  `ARKHAM_FIND_CURSOR`. On the phone those draws are left out when the frame before ended with them; the pointer still moves and clicks
+  where a tap puts it. `ARKHAM_SHOW_CURSOR=1` draws it on the phone, `ARKHAM_HIDE_CURSOR=1` hides it on the Mac.
+- **v15, the Metal HUD switch** stores the choice for the next launch and says so each time: iOS shows Apple's HUD only in a process it was on
+  for from its start.
+- **v15, icons:** `ios/app/BatIcons.h` draws each button's icon with Core Graphics in the batarang's manner, in place of Apple's symbols:
+  chevrons to run, a fist, the counter's lightning, the cape, a grappling hook, down to the ground to crouch, a magnifier, the cowl for
+  detective mode, a reticle, an arrow round the cowl for the camera, the map, pause, a struck-out eye, a cross. `tools/bat_icons_preview.c`
+  draws them all on the Mac as the app does.
+- **v15, colour:** the buttons are white on their dark discs by default (Settings, "Кнопки", "Цвет": "Белые"); following the picture, light over
+  dark and dark over light, is the other choice. While white, the picture's lightness isn't read back.
+- **The startup on the phone (v14 log):** the launcher at 1.0 s, sound at 4.6 s, the back buffer at 4.7 s, the first frame at 7.3 s, the
+  Batman logo film at 9.0 s.
+  - The 2.5 s between the Steam calls after the device is made and the first frame take 0.1 s on the Mac. Only one exception is thrown
+    at startup, 8 ms, so it isn't throwing. The first launch of each new build now profiles every thread for its first 10 s, so the next
+    launch's log shows where they go.
+  - The 3.8 s of one-draw frames after the device is made, which looked black in the logs, are Feral's own logo film (`feral.bik`,
+    96 frames at 25 a second, no sound). On the Mac it shows as it should.
+- **Still open:**
+  - the gadgets' button showing the gadget chosen (the game's choice isn't known outside it yet);
+  - DualSense rumble on the phone;
+  - the cryptographic sequencer with touch;
+  - resolution and MSAA as settings.
