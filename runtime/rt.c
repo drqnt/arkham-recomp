@@ -270,9 +270,25 @@ static inline guest_fn ht_lookup(u32 a) {
 
 guest_fn rt_guest_fn(u32 addr) { return ht_lookup(addr); }
 
+// Adds a host function at a guest address to the table, after it's built: a vtable slot the game calls millions of times a second then skips the
+// search for imports below. The function finds out which address it was called through in c->jt. Readers may run meanwhile: they see the slot
+// empty, or its address with the function already there, and one that misses the function goes the slow way, which also works.
+void rt_ht_add(u32 addr, guest_fn fn) {
+    u32 h = ht_hash(addr);
+    while (ht[h].addr && ht[h].addr != addr) h = (h + 1) & (HT_SIZE - 1);
+    ht[h].fn = fn;
+    __atomic_store_n(&ht[h].addr, addr, __ATOMIC_RELEASE);
+}
+// The argument a dynamic import at this address was made with.
+u32 rt_dyn_arg_at(u32 addr) {
+    u32 k = (addr - IMP_BASE) / IMP_STEP - rt_import_n;
+    return k < dyn_n ? dyn_args[k] : 0;
+}
+
 void rt_dispatch(CPU *c, u32 t) {
     guest_fn f = ht_lookup(t);
     if (__builtin_expect(f != NULL, 1)) {
+        c->jt = t;
         f(c);
         return;
     }

@@ -166,6 +166,14 @@ is copied to a texture of the layer's own in the main queue, and a queue of its 
 old way). The same light run then gives 276 FPS with peaks of 320, still 120 a second on screen and the same 21 ms from present, and the polling is gone. At 4x nothing
 changes, 158 against 159, because there the GPU is the limit at about 6.5 ms a frame. Without anything presented, the render thread is the limit, about 3.5 ms of CPU a
 frame. Unordered memory changed nothing measurable in a test that turned out to be held by the GPU, so that's not settled.
+
+The render thread, with the GPU nearly idle, in Instruments: about 64% the engine's own translated code, and about 28% the way each Direct3D call reaches the queue: the
+dispatcher's search for the import, its slow path, a thread-local variable, the method shim and the queue itself, for some 2.8 million calls a second. Two changes:
+repeats of `SetTexture`, `SetStreamSource`, `SetVertexDeclaration`, the shaders and the shader constants are now skipped on the render thread, compared by address only
+while no object has been made since, since a new one can sit at a destroyed one's address, and constants by their values (calls through the queue down 36%); and the
+methods' addresses are in the dispatcher's table, so they skip the slow path. Together: render thread 3.62 to 3.45 ms a frame, 276 to 290 FPS in that light run, real
+4x unchanged. The queue's statistics, `ARKHAM_TRACE_D3DQ=1`, used to read the clock on every call, a quarter of the render thread, and the worker's busy time read it
+twice for each run of commands, 12% of that thread; both are cheap now.
 - `ARKHAM_FPS_CAP=n`: a frame limit, as on OpenGL.
 - `ARKHAM_MTLSNAP=dir`: the back buffer at frames 30, 120 and every 600th. It stalls those frames.
 - `MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_ERROR_MODE=nslog MTL_DEBUG_LAYER_WARNING_MODE=ignore`: Metal's own checking. Clean so far.

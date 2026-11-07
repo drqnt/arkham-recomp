@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,7 +55,9 @@ typedef struct {
     signed char ptr[2];  // argument numbers, this being 0; -1 for none
     signed char count;   // argument with the element count; -1 for one element
     u32 unit[2];
+    u8 shadowed;         // SH_*: a setter whose repeats are skipped below, or a creation that makes them unsafe to skip
 } Method;
+enum { SH_NONE, SH_TEXTURE, SH_STREAM, SH_DECL, SH_VS, SH_PS, SH_VS_CONST, SH_PS_CONST, SH_CREATE };
 
 #define MAX_METHODS 512
 static Method methods[MAX_METHODS];
@@ -193,6 +196,23 @@ static inline void spin_pause(u32 i) {
     if (i < 4000) __asm__ volatile("isb");
     else sched_yield();
 }
+// The same ticks as mach_absolute_time on Apple silicon, read straight from the counter: the worker reads the time twice for each run of commands, and through
+// mach_absolute_time that was 12% of its time.
+static inline u64 fast_ticks(void) {
+    u64 v;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+}
+// The counter's ticks in mach_absolute_time's 24 MHz ones: on this Mac the counter runs faster.
+static u64 to_mach_ticks(u64 counter_ticks) {
+    static double scale;
+    if (!scale) {
+        u64 hz;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
+        scale = hz ? 24e6 / (double)hz : 1.0;
+    }
+    return (u64)((double)counter_ticks * scale);
+}
 static inline void wake_worker(void) {
     if (__atomic_load_n(&worker_asleep, __ATOMIC_SEQ_CST)) {
         pthread_mutex_lock(&sleep_mu);
@@ -321,7 +341,7 @@ static void *worker_main(void *arg) {
             pthread_mutex_unlock(&sleep_mu);
             continue;
         }
-        u64 busy_from = mach_absolute_time();
+        u64 busy_from = fast_ticks();
         while (tail != head) {
             Cmd *cmd = (Cmd *)(ring + (u32)(tail % RING_SIZE));
             if (cmd->fn) {
@@ -343,7 +363,7 @@ static void *worker_main(void *arg) {
             tail += cmd->size;
             __atomic_store_n(&q_tail, tail, __ATOMIC_RELEASE);
         }
-        rt_d3dq_busy_ticks += mach_absolute_time() - busy_from;
+        rt_d3dq_busy_ticks += to_mach_ticks(fast_ticks() - busy_from);
     }
     return NULL;
 }
@@ -367,13 +387,78 @@ static inline u32 arg_of(CPU *c, int i) { return G32(c->esp + 4 + 4u * (u32)i); 
 #define SAMPLERS 32
 #define SAMPLER_TYPES 16
 #define STREAMS 16
+#define TEX_STAGES 20  // 0-15, and the vertex texture samplers 257-260 as 16-19
 static struct {
     u32 render[RENDER_STATES];
     u32 sampler[SAMPLERS][SAMPLER_TYPES];
     u32 freq[STREAMS];
     u32 indices;
     u8 render_set[RENDER_STATES], sampler_set[SAMPLERS][SAMPLER_TYPES], freq_set[STREAMS], indices_set;
+    // Objects by their guest address, valid only while no object has been made since: a new one can sit at a destroyed one's address.
+    u32 texture[TEX_STAGES], stream[STREAMS][3], decl, vs, ps;
+    u64 texture_made[TEX_STAGES], stream_made[STREAMS], decl_made, vs_made, ps_made, indices_made;
+    float vs_const[256][4], ps_const[224][4];
+    u8 vs_const_set[256], ps_const_set[224];
 } shadow;
+// Counts objects made, from any thread: what the engine sets is compared by address only while this hasn't moved.
+static _Atomic u64 objects_made = 1;
+static inline u64 made_now(void) { return atomic_load_explicit(&objects_made, memory_order_acquire); }
+// Returns 1 for a call that sets what is already set, and remembers what a call sets otherwise. The engine sets about 9,000 things a frame through the queue, and each
+// costs the render thread more than this check.
+static int repeats_what_is_set(CPU *c, const Method *m) {
+    u64 now = made_now();
+    switch (m->shadowed) {
+        case SH_TEXTURE: {  // this, stage, texture
+            u32 stage = arg_of(c, 1), tex = arg_of(c, 2);
+            u32 i = stage < 16 ? stage : stage >= 257 && stage <= 260 ? stage - 241 : TEX_STAGES;
+            if (i >= TEX_STAGES) return 0;
+            if (shadow.texture_made[i] == now && shadow.texture[i] == tex) return 1;
+            shadow.texture[i] = tex;
+            shadow.texture_made[i] = now;
+            return 0;
+        }
+        case SH_STREAM: {  // this, stream, buffer, offset, stride
+            u32 n = arg_of(c, 1), vb = arg_of(c, 2), off = arg_of(c, 3), stride = arg_of(c, 4);
+            if (n >= STREAMS) return 0;
+            if (shadow.stream_made[n] == now && shadow.stream[n][0] == vb && shadow.stream[n][1] == off && shadow.stream[n][2] == stride) return 1;
+            shadow.stream[n][0] = vb;
+            shadow.stream[n][1] = off;
+            shadow.stream[n][2] = stride;
+            shadow.stream_made[n] = now;
+            return 0;
+        }
+        case SH_DECL:
+        case SH_VS:
+        case SH_PS: {  // this, object
+            u32 o = arg_of(c, 1);
+            u32 *v = m->shadowed == SH_DECL ? &shadow.decl : m->shadowed == SH_VS ? &shadow.vs : &shadow.ps;
+            u64 *t = m->shadowed == SH_DECL ? &shadow.decl_made : m->shadowed == SH_VS ? &shadow.vs_made : &shadow.ps_made;
+            if (*t == now && *v == o) return 1;
+            *v = o;
+            *t = now;
+            return 0;
+        }
+        case SH_VS_CONST:
+        case SH_PS_CONST: {  // this, start, data, count
+            u32 start = arg_of(c, 1), data = arg_of(c, 2), count = arg_of(c, 3);
+            int vs = m->shadowed == SH_VS_CONST;
+            u32 regs = vs ? 256 : 224;
+            if (!data || start >= regs || count > regs - start) return 0;
+            float(*k)[4] = vs ? &shadow.vs_const[start] : &shadow.ps_const[start];
+            u8 *set = vs ? &shadow.vs_const_set[start] : &shadow.ps_const_set[start];
+            int same = !memcmp(k, GP(data), count * 16u);
+            for (u32 r = 0; same && r < count; r++) same = set[r];
+            if (same) return 1;
+            memcpy(k, GP(data), count * 16u);
+            memset(set, 1, count);
+            return 0;
+        }
+        case SH_CREATE:
+            atomic_fetch_add_explicit(&objects_made, 1, memory_order_acq_rel);
+            return 0;
+    }
+    return 0;
+}
 // A texture's level surfaces last as long as it does, so GetSurfaceLevel only has to go to the layer once per level. The engine asks a
 // dozen times a frame for its render targets, and each of those would otherwise wait for the whole queue.
 #define LEVEL_CACHE 1024u
@@ -513,6 +598,9 @@ static void run_async_with(u32 index, u32 this_arg) {
     wake_worker();
 }
 static void note_stats(void) {
+    // Reading the clock on every call cost the render thread a quarter of its time, which hid what was being measured.
+    static u32 calls;
+    if (++calls & 0xFFFF) return;
     static u64 last;
     u64 now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000000;
     if (now - last < 5) return;
@@ -645,8 +733,16 @@ static void dtr_call(CPU *c, const Method *m) {
         fprintf(stderr, "[d3d] %s %x %x %x %x %x %x\n", n, arg_of(c, 1), arg_of(c, 2), arg_of(c, 3), arg_of(c, 4), arg_of(c, 5), arg_of(c, 6));
     }
 }
-static void method_shim(CPU *c) {
-    u32 index = rt_dyn_cur_arg;
+static void method_call(CPU *c, u32 index);
+static void method_shim(CPU *c) { method_call(c, rt_dyn_cur_arg); }
+// Reached straight from rt_dispatch's table, through the vtable slot's address in c->jt: no search for the import, no thread-local variable.
+void rt_ht_add(u32 addr, guest_fn fn);
+u32 rt_dyn_arg_at(u32 addr);
+static void method_entry(CPU *c) {
+    method_call(c, rt_dyn_arg_at(c->jt));
+    c->esp += 4;  // the return address, which the import path pops for other imports
+}
+static void method_call(CPU *c, u32 index) {
     Method *m = &methods[index];
     if (__builtin_expect(rt_d3d_census_on > 0, 0) && c != worker_cpu) rt_d3d_census(m->name, c);
     if (__builtin_expect(lvl.on != 0, 0) && c != worker_cpu) level_note(m);
@@ -688,6 +784,11 @@ static void method_shim(CPU *c) {
         return;
     }
     if (trace) note_stats();
+    if (m->shadowed && repeats_what_is_set(c, m)) {
+        if (trace) n_skipped++;
+        c->eax = 0;
+        return;
+    }
     u32 p0 = 0, b0 = 0, p1 = 0, b1 = 0;
     switch (m->kind) {
         case K_ASYNC:
@@ -737,13 +838,14 @@ static void method_shim(CPU *c) {
         }
         case K_INDICES: {
             u32 ib = arg_of(c, 1);
-            if (shadow.indices_set && shadow.indices == ib) {
+            if (shadow.indices_set && shadow.indices == ib && shadow.indices_made == made_now()) {
                 if (trace) n_skipped++;
                 c->eax = 0;
                 return;
             }
             shadow.indices = ib;
             shadow.indices_set = 1;
+            shadow.indices_made = made_now();
             break;
         }
         case K_QUERY_DATA: {
@@ -817,11 +919,13 @@ static void method_shim(CPU *c) {
             break;
         }
         case K_DRAW_UP:  // this, type, primitives, data, stride
+            shadow.stream_made[0] = 0;  // Direct3D clears stream 0 after this call
             p0 = arg_of(c, 3);
             b0 = prim_vertices(arg_of(c, 1), arg_of(c, 2)) * arg_of(c, 4);
             break;
         case K_DRAW_IUP: {  // this, type, min index, vertices, primitives, indices, format, data, stride
-            shadow.indices_set = 0;  // Direct3D clears the index buffer after this call
+            shadow.indices_set = 0;  // Direct3D clears the index buffer and stream 0 after this call
+            shadow.stream_made[0] = 0;
             u32 fmt = arg_of(c, 6);
             p0 = arg_of(c, 5);
             b0 = prim_vertices(arg_of(c, 1), arg_of(c, 4)) * (fmt == 102 ? 4u : 2u);
@@ -884,6 +988,10 @@ static void add_method(u32 vtable, u32 slot, const char *cls, const char *method
         }
     }
     if (slot == 2 || slot == 3) m->kind = K_REF;
+    m->shadowed = !strcmp(name, "Device.SetTexture") ? SH_TEXTURE : !strcmp(name, "Device.SetStreamSource") ? SH_STREAM
+                : !strcmp(name, "Device.SetVertexDeclaration") ? SH_DECL : !strcmp(name, "Device.SetVertexShader") ? SH_VS
+                : !strcmp(name, "Device.SetPixelShader") ? SH_PS : !strcmp(name, "Device.SetVertexShaderConstantF") ? SH_VS_CONST
+                : !strcmp(name, "Device.SetPixelShaderConstantF") ? SH_PS_CONST : !strncmp(name, "Device.Create", 13) ? SH_CREATE : SH_NONE;
     {
         void (*rt_mtl_method(const char *name, unsigned slot))(CPU *);
         void (*metal)(CPU *) = rt_mtl_method(m->name, slot);
@@ -900,6 +1008,7 @@ static void add_method(u32 vtable, u32 slot, const char *cls, const char *method
     if (!strcmp(name, "Device.CreateVertexShader")) method_create_vs = n_methods;
     if (!strcmp(name, "Device.CreatePixelShader")) method_create_ps = n_methods;
     G32(where) = rt_dyn_import_nogate(method_shim, n_methods);
+    rt_ht_add(G32(where), method_entry);
     n_methods++;
 }
 void rt_d3dq_start(void) {
