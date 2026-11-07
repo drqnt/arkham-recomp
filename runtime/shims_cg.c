@@ -71,9 +71,11 @@ SHIM(CGDisplayScreenSize) {
     memcpy(&c->edx, &h, 4);
 }
 SHIM(CGDisplayIDToOpenGLDisplayMask) { RET(1); }
-SHIM(CGDisplayCopyDisplayMode) { RET(cf_wrap(phone_mode(1.0, 1))); }
+// The default and current mode is half the screen's pixels, which the game ran at over 100 FPS: Feral falls back to the default whenever the size it
+// kept isn't one of the modes, as after a start on the outer screen, and the full pixels took four times the GPU (shims_libc.c, phone_prefs_data).
+SHIM(CGDisplayCopyDisplayMode) { RET(cf_wrap(phone_mode(0.5, 1))); }
 SHIM(CGDisplayCopyAllDisplayModes) {
-    CFDictionaryRef modes[3] = {phone_mode(1.0, 1), phone_mode(0.75, 0), phone_mode(0.5, 0)};
+    CFDictionaryRef modes[3] = {phone_mode(0.5, 1), phone_mode(0.75, 0), phone_mode(1.0, 0)};
     CFArrayRef a = CFArrayCreate(NULL, (const void **)modes, 3, &kCFTypeArrayCallBacks);
     for (int i = 0; i < 3; i++) CFRelease(modes[i]);
     if (tracing()) fprintf(stderr, "[cg] display modes: %d x %d and two smaller\n", mode_int(cf_wrap(CFArrayGetValueAtIndex(a, 0)), CFSTR("w")), mode_int(cf_wrap(CFArrayGetValueAtIndex(a, 0)), CFSTR("h")));

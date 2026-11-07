@@ -331,6 +331,100 @@ static void install_mouse_as_pad(u32 bp2) {
     fprintf(stderr, "[mouse] the pointer's motion reaches the engine as a pad's (its InputAxis at %08x)\n", fn);
 }
 #define TOUCH_TURN_VSIGN 1.0  // the vertical's sign on the stick's axis against the mouse's, measured on the Mac
+// ---------- the touch camera as the right stick ----------
+// The game turns the camera from the mouse while Batman stands, but damps it while he walks, and from the pad's right stick it never does (the user's
+// DualSense in the same place; v11 put the swipe on the stick's axes through the mouse's key, and that was damped too). So the swipe goes to the engine
+// as the right stick itself: the keys XboxTypeS_RightX and XboxTypeS_RightY, with the stick's own bindings (aTurn and aLookup with a dead zone of 0.2,
+// and the raw axes), and each frame the value that turns by exactly the swipe. The engine's Axis command (F_0f84320) maps a value v past the dead zone
+// to (v - 0.2) / 0.8, so the value sent is 0.2 + 0.8 x what should arrive. Off with ARKHAM_TOUCH_STICK=0 on the phone; on the Mac with =1.
+// The engine knows its keys by their number in its name table. Those two are found once, in the background: each entry of the table holds its number
+// a few bytes before its characters, laid out as MouseX's entry shows, whose number F_19deea0's globals give.
+#include <mach/mach.h>
+#include <stdatomic.h>
+static _Atomic u32 stick_idx[2];  // the name table numbers of XboxTypeS_RightX and XboxTypeS_RightY, 0 until found
+// Only on asking (ARKHAM_TOUCH_STICK=1): measured on the Mac, swipes sent this way were damped while walking just as the mouse's were, and standing they
+// didn't turn the camera at all, since the game smooths and speeds up a stick's turning, made for a thumb that holds it.
+static int stick_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("ARKHAM_TOUCH_STICK");
+        on = v && *v == '1';
+    }
+    return on;
+}
+// Every place in the guest's memory where text appears as width-byte characters with a terminator: calls found(guest address) until it says stop.
+static void scan_guest_text(const char *text, int width, int (^found)(u32 guest)) {
+    u8 pat[64];
+    size_t n = strlen(text), len = (n + 1) * (size_t)width;
+    if (len > sizeof pat) return;
+    memset(pat, 0, len);
+    for (size_t i = 0; i < n; i++) pat[i * (size_t)width] = (u8)text[i];
+    vm_address_t a = (vm_address_t)RT_MEM_BASE;
+    while (a < (vm_address_t)RT_MEM_BASE + 0x100000000ull) {
+        vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj;
+        if (vm_region_64(mach_task_self(), &a, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS) return;
+        if (a >= (vm_address_t)RT_MEM_BASE + 0x100000000ull) return;
+        if (info.protection & VM_PROT_READ) {
+            const u8 *p = (const u8 *)a, *end = p + size;
+            while (p < end) {
+                const u8 *hit = memmem(p, (size_t)(end - p), pat, len);
+                if (!hit) break;
+                u64 g = (u64)(uintptr_t)hit - RT_MEM_BASE;
+                if (g >= 16 && found((u32)g)) return;
+                p = hit + 1;
+            }
+        }
+        a += size;
+    }
+}
+static void *find_stick_names(void *arg) {
+    u32 mouse_idx = (u32)(uintptr_t)arg;
+    u64 t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    __block int width = 0, at = 0, shift = 0;
+    // The layout, from MouseX: the characters' width, how far before them the number is, and whether it's stored doubled (a flag in its lowest bit).
+    for (int w = 1; w <= 4 && !width; w *= 2) {
+        scan_guest_text("MouseX", w, ^int(u32 g) {
+            for (int off = 4; off <= 16; off += 4)
+                for (int sh = 0; sh <= 1; sh++)
+                    if (G32(g - (u32)off) >> sh == mouse_idx) {
+                        width = w, at = off, shift = sh;
+                        return 1;
+                    }
+            return 0;
+        });
+    }
+    if (!width) {
+        fprintf(stderr, "[mouse] the right stick's key names weren't found (MouseX is %u): the touch camera stays the mouse\n", mouse_idx);
+        return NULL;
+    }
+    static const char *const names[2] = {"XboxTypeS_RightX", "XboxTypeS_RightY"};
+    for (int k = 0; k < 2; k++) {
+        __block u32 idx = 0;
+        scan_guest_text(names[k], width, ^int(u32 g) {
+            u32 v = G32(g - (u32)at) >> shift;
+            if (v && v < 1000000) idx = v;
+            return idx != 0;
+        });
+        atomic_store(&stick_idx[k], idx);
+    }
+    fprintf(stderr, "[mouse] the right stick's keys are names %u and %u (MouseX %u, %d-byte characters, the number %d bytes before them%s), found in %.0f ms\n",
+            atomic_load(&stick_idx[0]), atomic_load(&stick_idx[1]), mouse_idx, width, at, shift ? ", doubled" : "",
+            (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6);
+    return NULL;
+}
+static void start_stick_names(u32 bp2) {
+    static int started;
+    if (started || !stick_on()) return;
+    u32 base = G32(bp2 - 0xbc), mouse_name = base == 0x19deeb1u ? G32(base + 0x1aaf027u) : 0;
+    if (!mouse_name) return;
+    started = 1;
+    pthread_t t;
+    pthread_create(&t, NULL, find_stick_names, (void *)(uintptr_t)G32(mouse_name));
+    pthread_detach(t);
+}
 // The touch camera's motion to the engine, as Feral's input loop would hand a mouse's, from inside that loop's reading of the pointer. bp2 is the loop's
 // frame: [-0xc0] its viewport client, [-0xc8] its window object (the viewport is 4 bytes in), [+0xc] the frame's time, and [-0xbc] the address its
 // code takes its globals from (0x19deeb1), where the names MouseX and MouseY are at +0x1aaf027 and +0x1aaf02b.
@@ -346,6 +440,8 @@ static void touch_mouse_to_engine(CPU *c, u32 bp2, double dx, double dy) {
     }
     const u32 names[2] = {G32(base + 0x1aaf027u), G32(base + 0x1aaf02bu)};
     double d[2] = {dx, -dy};  // as F_0048c10 gives them: right and up positive, the pointer's y growing downwards
+    u32 stick[2] = {atomic_load(&stick_idx[0]), atomic_load(&stick_idx[1])};
+    int as_stick = stick_on() && stick[0] && stick[1];
     // With the mouse's axes on the right stick's (rt_touch_turn, shims_libc.c), the value for this frame that turns by what the mouse would have:
     // a pixel was 7.5 rotation units (MouseSensitivity 7.5), and the engine turns the stick's axes by value x 100 x the frame's time x
     // LookRightScale (375) or LookUpScale (-300).
@@ -353,16 +449,19 @@ static void touch_mouse_to_engine(CPU *c, u32 bp2, double dx, double dy) {
     float dt;
     memcpy(&dt, &(u32){G32(bp2 + 0xc)}, 4);
     if (!(dt > 0.0005f && dt < 0.25f)) dt = 1.0f / 60;
-    if (rt_touch_turn()) {
+    if (rt_touch_turn() || as_stick) {
         d[0] = d[0] * 7.5 / (100.0 * dt * 375.0);
         d[1] = d[1] * 7.5 / (100.0 * dt * -300.0) * TOUCH_TURN_VSIGN;
     }
+    if (as_stick)  // past the stick's dead zone, as the engine maps it back (F_0f84320)
+        for (int k = 0; k < 2; k++)
+            if (d[k] != 0) d[k] = d[k] > 0 ? 0.2 + 0.8 * d[k] : -0.2 + 0.8 * d[k];
     for (int k = 0; k < 2; k++) {
         if (d[k] == 0 || !names[k]) continue;
         float f = (float)d[k];
         u32 bits;
         memcpy(&bits, &f, 4);
-        u32 args[8] = {client, window ? window + 4 : 0, 0, G32(names[k]), G32(names[k] + 4), bits, G32(bp2 + 0xc), 1};
+        u32 args[8] = {client, window ? window + 4 : 0, 0, as_stick ? stick[k] : G32(names[k]), as_stick ? 0 : G32(names[k] + 4), bits, G32(bp2 + 0xc), 1};
         rt_call_guest(c, fn, 8, args);
     }
     sent_frames++;
@@ -405,7 +504,10 @@ SHIM(HIGetMousePosition) {
             u32 bp1 = G32(bp);
             if (bp1 > 0x1000 && G32(bp1 + 4) == 0x19df02fu) bp2 = G32(bp1);
         }
-        if (bp2) install_mouse_as_pad(bp2);
+        if (bp2) {
+            install_mouse_as_pad(bp2);
+            start_stick_names(bp2);
+        }
     }
     {
         static int trace = -1;

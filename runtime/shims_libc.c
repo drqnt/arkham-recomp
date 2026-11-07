@@ -844,10 +844,8 @@ extern int rt_no_frame_limit;
 //   the engine had written that back into BmInput.ini.
 // - And in the camera's settings (BmCamera.ini and the files it's based on), the game's camera assist as the phone's settings say (ARKHAM_CAMERA_ASSIST,
 //   off unless set): with a pad, and the touch camera is one to the engine, it turns the camera behind Batman as he runs, over what a swipe turns.
-// - The mouse's axes bound to the right stick's (aTurn and aLookup) instead of the mouse's own (aMouseX, aMouseY): the touch camera then turns the
-//   camera as a pad's right stick does, which the game lets turn it while Batman walks, where it all but stops the mouse's turning (controls v11,
-//   docs/IOS_PORT.md). The runtime sends each frame the stick value that turns by exactly the swipe (touch_mouse_to_engine, shims_sys.c). Off with
-//   ARKHAM_TOUCH_TURN=0 on the phone; on the Mac only with ARKHAM_TOUCH_TURN=1.
+// - With ARKHAM_TOUCH_TURN=1 (controls v11, now replaced by the right stick's own keys), the mouse's axes bound to the right stick's (aTurn and
+//   aLookup) instead of the mouse's own (aMouseX, aMouseY).
 // ARKHAM_TOUCH_MOUSE_INI=1 does the same on the Mac, for scripted runs, and then the engine's writes of those files go nowhere, so that the Mac's
 // game keeps its own settings.
 // The text keeps its length, since the engine may take the size from stat(), and values are set, not multiplied, since the engine writes what it read
@@ -915,11 +913,7 @@ int rt_touch_turn(void) {
     static int on = -1;
     if (on < 0) {
         const char *v = getenv("ARKHAM_TOUCH_TURN");
-#if TARGET_OS_IPHONE
-        on = !(v && *v == '0');
-#else
-        on = v && *v == '1';
-#endif
+        on = v && *v == '1';  // v11's way, now only on asking: the swipe goes in as the right stick's own keys (shims_sys.c)
     }
     return on;
 }
@@ -990,6 +984,9 @@ static int input_ini_file(const char *path) {
     free(text);
     return fd;
 }
+#if TARGET_OS_IPHONE
+extern double rt_ios_screen_w, rt_ios_screen_h, rt_ios_screen_scale;  // ios_appkit.m, from the app
+#endif
 static FILE *language_ini(const char *path, const char *mode) {
     static const char *const codes[][2] = {{"en", "int"}, {"fr", "fra"}, {"de", "deu"}, {"it", "ita"}, {"es", "esn"}, {"pl", "pol"}, {"ru", "rus"}};
     static const char tail[] = "/BmEngine.ini";
@@ -1024,8 +1021,55 @@ static FILE *language_ini(const char *path, const char *mode) {
     if (ue) fprintf(stderr, "[lang] the engine reads Language=%s\n", ue);
     return fmemopen(out, o, "r");  // the buffer lives as long as the process: the engine reads this file a few times at start
 }
+#if TARGET_OS_IPHONE
+// The game's resolution is in Feral's own preferences ("Preferences Data", XML), as ScreenW and ScreenH: on the phone it reads them as half the
+// screen's pixels, 1424 x 1000 on the inner screen, which its first start chose and which ran over 100 FPS. Started once on the outer screen (folded),
+// where that size isn't one of the modes, Feral took the screen's full pixels instead and kept them, 2848 x 2000 back on the inner screen: four times
+// the pixels, 30 to 45 ms of GPU a frame (2026-11-08). The file stays as it is; Feral writes what it uses back into it.
+static FILE *phone_prefs_data(const char *path, const char *mode) {
+    static const char tail[] = "/Preferences Data";
+    size_t n = strlen(path), t = sizeof tail - 1;
+    if (mode[0] != 'r' || n < t || strcmp(path + n - t, tail)) return NULL;
+    FILE *in = fopen(path, "rb");
+    if (!in) return NULL;
+    fseek(in, 0, SEEK_END);
+    long size = ftell(in);
+    fseek(in, 0, SEEK_SET);
+    if (size <= 0 || size > (4 << 20)) {
+        fclose(in);
+        return NULL;
+    }
+    char *text = calloc(1, (size_t)size + 1), *out = malloc((size_t)size + 64);
+    size_t got = fread(text, 1, (size_t)size, in);
+    fclose(in);
+    int want[2] = {(int)(rt_ios_screen_w * rt_ios_screen_scale * 0.5) & ~7, (int)(rt_ios_screen_h * rt_ios_screen_scale * 0.5) & ~7};
+    static const char *const keys[2] = {"name=\"ScreenW\" type=\"integer\">", "name=\"ScreenH\" type=\"integer\">"};
+    size_t o = 0, i = 0;
+    int was[2] = {0, 0};
+    while (i < got) {
+        int k = !strncmp(text + i, keys[0], strlen(keys[0])) ? 0 : !strncmp(text + i, keys[1], strlen(keys[1])) ? 1 : -1;
+        if (k < 0) {
+            out[o++] = text[i++];
+            continue;
+        }
+        size_t kl = strlen(keys[k]);
+        memcpy(out + o, text + i, kl);
+        o += kl;
+        i += kl;
+        was[k] = atoi(text + i);
+        while (i < got && text[i] >= '0' && text[i] <= '9') i++;
+        o += (size_t)sprintf(out + o, "%d", want[k]);
+    }
+    free(text);
+    fprintf(stderr, "[ios] Feral's preferences read with the resolution %d x %d (they say %d x %d)\n", want[0], want[1], was[0], was[1]);
+    return fmemopen(out, o, "r");  // kept for the life of the process, as language_ini's
+}
+#endif
 SHIM(fopen) {
     FILE *f = language_ini(GS(ARG(0)), GS(ARG(1)));
+#if TARGET_OS_IPHONE
+    if (!f) f = phone_prefs_data(GS(ARG(0)), GS(ARG(1)));
+#endif
 #if !TARGET_OS_IPHONE
     // As in open() below: an experiment's input settings aren't written back into the Mac's game.
     if (!f && GS(ARG(1))[0] != 'r' && input_rewrites() && is_input_ini(GS(ARG(0)))) {
