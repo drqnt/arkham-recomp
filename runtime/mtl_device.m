@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -2807,11 +2808,14 @@ void rt_set_metal_hud(int on) {
 }
 // Frames the game has finished, for the phone's touch controls (ios/app/TouchControls.m): a game that has stopped warping the cursor while frames
 // go on is in a menu, while one that has stopped both is only busy.
-static _Atomic unsigned frames_total;
+static _Atomic unsigned frames_total, last_draws;
 unsigned rt_frames_presented(void) { return atomic_load(&frames_total); }
+// And how many draws the last one took: play takes hundreds, a loading screen or a film a few.
+unsigned rt_last_frame_draws(void) { return atomic_load(&last_draws); }
 static void note_frame(u64 draws) {
     static u64 fps_start, fps_frames, fps_worst, fps_prev, draws_seen;
     atomic_fetch_add(&frames_total, 1);
+    atomic_store(&last_draws, (unsigned)draws);
     u64 now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (!fps_start) fps_start = now;
     if (fps_prev && now - fps_prev > fps_worst) fps_worst = now - fps_prev;
@@ -2865,6 +2869,105 @@ static void compile_test(const char *list) {
             object_getClassName(dev), object_getClassName(queue));
     _exit(0);
 }
+#if TARGET_OS_IPHONE
+// ---------- for the phone's touch controls (ios/app/TouchControls.m) ----------
+// How light the picture is under each button, so that each can be drawn light over dark parts and dark over light ones: every 6th frame, while the app
+// asks for it, the finished frame is copied into a texture of its own, its mip levels are made, and the level about 44 x 31 is read back once the GPU
+// is done with it. A few hundredths of a millisecond of the GPU's time.
+#define LUMA_LEVEL 5
+static _Atomic int luma_wanted, luma_busy;
+static id<MTLTexture> luma_tex;
+static id<MTLBuffer> luma_buf;
+static pthread_mutex_t luma_mu = PTHREAD_MUTEX_INITIALIZER;
+static float *luma_cells;
+static u32 luma_cw, luma_ch;
+void rt_want_picture_luma(int on) { atomic_store(&luma_wanted, on); }
+// The average lightness, 0 to 1, of a part of the picture given as shares of it from its top left; -1 until there is any.
+double rt_picture_luma(double x0, double y0, double x1, double y1) {
+    double sum = 0;
+    int n = 0;
+    pthread_mutex_lock(&luma_mu);
+    if (luma_cells) {
+        int cx0 = (int)fmax(0, floor(x0 * luma_cw)), cx1 = (int)fmin(luma_cw - 1, ceil(x1 * luma_cw) - 1);
+        int cy0 = (int)fmax(0, floor(y0 * luma_ch)), cy1 = (int)fmin(luma_ch - 1, ceil(y1 * luma_ch) - 1);
+        for (int y = cy0; y <= cy1; y++)
+            for (int x = cx0; x <= cx1; x++) {
+                sum += luma_cells[y * (int)luma_cw + x];
+                n++;
+            }
+    }
+    pthread_mutex_unlock(&luma_mu);
+    return n ? sum / n : -1;
+}
+static void sample_luma(void) {
+    if (!atomic_load(&luma_wanted) || !back_buffer || frame_no % 6 || atomic_load(&luma_busy)) return;
+    id<MTLTexture> src = back_buffer->tex;
+    if (src.sampleCount > 1 || (src.pixelFormat != MTLPixelFormatBGRA8Unorm && src.pixelFormat != MTLPixelFormatBGRA8Unorm_sRGB)) return;
+    u32 w = (u32)src.width, h = (u32)src.height, lw = MAX(1u, w >> LUMA_LEVEL), lh = MAX(1u, h >> LUMA_LEVEL);
+    if (!luma_tex || luma_tex.width != w || luma_tex.height != h || luma_tex.pixelFormat != src.pixelFormat) {
+        [luma_tex release];
+        [luma_buf release];
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:w height:h mipmapped:YES];
+        d.storageMode = MTLStorageModePrivate;
+        d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        luma_tex = [dev newTextureWithDescriptor:d];
+        luma_buf = [dev newBufferWithLength:(NSUInteger)lw * lh * 4 options:MTLResourceStorageModeShared];
+    }
+    if (luma_tex.mipmapLevelCount <= LUMA_LEVEL) return;
+    atomic_store(&luma_busy, 1);
+    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toTexture:luma_tex destinationSlice:0
+        destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [b generateMipmapsForTexture:luma_tex];
+    [b copyFromTexture:luma_tex sourceSlice:0 sourceLevel:LUMA_LEVEL sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(lw, lh, 1) toBuffer:luma_buf
+        destinationOffset:0 destinationBytesPerRow:lw * 4 destinationBytesPerImage:(NSUInteger)lw * lh * 4];
+    [b endEncoding];
+    id<MTLBuffer> buf = luma_buf;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        const u8 *px = buf.contents;
+        float *cells = malloc((size_t)lw * lh * sizeof(float));
+        for (u32 i = 0; i < lw * lh; i++) cells[i] = (0.0722f * px[4 * i] + 0.7152f * px[4 * i + 1] + 0.2126f * px[4 * i + 2]) / 255.0f;  // BGRA
+        pthread_mutex_lock(&luma_mu);
+        free(luma_cells);
+        luma_cells = cells;
+        luma_cw = lw;
+        luma_ch = lh;
+        pthread_mutex_unlock(&luma_mu);
+        atomic_store(&luma_busy, 0);
+    }];
+}
+// A picture of the next finished frame in Documents/Shots/<name>.png, written off the game's threads once the GPU has it, so the game doesn't wait.
+static _Atomic(char *) shot_wanted;
+void rt_request_snapshot(const char *name) { free(atomic_exchange(&shot_wanted, strdup(name))); }
+static void take_snapshot(void) {
+    char *name = atomic_exchange(&shot_wanted, NULL);
+    if (!name) return;
+    id<MTLTexture> src = back_buffer ? back_buffer->tex : nil;
+    if (!src || src.sampleCount > 1 || (src.pixelFormat != MTLPixelFormatBGRA8Unorm && src.pixelFormat != MTLPixelFormatBGRA8Unorm_sRGB)) {
+        free(name);
+        return;
+    }
+    u32 w = (u32)src.width, h = (u32)src.height;
+    id<MTLBuffer> buf = [dev newBufferWithLength:(NSUInteger)w * h * 4 options:MTLResourceStorageModeShared];
+    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toBuffer:buf destinationOffset:0
+        destinationBytesPerRow:w * 4 destinationBytesPerImage:(NSUInteger)w * h * 4];
+    [b endEncoding];
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            char dir[1024], path[1200];
+            snprintf(dir, sizeof dir, "%s/Documents/Shots", getenv("HOME"));
+            mkdir(dir, 0755);
+            snprintf(path, sizeof path, "%s/%s.png", dir, name);
+            write_png((u8 *)buf.contents, w, h, path);
+            [buf release];
+            free(name);
+        });
+    }];
+}
+#endif
 // ARKHAM_PREBUILD_IN_GAME=list: the same as --prebuild-shaders, but from the running game once its window is up, then quits. With Apple's Metal HUD on, Metal files compiled
 // shaders under another key, so the HUD's side of the cache can only be filled from a game whose HUD is showing. tools/prebuild_shaders.sh does this when config.local has it.
 static void m_Present(CPU *c) {
@@ -2895,6 +2998,12 @@ static void m_Present(CPU *c) {
         snprintf(path, sizeof path, "%s/m%06llu.png", snap, frame_no);
         save_png(back_buffer->tex, path);
     }
+#if TARGET_OS_IPHONE
+    if (back_buffer) {
+        sample_luma();
+        take_snapshot();
+    }
+#endif
     {
         static double map_at = -1;
         static u64 map_start;

@@ -41,8 +41,8 @@ static void settings(void) {
         v = [v stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"\"' "]];
         setenv(k.UTF8String, v.UTF8String, 1);
     }
-    const char *hud = getenv("ARKHAM_METAL_HUD");
-    if (hud && *hud == '1') setenv("MTL_HUD_ENABLED", "1", 1);  // and the layer's own switch, in mtl_device.m
+    // ARKHAM_METAL_HUD is only what the settings' switch starts as (TouchControls.m), which then turns the HUD on the game's layer (mtl_device.m).
+    // Metal's own MTL_HUD_ENABLED would show it whatever the switch said, so it isn't set.
 }
 
 // ---------- the log ----------
@@ -170,11 +170,16 @@ CGRect rt_ios_game_rect(void) {
 // The frame rate, the GPU's time a frame, how many frames reach the screen, and how warm the phone is: iOS tells apps a thermal state, not degrees.
 static UILabel *overlay;
 static int overlay_on = -1;  // the settings' switch (TouchControls.m), or ARKHAM_FPS=1 until they say
+static int overlay_hidden;   // everything hidden for a picture (TouchControls.m)
 void rt_ios_overlay_enable(int on) {
     overlay_on = on;
     if (!on) dispatch_async(dispatch_get_main_queue(), ^{
             overlay.hidden = YES;
         });
+}
+void rt_ios_overlay_hidden(int hidden) {
+    overlay_hidden = hidden;
+    overlay.hidden = hidden || overlay_on <= 0;
 }
 static NSString *thermal_name(NSProcessInfoThermalState s) {
     switch (s) {
@@ -203,7 +208,7 @@ void rt_ios_overlay(double fps, double gpu_ms, double shown_a_second) {
             overlay.textAlignment = NSTextAlignmentCenter;
             [v addSubview:overlay];
         }
-        overlay.hidden = NO;
+        overlay.hidden = overlay_hidden;
         overlay.text = text;
         [overlay sizeToFit];
         UIEdgeInsets safe = overlay.superview.safeAreaInsets;

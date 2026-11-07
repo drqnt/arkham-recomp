@@ -175,3 +175,34 @@ app goes to the background.
 - **Shaders built ahead**: with the entry renamed in the text instead of by `-D`, every compile has the same options and one module cache, 19 MB.
   Before, it was 483 GB in a day. All 32,010 compiled and the 16 libraries (263 MB) are on the phone. The first launch with them took every shader
   from them (`86 of 86 ... built ahead`), and the title menu ran at about 345 FPS.
+
+## Controls v4: the camera for real, buttons that follow the picture, 2026-11-07
+
+- **Why the camera didn't turn:** the engine reads its input settings with `open()`, not `fopen()`, so the v3 rewrite never ran. The default
+  dead zone of 0.2 then swallowed the linear swipes. The rewrite now runs in the `open` shim for any `*Input.ini` (`BaseInput.ini`,
+  `DefaultInput.ini`, `BmInput.ini`, `UserInput.ini`). It hands the engine an unlinked temporary file of the same length, since the engine
+  may take the size from `stat()`. It sets `Speed=10` (with its sign) and `DeadZone=0` on every right-stick axis, rather than multiplying,
+  because the engine writes what it read back into `BmInput.ini`. The camera speed setting moved to a new key (`cameraSpeed`, 1.0) because
+  the old one had been pushed to its maximum while nothing turned.
+- **Play** is now the cursor held and at least 200 draws a frame (with 0.6 s of grace). Films and loading screens hold the cursor but take a
+  few dozen draws, so the pad stays hidden through them and through the start, until play is first seen.
+- **Buttons follow the picture.** Every 6th frame `mtl_device.m` copies the finished frame, makes its mip levels and reads back the 44 x 31 level
+  (`rt_picture_luma`). Each button's ink glides, over about a quarter of a second, to light lines over a dark picture and dark ones over a light
+  picture. Over the black around the picture they're light. Visibility (the "Заметность" setting) now has a floor.
+- **Icons:**
+  - figure.boxing for the strike;
+  - bolt.shield for the counter;
+  - tornado for the cape;
+  - figure.climbing for the grapple;
+  - camera centring for L3;
+  - a drawn batarang for the gadget wheel and for R2 while L2 aims, R2 then lit, since that's where the game throws.
+- **Photo mode:** an eye button (top left; upright, between map and pause) hides every button, the gear and the frame-rate line. The stick and
+  the camera keep working unseen, and a tap brings everything back.
+- **Menu clicks:** the cursor moves first, the button goes down 50 ms later and up at 120 ms. The cursor goes to the corner 1.2 s after the
+  last tap. A click sent together with the move came every other time. For finding where the game draws its cursor, each tap saves two frames
+  to `Documents/Shots` (just after the click, and after parking). The copy is written off the game's threads, so nothing waits on it.
+- **Settings** are a grouped table in a sheet, each control under its name and as wide as the table. The Metal HUD follows its switch only:
+  `MTL_HUD_ENABLED` is no longer set from `arkham.env`.
+- **Not shaders:** the lags at level loads, turns and fights come from pipelines. In the first long session, all 591 shaders came from the
+  prebuilt libraries (0 ms compiling), but 1,280 pipeline states took 4.7 s to create: the driver's final compile for this GPU, on first use. They
+  came in bursts of 30 to 100, as frames of 100 to 380 ms.

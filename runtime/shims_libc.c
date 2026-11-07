@@ -663,10 +663,12 @@ static int trace_fs_early(void) { return getenv("ARKHAM_TRACE_FS") != NULL; }
 //   on a new machine writes it on. ARKHAM_FPS_CAP is the runtime's own limit.
 extern int rt_no_frame_limit;
 #if TARGET_OS_IPHONE
-// BmInput.ini on the phone: everything the right stick feeds (aTurn and aLookup, which turn the camera, and the game's own raw aRawRHJoyRight and
-// aRawRHJoyUp, which it may turn it with instead) made RIGHT_STICK_SPEED times faster and without the game's dead zone, so that swipes, which reach the
-// game as that stick (ios/app/TouchControls.m), can turn the camera as far as a thumb moves. A real controller's right stick is given back its dead
-// zone and scaled down as much in shims_hid.m, so it turns as it always did.
+// The input settings on the phone (BaseInput.ini, DefaultInput.ini, BmInput.ini, UserInput.ini), as the engine reads them with open(): everything the
+// right stick feeds (aTurn and aLookup, which turn the camera, and the game's own raw aRawRHJoyRight and aRawRHJoyUp) at Speed=10 instead of 1 and
+// without the game's dead zone, so that swipes, which reach the game as that stick (ios/app/TouchControls.m), can turn the camera as far as a thumb
+// moves. A real controller's right stick is given back its dead zone and a tenth of its push in shims_hid.m, so it turns as it always did.
+// The text keeps its length, since the engine may take the size from stat(), and the speed is set, not multiplied, since the engine writes what it
+// read back into BmInput.ini, which is then read again at the next start.
 #define RIGHT_STICK_SPEED 10.0
 static const char *right_stick_axis(const char *q, const char *end) {
     static const char *const names[] = {"Axis aTurn ", "Axis aLookup ", "Axis aRawRHJoyRight ", "Axis aRawRHJoyUp "};
@@ -676,71 +678,84 @@ static const char *right_stick_axis(const char *q, const char *end) {
     }
     return NULL;
 }
-static char *right_stick_line(const char *line, size_t len) {
-    if (!memmem(line, len, "XboxTypeS_RightX", 16) && !memmem(line, len, "XboxTypeS_RightY", 16)) return NULL;
-    char *out = malloc(len * 2 + 64), *o = out;
-    const char *p = line, *end = line + len;
-    while (p < end) {
-        const char *axis = NULL;
-        for (const char *q = p; q + 11 < end && !axis; q++) axis = right_stick_axis(q, end);
-        if (!axis) {
-            memcpy(o, p, (size_t)(end - p));
-            o += end - p;
-            break;
+// A value after "name=" in one command, overwritten in place, padded with spaces; 0 if it doesn't fit.
+static int set_field(char *cmd, char *cmd_end, const char *name, const char *value) {
+    size_t nl = strlen(name), vl = strlen(value);
+    char *at = memmem(cmd, (size_t)(cmd_end - cmd), name, nl);
+    if (!at) return 0;
+    char *v = at + nl, *ve = v;
+    while (ve < cmd_end && *ve != ' ' && *ve != '|' && *ve != '"' && *ve != ')') ve++;
+    if ((size_t)(ve - v) < vl) return 0;
+    memset(v, ' ', (size_t)(ve - v));
+    memcpy(v, value, vl);
+    return 1;
+}
+static int right_stick_rewrite(char *text, size_t len) {
+    int changed = 0;
+    char *end_all = text + len;
+    for (char *line = text; line < end_all;) {
+        char *nl = memchr(line, '\n', (size_t)(end_all - line));
+        char *line_end = nl ? nl : end_all;
+        if (memmem(line, (size_t)(line_end - line), "XboxTypeS_RightX", 16) || memmem(line, (size_t)(line_end - line), "XboxTypeS_RightY", 16)) {
+            for (char *q = line; q < line_end; q++) {
+                if (!right_stick_axis(q, line_end)) continue;
+                char *cmd_end = q;
+                while (cmd_end < line_end && *cmd_end != '|' && *cmd_end != '"') cmd_end++;
+                char *sp = memmem(q, (size_t)(cmd_end - q), "Speed=", 6);
+                int neg = sp && sp[6] == '-';
+                changed += set_field(q, cmd_end, "Speed=", neg ? "-10" : "10");
+                set_field(q, cmd_end, "DeadZone=", "0");
+                q = cmd_end;
+            }
         }
-        memcpy(o, p, (size_t)(axis - p));
-        o += axis - p;
-        const char *name_end = strchr(axis + 5, ' ');
-        double speed = 1.0;
-        const char *sp = strstr(axis, "Speed="), *bar = strchr(axis, '|');
-        if (sp && (!bar || sp < bar)) speed = atof(sp + 6);
-        o += sprintf(o, "%.*s Speed=%.2f DeadZone=0.0", (int)(name_end - axis), axis, speed * RIGHT_STICK_SPEED);
-        // the rest of this axis's settings, up to the next command
-        const char *next = bar ? bar : end;
-        const char *close = memchr(axis, '"', (size_t)(end - axis));
-        if (close && close < next) next = close;
-        p = next;
+        line = line_end + 1;
     }
-    *o = 0;
-    return out;
+    return changed;
+}
+// The rewritten text in a file of its own, already unlinked, for open() to hand the engine; -1 for any other file, or one with nothing to change.
+static int input_ini_file(const char *path) {
+    static const char tail[] = "Input.ini";
+    size_t n = strlen(path), t = sizeof tail - 1;
+    if (n < t || strcmp(path + n - t, tail)) return -1;
+    int in = open(path, O_RDONLY);
+    if (in < 0) return -1;
+    struct stat st;
+    if (fstat(in, &st) || st.st_size <= 0 || st.st_size > (16 << 20)) {
+        close(in);
+        return -1;
+    }
+    size_t size = (size_t)st.st_size, got = 0;
+    char *text = malloc(size);
+    while (got < size) {
+        ssize_t r = read(in, text + got, size - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(in);
+    int changed = got == size ? right_stick_rewrite(text, size) : 0;
+    int fd = -1;
+    if (changed) {
+        const char *dir = getenv("TMPDIR");
+        char tmp[1100];
+        snprintf(tmp, sizeof tmp, "%s/arkham-input-XXXXXX", dir && *dir ? dir : "/tmp");
+        fd = mkstemp(tmp);
+        if (fd >= 0) {
+            unlink(tmp);
+            if (write(fd, text, size) != (ssize_t)size || lseek(fd, 0, SEEK_SET) < 0) {
+                close(fd);
+                fd = -1;
+            }
+        }
+        static int told;
+        if (fd >= 0 && told++ < 8)
+            fprintf(stderr, "[input] the engine reads %s with %d right-stick axes at Speed=%g and no dead zone\n", strrchr(path, '/') ? strrchr(path, '/') + 1 : path,
+                    changed, RIGHT_STICK_SPEED);
+    }
+    free(text);
+    return fd;
 }
 #endif
 static FILE *language_ini(const char *path, const char *mode) {
-#if TARGET_OS_IPHONE
-    static const char input_tail[] = "/BmInput.ini";
-    size_t pn = strlen(path), it = sizeof input_tail - 1;
-    if (mode[0] == 'r' && pn >= it && !strcmp(path + pn - it, input_tail)) {
-        FILE *in = fopen(path, "rb");
-        if (!in) return NULL;
-        fseek(in, 0, SEEK_END);
-        long size = ftell(in);
-        fseek(in, 0, SEEK_SET);
-        char *text = malloc((size_t)size + 1), *out = malloc((size_t)size * 2 + 1024);
-        size_t got = fread(text, 1, (size_t)size, in), o = 0;
-        fclose(in);
-        text[got] = 0;
-        int changed = 0;
-        for (char *line = text; *line;) {
-            char *end = strchr(line, '\n');
-            size_t len = end ? (size_t)(end - line + 1) : strlen(line);
-            char *fixed = right_stick_line(line, len);
-            if (fixed) {
-                size_t fl = strlen(fixed);
-                memcpy(out + o, fixed, fl);
-                o += fl;
-                free(fixed);
-                changed++;
-            } else {
-                memcpy(out + o, line, len);
-                o += len;
-            }
-            line += len;
-        }
-        free(text);
-        fprintf(stderr, "[input] the engine reads BmInput.ini with %d right stick lines %gx faster and without a dead zone\n", changed, RIGHT_STICK_SPEED);
-        return fmemopen(out, o, "r");
-    }
-#endif
     static const char *const codes[][2] = {{"en", "int"}, {"fr", "fra"}, {"de", "deu"}, {"it", "ita"}, {"es", "esn"}, {"pl", "pol"}, {"ru", "rus"}};
     static const char tail[] = "/BmEngine.ini";
     const char *lang = getenv("ARKHAM_LANGUAGE"), *ue = NULL;
@@ -839,6 +854,9 @@ static int language_file(const char *path) {
 SHIM(open) {
     int fd = language_file(GS(ARG(0)));
     CIBUF(0);
+#if TARGET_OS_IPHONE
+    if (fd < 0 && ((int)ARG(1) & O_ACCMODE) == O_RDONLY) fd = input_ini_file(CIP(0));
+#endif
     if (fd < 0) fd = open(CIP(0), (int)ARG(1), (int)ARG(2));
     if (fd < 0) set_errno();
     TFS("open", GS(ARG(0)), fd);

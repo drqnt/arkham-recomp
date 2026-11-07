@@ -22,22 +22,27 @@
 #import <GameController/GameController.h>
 #import <QuartzCore/QuartzCore.h>
 #import <UIKit/UIKit.h>
+#import <objc/message.h>
 
 void rt_touch_pad(float lx, float ly, float rx, float ry, float lt, float rt, unsigned buttons);
 void rt_touch_pad_on(int on);
 void rt_touch_pad_playstation(int ps);
 int rt_controller_connected(void);
 int rt_game_holds_cursor(void);
-unsigned rt_frames_presented(void);
+unsigned rt_frames_presented(void), rt_last_frame_draws(void);
+void rt_want_picture_luma(int on);
+double rt_picture_luma(double x0, double y0, double x1, double y1);  // mtl_device.m: how light a part of the picture is, 0 to 1
+void rt_request_snapshot(const char *name);                          // mtl_device.m: the next frame into Documents/Shots
 void rt_ios_click(double share_x, double share_y);
 void rt_ios_park_cursor(void);
 void rt_set_fps_cap(double n);
 void rt_set_metal_hud(int on);
 void rt_ios_overlay_enable(int on);  // main.m: the frame rate line
+void rt_ios_overlay_hidden(int hidden);
 CGRect rt_ios_game_rect(void);       // main.m: where the game's picture is
 
 // The runtime's numbers for the controls (the enum in shims_hid.m), and the wheel's own.
-enum { C_LT = 4, C_RT = 5, B_SOUTH = 7, B_EAST, B_WEST, B_NORTH, B_LB, B_RB, B_START, B_BACK, B_L3, B_R3, B_HOME, D_UP, D_DOWN, D_LEFT, D_RIGHT, C_WHEEL = 100 };
+enum { C_LT = 4, C_RT = 5, B_SOUTH = 7, B_EAST, B_WEST, B_NORTH, B_LB, B_RB, B_START, B_BACK, B_L3, B_R3, B_HOME, D_UP, D_DOWN, D_LEFT, D_RIGHT, C_WHEEL = 100, C_PHOTO };
 enum { STYLE_PS, STYLE_XBOX, STYLE_ICONS };
 enum { SH_NONE, SH_CROSS, SH_CIRCLE, SH_SQUARE, SH_TRIANGLE };
 enum { SIDE_UP, SIDE_RIGHT, SIDE_DOWN, SIDE_LEFT };
@@ -81,23 +86,25 @@ typedef struct {
 #define TR 1, 0
 #define TC 0.5f, 0
 static const Def defs[] = {
-    // Under the right thumb: the arc of four, then grapple and crouch further along it. Upright, the four are a diamond and the shoulders on top.
-    {"cross", B_SOUTH, {BR, -86, -66, 34}, {BR, -174, -77, 44}, "", "A", "figure.run", "Бег, действие, планирование, уклонение", SH_CROSS, 0x7FB2E5, 0x6DB33F},
-    {"square", B_WEST, {BR, -184, -60, 36}, {BR, -273, -175, 44}, "", "X", "hand.raised.fill", "Удар, тихое добивание", SH_SQUARE, 0xE48AD6, 0x3C8FE0},
-    {"triangle", B_NORTH, {BR, -140, -154, 34}, {BR, -174, -274, 42}, "", "Y", "shield.fill", "Захват, контратака", SH_TRIANGLE, 0x5CC49A, 0xF5C518},
-    {"circle", B_EAST, {BR, -50, -164, 30}, {BR, -76, -175, 42}, "", "B", "wind", "Плащ, отмена, пропуск сцены", SH_CIRCLE, 0xE86A6A, 0xE03A3E},
-    {"r1", B_RB, {BR, -86, -258, 27}, {TR, -76, 55, 33}, "R1", "RB", "arrow.up.right", "Крюк", SH_NONE, 0xFFFFFF, 0xFFFFFF},
-    {"r2", C_RT, {BR, -236, -158, 28}, {TR, -185, 55, 33}, "R2", "RT", "arrow.down.to.line", "Присесть, гаджет, бросок", SH_NONE, 0xFFFFFF, 0xFFFFFF},
-    {"r3", B_R3, {BR, -200, -250, 21}, {BR, -49, -49, 26}, "R3", "RS", "plus.magnifyingglass", "Зум камеры", SH_NONE, 0xFFFFFF, 0xFFFFFF},
+    // Under the right thumb: the arc of four, then grapple and crouch further along it. Upright, the four are a diamond in the corner, with room above
+    // and beside it for the camera's swipes, and the shoulders on top. The icons are what each does in the game (DefaultInput.ini's bindings).
+    {"cross", B_SOUTH, {BR, -86, -66, 34}, {BR, -160, -80, 40}, "", "A", "figure.run", "Бег, действие, планирование, уклонение", SH_CROSS, 0x7FB2E5, 0x6DB33F},
+    {"square", B_WEST, {BR, -184, -60, 36}, {BR, -245, -165, 40}, "", "X", "figure.boxing", "Удар, тихое добивание", SH_SQUARE, 0xE48AD6, 0x3C8FE0},
+    {"triangle", B_NORTH, {BR, -140, -154, 34}, {BR, -160, -250, 38}, "", "Y", "bolt.shield.fill", "Контратака, захват", SH_TRIANGLE, 0x5CC49A, 0xF5C518},
+    {"circle", B_EAST, {BR, -50, -164, 30}, {BR, -75, -165, 38}, "", "B", "tornado", "Плащ, отмена, пропуск сцены", SH_CIRCLE, 0xE86A6A, 0xE03A3E},
+    {"r1", B_RB, {BR, -86, -258, 27}, {TR, -76, 55, 33}, "R1", "RB", "figure.climbing", "Крюк", SH_NONE, 0xFFFFFF, 0xFFFFFF},
+    {"r2", C_RT, {BR, -236, -158, 28}, {TR, -185, 55, 33}, "R2", "RT", "arrow.down.to.line", "Присесть; с прицелом — бросок", SH_NONE, 0xFFFFFF, 0xFFFFFF},
+    {"r3", B_R3, {BR, -200, -250, 21}, {BR, -45, -45, 26}, "R3", "RS", "plus.magnifyingglass", "Зум камеры", SH_NONE, 0xFFFFFF, 0xFFFFFF},
     // Above the left thumb's stick.
     {"l1", B_LB, {BL, 68, -262, 28}, {TL, 76, 55, 33}, "L1", "LB", "eye.fill", "Режим детектива", SH_NONE, 0xFFFFFF, 0xFFFFFF},
     {"l2", C_LT, {BL, 166, -276, 28}, {TL, 185, 55, 33}, "L2", "LT", "scope", "Прицел гаджета", SH_NONE, 0xFFFFFF, 0xFFFFFF},
-    {"l3", B_L3, {BL, 60, -350, 20}, {TL, 60, 153, 26}, "L3", "LS", "dot.viewfinder", "Камера за спину", SH_NONE, 0xFFFFFF, 0xFFFFFF},
-    // The gadgets: one button for the pad's cross, a wheel of its four sides.
-    {"gadgets", C_WHEEL, {TL, 124, 144, 30}, {BC, 0, -77, 37}, "", "", "dpad.fill", "Гаджеты: зажмите и ведите в сторону", SH_NONE, 0xFFFFFF, 0xFFFFFF},
-    // The top.
-    {"map", B_BACK, {TC, -64, 28, 20}, {TC, -44, 55, 24}, "", "", "map.fill", "Карта", SH_NONE, 0xFFFFFF, 0xFFFFFF},
-    {"pause", B_START, {TC, 64, 28, 20}, {TC, 44, 55, 24}, "", "", "pause.fill", "Пауза", SH_NONE, 0xFFFFFF, 0xFFFFFF},
+    {"l3", B_L3, {BL, 60, -350, 20}, {TL, 60, 153, 26}, "L3", "LS", "camera.metering.center.weighted", "Камера за спину", SH_NONE, 0xFFFFFF, 0xFFFFFF},
+    // The gadgets: one button for the pad's cross, a wheel of its four sides. Drawn as a batarang.
+    {"gadgets", C_WHEEL, {TL, 124, 144, 30}, {BC, 0, -77, 37}, "", "", "batarang", "Гаджеты: зажмите и ведите в сторону", SH_NONE, 0xFFFFFF, 0xFFFFFF},
+    // The top: the map and the pause, and, at the top left, hiding all of them for a picture.
+    {"map", B_BACK, {TC, -64, 28, 20}, {TC, -70, 55, 24}, "", "", "map.fill", "Карта", SH_NONE, 0xFFFFFF, 0xFFFFFF},
+    {"pause", B_START, {TC, 64, 28, 20}, {TC, 70, 55, 24}, "", "", "pause.fill", "Пауза", SH_NONE, 0xFFFFFF, 0xFFFFFF},
+    {"photo", C_PHOTO, {TL, 30, 26, 19}, {TC, 0, 55, 22}, "", "", "eye.slash.fill", "Скрыть все кнопки (для скриншотов); вернуть — касание экрана", SH_NONE, 0xFFFFFF, 0xFFFFFF},
 };
 #define N_DEFS (sizeof defs / sizeof defs[0])
 // Outside play the only one: backs out of menus, closes the map, skips a cutscene. It stays at the top left, as the gear does at the right.
@@ -147,6 +154,35 @@ static UIBezierPath *ps_shape(int shape, CGPoint c, CGFloat s) {
     }
     return p;
 }
+// The bat: a batarang for the gadgets, and on R2 while aiming, where the game throws one. Wings with three scallops below each, ears, a pointed tail;
+// s is half its width.
+static UIBezierPath *bat_shape(CGPoint c, CGFloat s) {
+    static const CGFloat right[][2] = {{0.06, -0.14}, {0.10, -0.40}, {0.15, -0.12}, {0.32, -0.12}};
+    UIBezierPath *p = [UIBezierPath bezierPath];
+    CGPoint (^at)(CGFloat, CGFloat) = ^CGPoint(CGFloat x, CGFloat y) { return CGPointMake(c.x + x * s, c.y + y * s); };
+    for (int side = 1; side >= -1; side -= 2) {
+        if (side == 1) [p moveToPoint:at(0, -0.14)];
+        if (side == 1) {
+            for (int i = 0; i < 4; i++) [p addLineToPoint:at(right[i][0], right[i][1])];
+            [p addQuadCurveToPoint:at(1.0, -0.36) controlPoint:at(0.62, -0.16)];
+            [p addLineToPoint:at(0.86, 0.04)];
+            [p addQuadCurveToPoint:at(0.66, 0.02) controlPoint:at(0.74, -0.08)];
+            [p addQuadCurveToPoint:at(0.46, 0.18) controlPoint:at(0.52, 0.02)];
+            [p addQuadCurveToPoint:at(0.22, 0.24) controlPoint:at(0.30, 0.10)];
+            [p addLineToPoint:at(0, 0.44)];
+        } else {
+            [p addLineToPoint:at(-0.22, 0.24)];
+            [p addQuadCurveToPoint:at(-0.46, 0.18) controlPoint:at(-0.30, 0.10)];
+            [p addQuadCurveToPoint:at(-0.66, 0.02) controlPoint:at(-0.52, 0.02)];
+            [p addQuadCurveToPoint:at(-0.86, 0.04) controlPoint:at(-0.74, -0.08)];
+            [p addLineToPoint:at(-1.0, -0.36)];
+            [p addQuadCurveToPoint:at(-0.32, -0.12) controlPoint:at(-0.62, -0.16)];
+            for (int i = 3; i >= 0; i--) [p addLineToPoint:at(-right[i][0], right[i][1])];
+        }
+    }
+    [p closePath];
+    return p;
+}
 static UIImage *symbol(NSString *name, CGFloat size, UIColor *color) {
     UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:size weight:UIImageSymbolWeightSemibold];
     UIImage *img = [UIImage systemImageNamed:name withConfiguration:cfg];
@@ -178,7 +214,12 @@ static float in_steps(float v, float *carry) {
 @property(nonatomic) int holders;
 @property(nonatomic) BOOL shown;           // drawn and taking touches now
 @property(nonatomic) BOOL hiddenByPlayer;  // hidden in the layout editor
+@property(nonatomic, strong) CALayer *icon_mask;  // the icon's shape; the icon layer's own colour shows through it
+@property(nonatomic) int kind;                    // what's drawn: one of the KIND_ below
+@property(nonatomic) int tint;                    // the colour of a PlayStation symbol or an Xbox letter, or 0 for the button's ink
+@property(nonatomic) float ink, ink_shown;        // 0 light on a dark picture, 1 dark on a light one, and what it was last drawn with
 @end
+enum { KIND_PS_SHAPE, KIND_TEXT, KIND_ICON, KIND_BAT };
 @implementation PadButton
 @end
 
@@ -204,9 +245,12 @@ static void open_settings(void);
     BOOL running;  // the stick pushed past its edge
     BOOL panning;  // the touch outside play has moved far enough to be a drag
     BOOL in_menu;  // outside play
-    CFTimeInterval last_frame, last_held;
-    unsigned held_frame;
+    BOOL seen_play, photo;
+    CFTimeInterval last_frame, last_play, heavy_until;
+    unsigned play_frame;
     CGSize laid_out;
+    UILabel *photo_hint;
+    float stick_ink;
     unsigned pulse_bits;  // the wheel's choice, held for a moment
     CFTimeInterval pulse_until;
     CAShapeLayer *stick_base, *stick_knob;
@@ -239,11 +283,13 @@ static void open_settings(void);
     b.text = [CATextLayer layer];
     b.badge_text = [CATextLayer layer];
     b.icon = [CALayer layer];
+    b.icon_mask = [CALayer layer];
+    b.icon_mask.contentsGravity = kCAGravityResizeAspect;
+    b.icon.mask = b.icon_mask;
     for (CATextLayer *t in @[b.text, b.badge_text]) {
         t.alignmentMode = kCAAlignmentCenter;
         t.contentsScale = UIScreen.mainScreen.scale;
     }
-    b.icon.contentsGravity = kCAGravityResizeAspect;
     for (CALayer *l in @[b.back, b.symbol, b.text, b.icon, b.badge, b.badge_text]) [b.group addSublayer:l];
     [self.layer addSublayer:b.group];
     return b;
@@ -290,11 +336,23 @@ static void open_settings(void);
         [self.layer addSublayer:wheel_icons[i]];
     }
     wheel_side = -1;
+    in_menu = YES;  // until play is seen: the films and loading at the start are outside it
+    photo_hint = [UILabel new];
+    photo_hint.text = @"  Коснитесь экрана, чтобы вернуть кнопки  ";
+    photo_hint.textColor = UIColor.whiteColor;
+    photo_hint.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    photo_hint.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+    photo_hint.layer.cornerRadius = 10;
+    photo_hint.clipsToBounds = YES;
+    photo_hint.alpha = 0;
+    [photo_hint sizeToFit];
+    photo_hint.frame = CGRectInset(photo_hint.frame, 0, -8);
+    [self addSubview:photo_hint];
     link = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     if (@available(iOS 15.0, *)) link.preferredFrameRateRange = CAFrameRateRangeMake(60, 120, 120);
     [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    fprintf(stderr, "[touch] camera speed %.2f (a swipe of %.0f points a second is the stick's full push)\n", setting(@"lookSpeed2", "ARKHAM_TOUCH_LOOK", 1.0),
-            3000.0 / setting(@"lookSpeed2", "ARKHAM_TOUCH_LOOK", 1.0));
+    fprintf(stderr, "[touch] camera speed %.2f (a swipe of %.0f points a second is the stick's full push)\n", setting(@"cameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0),
+            3000.0 / setting(@"cameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0));
     return self;
 }
 
@@ -414,45 +472,57 @@ static void open_settings(void);
 }
 
 // ---------- drawing ----------
-// Draws every button for the style chosen; only the back button outside play, and every one, hidden ones faintly, while the layout is edited.
-- (void)drawButton:(PadButton *)b style:(int)style alpha:(CGFloat)alpha {
+// Each button is drawn in two steps: its shape and what's on it (drawButton), and its colours (colorButton), which follow how light the game's
+// picture is under it: light lines on a dark picture, dark ones on a light picture, each button on its own and gliding from one to the other.
+// Over the black around the picture (upright, below it) they're light.
+- (void)drawButton:(PadButton *)b style:(int)style {
     const Def *d = b.def;
     CGPoint c = b.center;
     CGFloat r = b.radius;
-    BOOL down = b.holders > 0;
     b.back.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.x - r, c.y - r, r * 2, r * 2)].CGPath;
-    b.back.fillColor = [UIColor colorWithWhite:down ? 0.35 : 0 alpha:(down ? 0.6 : 0.32) * (alpha / 0.6)].CGColor;
-    b.back.strokeColor = (self.editing && b.hiddenByPlayer ? rgb(0xE86A6A, 0.9) : [UIColor colorWithWhite:1 alpha:(self.editing ? 0.9 : 0.5) * alpha]).CGColor;
-    b.back.lineWidth = self.editing && b == selected ? 3 : 1.5;
+    b.back.lineWidth = self.editing && b == selected ? 3 : MAX(1.5, r * 0.05);
     b.back.lineDashPattern = self.editing ? @[@6, @4] : nil;
     b.symbol.hidden = b.text.hidden = b.icon.hidden = b.badge.hidden = b.badge_text.hidden = YES;
-    BOOL letters = style != STYLE_ICONS && (d->shape != SH_NONE || *(style == STYLE_XBOX ? d->xbox : d->ps));
-    if (letters && style == STYLE_PS && d->shape != SH_NONE) {
-        // The PlayStation symbol, drawn.
+    b.tint = 0;
+    BOOL aiming = NO;
+    for (PadButton *o in buttons)
+        if (o.def->control == C_LT && o.holders > 0) aiming = YES;
+    BOOL bat = !strcmp(d->icon, "batarang") || (d->control == C_RT && aiming);
+    BOOL letters = !bat && style != STYLE_ICONS && (d->shape != SH_NONE || *(style == STYLE_XBOX ? d->xbox : d->ps));
+    if (bat) {
+        // The batarang: the gadgets, and R2 while L2 aims, since that's where the game throws one.
+        b.kind = KIND_BAT;
+        b.symbol.hidden = NO;
+        b.symbol.path = bat_shape(CGPointMake(c.x, c.y + r * 0.04), r * 0.66).CGPath;
+        b.symbol.lineWidth = 0;
+    } else if (letters && style == STYLE_PS && d->shape != SH_NONE) {
+        // The PlayStation symbol, drawn in its colour.
+        b.kind = KIND_PS_SHAPE;
+        b.tint = d->ps_color;
         b.symbol.hidden = NO;
         b.symbol.path = ps_shape(d->shape, c, r * 0.42).CGPath;
-        b.symbol.fillColor = UIColor.clearColor.CGColor;
-        b.symbol.strokeColor = rgb(d->ps_color, down ? 1 : alpha + 0.25).CGColor;
         b.symbol.lineWidth = MAX(2.5, r * 0.11);
     } else if (letters) {
         const char *label = style == STYLE_XBOX ? d->xbox : d->ps;
-        int color = style == STYLE_XBOX ? d->xbox_color : d->ps_color;
+        b.kind = KIND_TEXT;
+        b.tint = style == STYLE_XBOX && d->xbox_color != 0xFFFFFF ? d->xbox_color : 0;
         CGFloat font = strlen(label) > 1 ? r * 0.62 : r * 0.9;
         b.text.hidden = NO;
         b.text.string = @(label);
         b.text.fontSize = font;
         b.text.font = (__bridge CFTypeRef)[UIFont systemFontOfSize:font weight:UIFontWeightBold];
-        b.text.foregroundColor = rgb(color, down ? 1 : alpha + 0.3).CGColor;
         b.text.frame = CGRectMake(c.x - r, c.y - font * 0.62, r * 2, font * 1.3);
     } else {
-        // An icon of what the button does, with the PlayStation symbol or name it is in a corner, to match the game's prompts.
+        // An icon of what the button does, with the PlayStation symbol or name it is in a corner, to match the game's prompts. The icon's shape is
+        // a mask over a layer of the button's colour, so that changing that colour is cheap.
+        b.kind = KIND_ICON;
         UIImage *img = symbol(@(d->icon), r * 0.85, UIColor.whiteColor);
         if (img) {
             b.icon.hidden = NO;
-            b.icon.contents = (__bridge id)img.CGImage;
-            b.icon.opacity = down ? 1 : MIN(1, alpha + 0.3);
             CGFloat w = r * 1.15;
             b.icon.frame = CGRectMake(c.x - w / 2, c.y - w / 2, w, w);
+            b.icon_mask.frame = b.icon.bounds;
+            b.icon_mask.contents = (__bridge id)img.CGImage;
         }
         if (style == STYLE_ICONS && (d->shape != SH_NONE || *d->ps)) {
             CGPoint bc = CGPointMake(c.x + r * 0.72, c.y + r * 0.72);
@@ -478,15 +548,41 @@ static void open_settings(void);
         }
     }
 }
+// A grey from white (ink 0) to black (ink 1).
+static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithWhite:1 - ink alpha:alpha]; }
+- (void)colorButton:(PadButton *)b {
+    CGFloat o = b == close_button ? MAX(0.7, setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.6)) : setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.6);
+    BOOL down = b.holders > 0;
+    float ink = b.ink;
+    BOOL lit = b.def->control == C_RT && b.kind == KIND_BAT;  // R2 while aiming: lit up, to show where to throw
+    UIColor *fg = ink_color(ink, down ? 1 : 0.62 + 0.38 * o);
+    b.back.fillColor = (down ? ink_color(ink, 0.55) : ink_color(1 - ink, 0.16 + 0.34 * o)).CGColor;
+    b.back.strokeColor = (self.editing && b.hiddenByPlayer ? rgb(0xE86A6A, 0.95)
+                          : lit                          ? rgb(0x7FB2E5, 1)
+                                                         : ink_color(ink, self.editing ? 0.9 : 0.38 + 0.5 * o)).CGColor;
+    if (lit) b.back.lineWidth = MAX(3, b.radius * 0.09);
+    switch (b.kind) {
+        case KIND_PS_SHAPE:
+            b.symbol.fillColor = UIColor.clearColor.CGColor;
+            b.symbol.strokeColor = rgb(b.tint, down ? 1 : 0.7 + 0.3 * o).CGColor;
+            break;
+        case KIND_TEXT: b.text.foregroundColor = (b.tint ? rgb(b.tint, down ? 1 : 0.7 + 0.3 * o) : fg).CGColor; break;
+        case KIND_ICON: b.icon.backgroundColor = fg.CGColor; break;
+        case KIND_BAT:
+            b.symbol.fillColor = (lit ? rgb(0x7FB2E5, 1) : fg).CGColor;
+            b.symbol.strokeColor = UIColor.clearColor.CGColor;
+            break;
+    }
+    b.ink_shown = ink;
+}
 - (void)restyle {
     int style = (int)setting(@"buttonStyle", "ARKHAM_TOUCH_STYLE", STYLE_PS);
-    CGFloat alpha = setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.6);
     rt_touch_pad_playstation(style != STYLE_XBOX);
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     for (PadButton *b in [buttons arrayByAddingObject:close_button]) {
         [self placeButton:b];
-        BOOL show = b == close_button ? in_menu && !self.editing : self.editing || (!in_menu && !b.hiddenByPlayer);
+        BOOL show = b == close_button ? in_menu && !self.editing && !photo : self.editing || (!in_menu && !photo && !b.hiddenByPlayer);
         b.shown = show;
         b.group.hidden = !show;
         if (!show) {
@@ -494,11 +590,49 @@ static void open_settings(void);
             continue;
         }
         b.group.opacity = self.editing && b.hiddenByPlayer ? 0.35 : 1;
-        [self drawButton:b style:style alpha:b == close_button ? MAX(alpha, 0.6) : alpha];
+        [self drawButton:b style:style];
+        [self colorButton:b];
     }
-    stick_base.fillColor = [UIColor colorWithWhite:0 alpha:0.25 * (alpha / 0.6)].CGColor;
-    stick_base.strokeColor = [UIColor colorWithWhite:1 alpha:0.45 * (alpha / 0.6)].CGColor;
+    [self colorStick];
     [CATransaction commit];
+}
+// How light the picture is under a circle of the view: 0 off the picture, where the screen is black.
+- (float)lumaAt:(CGPoint)c radius:(CGFloat)r {
+    CGRect g = rt_ios_game_rect();
+    if (g.size.width < 1 || !CGRectContainsPoint(g, c)) return 0;
+    double l = rt_picture_luma((c.x - r - g.origin.x) / g.size.width, (c.y - r - g.origin.y) / g.size.height, (c.x + r - g.origin.x) / g.size.width,
+                               (c.y + r - g.origin.y) / g.size.height);
+    return l < 0 ? 0 : (float)l;
+}
+static float ink_for(float luma) {
+    float t = (luma - 0.42f) / 0.2f;  // light enough to need dark lines from about the middle grey
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    return t * t * (3 - 2 * t);
+}
+// Each frame: every button's colour a little further towards what the picture under it wants, over about a quarter of a second.
+- (void)followPicture:(CFTimeInterval)dt {
+    float k = (float)MIN(1.0, dt * 4.5);
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    for (PadButton *b in [buttons arrayByAddingObject:close_button]) {
+        if (!b.shown) continue;
+        float want = ink_for([self lumaAt:b.center radius:b.radius]);
+        b.ink += (want - b.ink) * k;
+        if (fabsf(b.ink - b.ink_shown) > 0.015f) [self colorButton:b];
+    }
+    if (!stick_base.hidden) {
+        float want = ink_for([self lumaAt:stick_center radius:[self stickRadius]]);
+        float was = stick_ink;
+        stick_ink += (want - stick_ink) * k;
+        if (fabsf(stick_ink - was) > 0.001f) [self colorStick];
+    }
+    [CATransaction commit];
+}
+- (void)colorStick {
+    CGFloat o = setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.6);
+    stick_base.fillColor = ink_color(1 - stick_ink, 0.14 + 0.3 * o).CGColor;
+    stick_base.strokeColor = ink_color(stick_ink, 0.4 + 0.45 * o).CGColor;
+    stick_knob.fillColor = (running ? rgb(0x7FB2E5, 0.85) : ink_color(stick_ink, 0.45 + 0.4 * o)).CGColor;
 }
 
 - (PadButton *)buttonAt:(CGPoint)p {
@@ -523,7 +657,7 @@ static void open_settings(void);
         int k = b.def->control;
         if (k == C_LT) lt = 1;
         else if (k == C_RT) rt = 1;
-        else if (k != C_WHEEL) bits |= 1u << k;
+        else if (k < C_WHEEL) bits |= 1u << k;
     }
     if (running) bits |= 1u << B_SOUTH;
     if (pulse_bits && CACurrentMediaTime() < pulse_until) bits |= pulse_bits;
@@ -537,8 +671,9 @@ static void open_settings(void);
     CGFloat R = [self stickRadius], kr = R * 0.42;
     stick_base.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.x - R, c.y - R, R * 2, R * 2)].CGPath;
     stick_knob.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(k.x - kr, k.y - kr, kr * 2, kr * 2)].CGPath;
-    stick_knob.fillColor = (running ? rgb(0x7FB2E5, 0.8) : [UIColor colorWithWhite:1 alpha:0.45]).CGColor;
-    stick_base.hidden = stick_knob.hidden = NO;
+    if (stick_base.hidden) stick_ink = ink_for([self lumaAt:c radius:R]);
+    stick_base.hidden = stick_knob.hidden = photo;
+    [self colorStick];
     [CATransaction commit];
 }
 
@@ -606,21 +741,46 @@ static void open_settings(void);
 }
 
 // ---------- each display frame ----------
-// Whether the game is in play: there it warps the cursor back every frame. A game whose frames go on without that is in a menu; one that has stopped
-// both is only busy, and stays in play.
+// Whether the game is in play: there it warps the cursor back every frame, and a frame takes hundreds of draws. Films and loading screens hold the
+// cursor too but take a few dozen; menus let it go. A game whose frames go on without play is outside it; one that has stopped making frames is only
+// busy, and stays where it was. Until play has been seen once, as through the films and loading at the start, it's outside.
 - (void)updatePlay:(CFTimeInterval)now {
     unsigned frames = rt_frames_presented();
-    if (rt_game_holds_cursor() || self.editing || setting(@"hideInMenus", "ARKHAM_TOUCH_HIDE", 1) <= 0) {
-        last_held = now;
-        held_frame = frames;
+    if (rt_last_frame_draws() >= 200) heavy_until = now + 0.6;
+    BOOL play = rt_game_holds_cursor() && now < heavy_until;
+    if (play || self.editing || setting(@"hideInMenus", "ARKHAM_TOUCH_HIDE", 1) <= 0) {
+        seen_play = YES;
+        last_play = now;
+        play_frame = frames;
     }
-    BOOL menu = frames - held_frame >= 20 && now - last_held > 0.3;
+    BOOL menu = !seen_play || (frames - play_frame >= 20 && now - last_play > 0.3);
     if (menu == in_menu) return;
     [self releaseAll];
     in_menu = menu;
-    if (menu) rt_ios_park_cursor();
+    if (menu) {
+        rt_ios_park_cursor();
+        [self setPhoto:NO];
+    }
     [self restyle];
     fprintf(stderr, "[touch] %s\n", menu ? "outside play: the back button only; taps click, drags are the left stick" : "in play: the pad is back");
+}
+// Hiding everything for a picture: the buttons, the gear and the frame rate line. The stick and the camera go on working, unseen; a tap brings them back.
+static UIView *gear_view;
+- (void)setPhoto:(BOOL)on {
+    if (on == photo) return;
+    photo = on;
+    gear_view.hidden = on;
+    rt_ios_overlay_hidden(on);
+    if (on) {
+        stick_base.hidden = stick_knob.hidden = YES;
+        photo_hint.center = CGPointMake(self.bounds.size.width / 2, CGRectGetMaxY(rt_ios_game_rect()) - 40);
+        photo_hint.alpha = 1;
+        [UIView animateWithDuration:0.6 delay:1.6 options:0 animations:^{ self->photo_hint.alpha = 0; } completion:nil];
+    } else {
+        photo_hint.alpha = 0;
+    }
+    [self restyle];
+    fprintf(stderr, "[touch] %s\n", on ? "photo mode: everything hidden" : "photo mode over");
 }
 // The camera: the thumb's speed as the right stick's push, so that it turns as far as the thumb moves. Two display frames are averaged, as touches and
 // frames don't come in step; that keeps the sum over a swipe.
@@ -629,9 +789,11 @@ static void open_settings(void);
     last_frame = now;
     if (dt <= 0 || dt > 0.1) dt = 1.0 / 60;
     [self updatePlay:now];
+    rt_want_picture_luma(!self.hidden && !photo);
+    [self followPicture:dt];
     float nx = 0, ny = 0;
     if (look_touch && !in_menu) {
-        double full = 3000.0 / setting(@"lookSpeed2", "ARKHAM_TOUCH_LOOK", 1.0);  // points a second for the stick's full push
+        double full = 3000.0 / setting(@"cameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0);  // points a second for the stick's full push
         nx = (float)(look_sum.x / dt / full);
         ny = (float)(-look_sum.y / dt / full);
         float m = hypotf(nx, ny);
@@ -676,6 +838,9 @@ static void open_settings(void);
     CGRect g = rt_ios_game_rect();
     if (!CGRectContainsPoint(g, p)) return;
     rt_ios_click((p.x - g.origin.x) / g.size.width, (p.y - g.origin.y) / g.size.height);
+    // For seeing where the game draws its cursor: the frame a moment after the click, and after the cursor has gone to the corner (Documents/Shots).
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ rt_request_snapshot("tap-1-after-click"); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1700 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ rt_request_snapshot("tap-2-cursor-parked"); });
 }
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     for (UITouch *t in touches) {
@@ -695,6 +860,12 @@ static void open_settings(void);
             }
         }
         PadButton *b = [self buttonAt:p];
+        if (b && b.def->control == C_PHOTO) {
+            [tap impactOccurred];
+            [owners setObject:@"photo" forKey:t];
+            [self setPhoto:YES];
+            continue;
+        }
         if (b && b.def->control == C_WHEEL) {
             if (!wheel_touch) {
                 wheel_touch = t;
@@ -805,12 +976,17 @@ static void open_settings(void);
             if (b.holders > 0) b.holders--;
             [self restyle];
         }
-        // A short touch that hardly moved, outside play, is a click there too.
+        // A short touch that hardly moved: outside play, a click there; with everything hidden for a picture, the controls back.
         NSValue *start = [tap_start objectForKey:t];
         NSNumber *when = [tap_time objectForKey:t];
         if (ended && start && when) {
             CGPoint p = [t locationInView:self], s0 = start.CGPointValue;
-            if (t.timestamp - when.doubleValue < 0.35 && hypot(p.x - s0.x, p.y - s0.y) < 14 && (in_menu || !rt_game_holds_cursor())) [self clickAt:p];
+            if (t.timestamp - when.doubleValue < 0.35 && hypot(p.x - s0.x, p.y - s0.y) < 14) {
+                if (photo)
+                    [self setPhoto:NO];
+                else if (in_menu || !rt_game_holds_cursor())
+                    [self clickAt:p];
+            }
         }
         [tap_start removeObjectForKey:t];
         [tap_time removeObjectForKey:t];
@@ -997,100 +1173,126 @@ static void open_settings(void);
 @end
 
 // ---------- the settings ----------
-@interface SettingsView : UIView
+// A grouped table, as iOS's own settings: each control under its name and as wide as the table, so that nothing is squeezed on a narrow screen. It
+// opens over the game as a sheet; what's changed applies at once.
+@interface SettingsController : UITableViewController
 @end
-@implementation SettingsView {
-    UIScrollView *scroll;
-    UIStackView *stack;
+@implementation SettingsController {
+    NSMutableArray<NSString *> *titles, *footers;
+    NSMutableArray<NSMutableArray<UITableViewCell *> *> *rows;
+    NSMutableDictionary<NSValue *, NSString *> *actions;  // rows that do something when tapped
+    UILabel *size_value, *opacity_value, *look_value;
 }
-- (UISegmentedControl *)segments:(NSArray *)items value:(NSInteger)v action:(SEL)a {
-    UISegmentedControl *s = [[UISegmentedControl alloc] initWithItems:items];
-    s.selectedSegmentIndex = v;
-    [s addTarget:self action:a forControlEvents:UIControlEventValueChanged];
-    return s;
+- (UITableViewCell *)cellWith:(NSArray<UIView *> *)views {
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:views];
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 10;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [cell.contentView addSubview:stack];
+    UILayoutGuide *m = cell.contentView.layoutMarginsGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.leadingAnchor constraintEqualToAnchor:m.leadingAnchor], [stack.trailingAnchor constraintEqualToAnchor:m.trailingAnchor],
+        [stack.topAnchor constraintEqualToAnchor:m.topAnchor constant:2], [stack.bottomAnchor constraintEqualToAnchor:m.bottomAnchor constant:-2],
+    ]];
+    return cell;
 }
-- (UISlider *)slider:(float)min max:(float)max value:(float)v action:(SEL)a {
+- (UILabel *)label:(NSString *)text {
+    UILabel *l = [UILabel new];
+    l.text = text;
+    l.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    l.numberOfLines = 0;
+    return l;
+}
+- (void)section:(NSString *)title footer:(NSString *)footer {
+    [titles addObject:title];
+    [footers addObject:footer ?: @""];
+    [rows addObject:[NSMutableArray array]];
+}
+- (void)add:(UITableViewCell *)cell { [rows.lastObject addObject:cell]; }
+- (void)choice:(NSString *)title items:(NSArray *)items value:(NSInteger)v action:(SEL)a {
+    UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:items];
+    seg.selectedSegmentIndex = v;
+    seg.apportionsSegmentWidthsByContent = YES;
+    [seg addTarget:self action:a forControlEvents:UIControlEventValueChanged];
+    [self add:[self cellWith:@[[self label:title], seg]]];
+}
+- (UILabel *)slider:(NSString *)title min:(float)min max:(float)max value:(float)v action:(SEL)a {
+    UILabel *value = [UILabel new];
+    value.font = [UIFont monospacedDigitSystemFontOfSize:17 weight:UIFontWeightRegular];
+    value.textColor = UIColor.secondaryLabelColor;
+    UIStackView *head = [[UIStackView alloc] initWithArrangedSubviews:@[[self label:title], value]];
+    head.distribution = UIStackViewDistributionEqualSpacing;
     UISlider *s = [UISlider new];
     s.minimumValue = min;
     s.maximumValue = max;
     s.value = v;
     [s addTarget:self action:a forControlEvents:UIControlEventValueChanged];
-    return s;
+    [self add:[self cellWith:@[head, s]]];
+    return value;
 }
-- (UISwitch *)toggle:(BOOL)on action:(SEL)a {
-    UISwitch *s = [UISwitch new];
-    s.on = on;
-    [s addTarget:self action:a forControlEvents:UIControlEventValueChanged];
-    return s;
+- (void)toggle:(NSString *)title on:(BOOL)on action:(SEL)a {
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    cell.textLabel.text = title;
+    cell.textLabel.numberOfLines = 0;
+    UISwitch *sw = [UISwitch new];
+    sw.on = on;
+    [sw addTarget:self action:a forControlEvents:UIControlEventValueChanged];
+    cell.accessoryView = sw;
+    [self add:cell];
 }
-- (void)row:(NSString *)title control:(UIView *)c {
-    UILabel *l = [UILabel new];
-    l.text = title;
-    l.textColor = UIColor.whiteColor;
-    l.font = [UIFont systemFontOfSize:15];
-    [l setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[l, c]];
-    row.axis = UILayoutConstraintAxisHorizontal;
-    row.spacing = 16;
-    row.alignment = UIStackViewAlignmentCenter;
-    [stack addArrangedSubview:row];
+- (void)action:(NSString *)title selector:(SEL)a {
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    cell.textLabel.text = title;
+    cell.textLabel.textColor = self.view.tintColor;
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    [self add:cell];
+    actions[[NSValue valueWithNonretainedObject:cell]] = NSStringFromSelector(a);
 }
-- (UIButton *)action:(NSString *)title selector:(SEL)a {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    [b setTitle:title forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
-    [b addTarget:self action:a forControlEvents:UIControlEventTouchUpInside];
-    return b;
-}
-- (instancetype)initWithFrame:(CGRect)frame {
-    if (!(self = [super initWithFrame:frame])) return nil;
-    self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
-    blur.frame = self.bounds;
-    blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [self addSubview:blur];
-    scroll = [UIScrollView new];
-    scroll.translatesAutoresizingMaskIntoConstraints = NO;
-    [self addSubview:scroll];
-    stack = [UIStackView new];
-    stack.axis = UILayoutConstraintAxisVertical;
-    stack.spacing = 14;
-    stack.translatesAutoresizingMaskIntoConstraints = NO;
-    [scroll addSubview:stack];
-    NSLayoutConstraint *wide = [scroll.widthAnchor constraintEqualToConstant:520];
-    wide.priority = UILayoutPriorityDefaultHigh;  // narrower on a narrow screen
-    [NSLayoutConstraint activateConstraints:@[
-        [scroll.topAnchor constraintEqualToAnchor:self.safeAreaLayoutGuide.topAnchor constant:12],
-        [scroll.bottomAnchor constraintEqualToAnchor:self.safeAreaLayoutGuide.bottomAnchor constant:-12],
-        [scroll.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
-        wide,
-        [scroll.widthAnchor constraintLessThanOrEqualToAnchor:self.safeAreaLayoutGuide.widthAnchor constant:-24],
-        [stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor],
-        [stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor],
-        [stack.leadingAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.leadingAnchor],
-        [stack.trailingAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.trailingAnchor],
-    ]];
-    UILabel *title = [UILabel new];
-    title.text = @"Настройки";
-    title.textColor = UIColor.whiteColor;
-    title.font = [UIFont systemFontOfSize:22 weight:UIFontWeightBold];
-    [stack addArrangedSubview:title];
+- (instancetype)init {
+    if (!(self = [super initWithStyle:UITableViewStyleInsetGrouped])) return nil;
+    self.title = @"Настройки";
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(close)];
+    titles = [NSMutableArray array];
+    footers = [NSMutableArray array];
+    rows = [NSMutableArray array];
+    actions = [NSMutableDictionary dictionary];
 
+    [self section:@"Изображение" footer:@"Экран показывает не больше 120 кадров в секунду; ограничение 60 бережёт батарею и греет меньше."];
     double cap = setting(@"fpsCap", "ARKHAM_FPS_CAP", 0);
-    NSInteger capIndex = cap <= 0 ? 3 : cap <= 30 ? 0 : cap <= 60 ? 1 : 2;
-    [self row:@"Ограничение FPS" control:[self segments:@[@"30", @"60", @"120", @"Без"] value:capIndex action:@selector(capChanged:)]];
-    [self row:@"Кнопки" control:[self segments:@[@"PlayStation", @"Xbox", @"Иконки"] value:(NSInteger)setting(@"buttonStyle", "ARKHAM_TOUCH_STYLE", STYLE_PS)
-                                         action:@selector(styleChanged:)]];
-    [self row:@"Размер кнопок" control:[self slider:0.7 max:1.5 value:setting(@"buttonScale", "ARKHAM_TOUCH_SIZE", 1.0) action:@selector(sizeChanged:)]];
-    [self row:@"Прозрачность" control:[self slider:0.2 max:1.0 value:setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.6) action:@selector(opacityChanged:)]];
-    [self row:@"Скорость камеры" control:[self slider:0.25 max:4.0 value:setting(@"lookSpeed2", "ARKHAM_TOUCH_LOOK", 1.0) action:@selector(lookChanged:)]];
-    [self row:@"Бег: стик за край" control:[self toggle:setting(@"autoRun", "ARKHAM_TOUCH_RUN", 1) > 0 action:@selector(runChanged:)]];
-    [self row:@"Прятать кнопки вне игры" control:[self toggle:setting(@"hideInMenus", "ARKHAM_TOUCH_HIDE", 1) > 0 action:@selector(hideChanged:)]];
-    [self row:@"Строка FPS и нагрева" control:[self toggle:setting(@"showFPS", "ARKHAM_FPS", 1) > 0 action:@selector(fpsLineChanged:)]];
-    [self row:@"Metal HUD" control:[self toggle:setting(@"metalHUD", "ARKHAM_METAL_HUD", 0) > 0 action:@selector(hudChanged:)]];
-    [stack addArrangedSubview:[self action:@"Расположение кнопок…" selector:@selector(editLayout)]];
-    [stack addArrangedSubview:[self action:@"Готово" selector:@selector(close)]];
+    [self choice:@"Ограничение FPS" items:@[@"30", @"60", @"120", @"Без ограничения"] value:cap <= 0 ? 3 : cap <= 30 ? 0 : cap <= 60 ? 1 : 2 action:@selector(capChanged:)];
+    [self toggle:@"Строка FPS и нагрева" on:setting(@"showFPS", "ARKHAM_FPS", 1) > 0 action:@selector(fpsLineChanged:)];
+    [self toggle:@"Metal HUD" on:setting(@"metalHUD", "ARKHAM_METAL_HUD", 0) > 0 action:@selector(hudChanged:)];
+
+    [self section:@"Кнопки" footer:@"Кнопки светлеют над тёмной картинкой и темнеют над светлой. Глаз в углу прячет их все для скриншота; вернуть — коснуться экрана."];
+    [self choice:@"Вид" items:@[@"PlayStation", @"Xbox", @"Иконки"] value:(NSInteger)setting(@"buttonStyle", "ARKHAM_TOUCH_STYLE", STYLE_PS) action:@selector(styleChanged:)];
+    size_value = [self slider:@"Размер" min:0.7 max:1.5 value:setting(@"buttonScale", "ARKHAM_TOUCH_SIZE", 1.0) action:@selector(sizeChanged:)];
+    opacity_value = [self slider:@"Заметность" min:0.2 max:1.0 value:setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.6) action:@selector(opacityChanged:)];
+    [self toggle:@"Прятать вне игры" on:setting(@"hideInMenus", "ARKHAM_TOUCH_HIDE", 1) > 0 action:@selector(hideChanged:)];
+    [self action:@"Расположение кнопок" selector:@selector(editLayout)];
+
+    [self section:@"Управление" footer:@"Камера поворачивается на столько, на сколько проведён палец, с любой скоростью."];
+    look_value = [self slider:@"Скорость камеры" min:0.25 max:4.0 value:setting(@"cameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) action:@selector(lookChanged:)];
+    [self toggle:@"Бег: стик за край" on:setting(@"autoRun", "ARKHAM_TOUCH_RUN", 1) > 0 action:@selector(runChanged:)];
+    [self showValues];
     return self;
+}
+- (void)showValues {
+    size_value.text = [NSString stringWithFormat:@"%.0f %%", setting(@"buttonScale", "ARKHAM_TOUCH_SIZE", 1.0) * 100];
+    opacity_value.text = [NSString stringWithFormat:@"%.0f %%", setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.6) * 100];
+    look_value.text = [NSString stringWithFormat:@"%.2f×", setting(@"cameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0)];
+}
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)t { return (NSInteger)rows.count; }
+- (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return (NSInteger)rows[(NSUInteger)s].count; }
+- (UITableViewCell *)tableView:(UITableView *)t cellForRowAtIndexPath:(NSIndexPath *)i { return rows[(NSUInteger)i.section][(NSUInteger)i.row]; }
+- (NSString *)tableView:(UITableView *)t titleForHeaderInSection:(NSInteger)s { return titles[(NSUInteger)s]; }
+- (NSString *)tableView:(UITableView *)t titleForFooterInSection:(NSInteger)s { return footers[(NSUInteger)s]; }
+- (void)tableView:(UITableView *)t didSelectRowAtIndexPath:(NSIndexPath *)i {
+    [t deselectRowAtIndexPath:i animated:YES];
+    NSString *a = actions[[NSValue valueWithNonretainedObject:rows[(NSUInteger)i.section][(NSUInteger)i.row]]];
+    if (a) ((void (*)(id, SEL))objc_msgSend)(self, NSSelectorFromString(a));
 }
 - (void)capChanged:(UISegmentedControl *)s {
     static const double caps[] = {30, 60, 120, 0};
@@ -1103,13 +1305,18 @@ static void open_settings(void);
 }
 - (void)sizeChanged:(UISlider *)s {
     set_setting(@"buttonScale", s.value);
+    [self showValues];
     [controls restyle];
 }
 - (void)opacityChanged:(UISlider *)s {
     set_setting(@"opacity", s.value);
+    [self showValues];
     [controls restyle];
 }
-- (void)lookChanged:(UISlider *)s { set_setting(@"lookSpeed2", s.value); }
+- (void)lookChanged:(UISlider *)s {
+    set_setting(@"cameraSpeed", s.value);
+    [self showValues];
+}
 - (void)runChanged:(UISwitch *)s { set_setting(@"autoRun", s.on); }
 - (void)hideChanged:(UISwitch *)s { set_setting(@"hideInMenus", s.on); }
 - (void)fpsLineChanged:(UISwitch *)s {
@@ -1121,18 +1328,23 @@ static void open_settings(void);
     rt_set_metal_hud(s.on);
 }
 - (void)editLayout {
-    [self close];
-    controls.hidden = NO;
-    [controls startEditing];
+    [self.navigationController dismissViewControllerAnimated:YES completion:^{
+        controls.hidden = NO;
+        [controls startEditing];
+    }];
 }
-- (void)close { [self removeFromSuperview]; }
+- (void)close { [self.navigationController dismissViewControllerAnimated:YES completion:nil]; }
 @end
 
 static UIView *game_view;
 static void open_settings(void) {
     [controls releaseAll];
-    SettingsView *s = [[SettingsView alloc] initWithFrame:game_view.bounds];
-    [game_view addSubview:s];
+    UIViewController *root = game_view.window.rootViewController;
+    if (root.presentedViewController) return;
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[SettingsController new]];
+    nav.modalPresentationStyle = UIModalPresentationFormSheet;
+    nav.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    [root presentViewController:nav animated:YES completion:nil];
 }
 
 // ---------- putting it together ----------
@@ -1184,6 +1396,7 @@ void rt_ios_touch_controls(UIView *over) {
     gear_target = [GearTarget new];
     [gear addTarget:gear_target action:@selector(tapped) forControlEvents:UIControlEventTouchUpInside];
     [over addSubview:gear];
+    gear_view = gear;
     if (!controls) return;
     for (NSNotificationName n in @[GCControllerDidConnectNotification, GCControllerDidDisconnectNotification])
         [NSNotificationCenter.defaultCenter addObserverForName:n object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) { update_visibility(); }];

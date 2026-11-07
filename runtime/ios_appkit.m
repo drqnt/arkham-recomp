@@ -979,8 +979,9 @@ Class rt_ios_class(const char *name) {
 
 // A tap on the phone's screen as a click of the left button there, for the game's menus (ios/app/TouchControls.m). Where it lands is given as a
 // share of the game's picture, from its top left, since the picture needn't fill the screen (upright, or on the outer screen); the window's own
-// points come from that here. The cursor goes there first, the button comes up a little later, as a finger would let go, and then the cursor goes
-// into the bottom right corner, where the game draws it off the screen: a phone has no cursor to show.
+// points come from that here. The cursor goes there first and stays for a few frames, so that the game has the item under it before the button
+// goes down (sent together, a click came every other time); the button comes up as a finger would let go. A while after the last tap the cursor
+// goes into the bottom right corner, where the game draws it off the screen: a phone has no cursor to show.
 void rt_touch_cursor(double x, double y);  // shims_sys.c
 static void move_cursor(NSWindow *w, double x, double y) {
     rt_touch_cursor(x, y);
@@ -993,24 +994,28 @@ void rt_ios_park_cursor(void) {
     NSWindow *w = [[NSApplication sharedApplication] keyWindow];
     if (w) move_cursor(w, w->_frame.size.width - 1, w->_frame.size.height - 1);
 }
+static _Atomic unsigned clicks;
 void rt_ios_click(double share_x, double share_y) {
     NSApplication *app = [NSApplication sharedApplication];
     NSWindow *w = [app keyWindow];
     if (!w) return;
     double x = share_x * w->_frame.size.width, y = share_y * w->_frame.size.height;
+    unsigned mine = atomic_fetch_add(&clicks, 1) + 1;
     move_cursor(w, x, y);
     CGPoint at = CGPointMake(x, w->_frame.size.height - y);
-    NSEvent *down = [NSEvent mouseEventWithType:1 location:at modifierFlags:0 timestamp:CFAbsoluteTimeGetCurrent() windowNumber:1 context:nil eventNumber:1 clickCount:1 pressure:1];
-    down->_window = w;
-    [app postEvent:down atStart:NO];
     NSWindow *kept = [w retain];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        NSEvent *down = [NSEvent mouseEventWithType:1 location:at modifierFlags:0 timestamp:CFAbsoluteTimeGetCurrent() windowNumber:1 context:nil eventNumber:1 clickCount:1 pressure:1];
+        down->_window = kept;
+        [app postEvent:down atStart:NO];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         NSEvent *up = [NSEvent mouseEventWithType:2 location:at modifierFlags:0 timestamp:CFAbsoluteTimeGetCurrent() windowNumber:1 context:nil eventNumber:2 clickCount:1 pressure:0];
         up->_window = kept;
         [app postEvent:up atStart:NO];
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 160 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        move_cursor(kept, kept->_frame.size.width - 1, kept->_frame.size.height - 1);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        if (atomic_load(&clicks) == mine) move_cursor(kept, kept->_frame.size.width - 1, kept->_frame.size.height - 1);
         [kept release];
     });
 }
