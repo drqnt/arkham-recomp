@@ -410,7 +410,35 @@ static CFBundleRef main_bundle(void) {
 #define B(n) ((CFBundleRef)cf_unwrap(ARG(n)))
 SHIM(CFBundleGetMainBundle) { RET(cf_wrap(main_bundle())); }
 SHIM(CFBundleGetBundleWithIdentifier) { RET(cf_wrap(CFBundleGetBundleWithIdentifier(S(0)))); }
+#if TARGET_OS_IPHONE
+// Feral's code finds system functions by name in a framework's bundle (CFBundleGetFunctionPointerForName below, which answers from the runtime's
+// shims whatever the bundle). Frameworks the phone doesn't have would leave it with no bundle, and it would look again at every call, thousands of
+// times a second: so a framework that isn't there is given the app's own bundle.
+SHIM(CFBundleCreate) {
+    CFURLRef url = U(1);
+    CFBundleRef b = CFBundleCreate(NULL, url);
+    if (!b && url) {
+        CFStringRef path = CFURLCopyFileSystemPath(url, kCFURLPOSIXPathStyle);
+        if (path && CFStringHasSuffix(path, CFSTR(".framework"))) {
+            enum { TOLD = 32 };
+            static CFStringRef told[TOLD];
+            int seen = 0, i = 0;
+            for (; i < TOLD && told[i] && !seen; i++) seen = CFEqual(told[i], path);
+            if (!seen && i < TOLD) {
+                told[i] = CFRetain(path);
+                char s[600] = "";
+                CFStringGetCString(path, s, sizeof s, kCFStringEncodingUTF8);
+                fprintf(stderr, "[cf] %s isn't on the phone: its functions come from the runtime\n", s);
+            }
+            b = (CFBundleRef)CFRetain(CFBundleGetMainBundle());
+        }
+        if (path) CFRelease(path);
+    }
+    RET(cf_wrap(b));
+}
+#else
 SHIM(CFBundleCreate) { RET(cf_wrap(CFBundleCreate(NULL, U(1)))); }
+#endif
 SHIM(CFBundleCopyBundleURL) { RET(cf_wrap(CFBundleCopyBundleURL(B(0)))); }
 SHIM(CFBundleCopyResourcesDirectoryURL) { RET(cf_wrap(CFBundleCopyResourcesDirectoryURL(B(0)))); }
 SHIM(CFBundleCopyPrivateFrameworksURL) { RET(cf_wrap(CFBundleCopyPrivateFrameworksURL(B(0)))); }
