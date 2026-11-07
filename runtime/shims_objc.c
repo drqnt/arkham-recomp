@@ -1243,9 +1243,56 @@ static void input_schedule(void) {
     }
     free(copy);
 }
+// Steering by hand once and repeating it. ARKHAM_RECORD=file writes the keys pressed once a level has started, and ARKHAM_REPLAY=file presses them again at the same moments.
+// Times count from the first frame with over 300 draws, because loading takes a different time on each run. A scripted run ignores the real mouse, so keys are all there is.
+static double level_started;
+static FILE *record_file;
+void rt_input_level_started(void) {
+    if (level_started) return;
+    level_started = CFAbsoluteTimeGetCurrent();
+    fprintf(stderr, "[input] level started\n");
+    const char *path = getenv("ARKHAM_REPLAY");
+    FILE *f = path ? fopen(path, "r") : NULL;
+    if (!f) return;
+    double t;
+    char kind[8];
+    int code, n = 0;
+    while (fscanf(f, "%lf %7s %d", &t, kind, &code) == 3) {
+        int key = code, down = !strcmp(kind, "down");
+        CFRunLoopTimerRef timer = CFRunLoopTimerCreateWithHandler(NULL, level_started + t, 0, 0, 0, ^(CFRunLoopTimerRef tt) {
+            (void)tt;
+            script_key_event(key, down ? 10 : 11);
+            fprintf(stderr, "[input] replay key %d %s\n", key, down ? "down" : "up");
+        });
+        CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+        CFRelease(timer);
+        n++;
+    }
+    fclose(f);
+    CFRunLoopWakeUp(CFRunLoopGetMain());
+    fprintf(stderr, "[input] replaying %d key events\n", n);
+}
+static void record_schedule(void) {
+    const char *path = getenv("ARKHAM_RECORD");
+    if (!path) return;
+    record_file = fopen(path, "w");
+    if (!record_file) return;
+    id (^handler)(id) = ^id(id ev) {
+        if (level_started && !((signed char (*)(id, SEL))objc_msgSend)(ev, SELR("isARepeat"))) {
+            unsigned long type = ((unsigned long (*)(id, SEL))objc_msgSend)(ev, SELR("type"));
+            unsigned short code = ((unsigned short (*)(id, SEL))objc_msgSend)(ev, SELR("keyCode"));
+            fprintf(record_file, "%.3f %s %d\n", CFAbsoluteTimeGetCurrent() - level_started, type == 10 ? "down" : "up", code);
+            fflush(record_file);
+        }
+        return ev;
+    };
+    ((id(*)(id, SEL, unsigned long long, id))objc_msgSend)((id)objc_getClass("NSEvent"), SELR("addLocalMonitorForEventsMatchingMask:handler:"), (1ull << 10) | (1ull << 11), (id)(void *)handler);
+    fprintf(stderr, "[input] recording keys to %s\n", path);
+}
 static void snap_schedule(void) {
     auto_play_schedule();
     input_schedule();
+    record_schedule();
     const char *path = getenv("ARKHAM_SNAP");
     if (!path) return;
     const char *after = getenv("ARKHAM_SNAP_AFTER");

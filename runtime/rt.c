@@ -751,8 +751,10 @@ static void *guest_main(void *arg) {
     exit(0);
 }
 
+int rt_mtl_prebuild(const char *list);
 int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IOLBF, 0);
+    if (argc == 3 && !strcmp(argv[1], "--prebuild-shaders")) return rt_mtl_prebuild(argv[2]);
     rt_main_argc = argc;
     rt_main_argv = argv;
     gate_init();

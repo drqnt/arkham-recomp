@@ -37,7 +37,11 @@ Bink cutscenes, and real-time play in the Intensive Treatment lobby at about 200
 turns with mouse motion, Esc opens the pause menu, and memory stays near 1.3 GB over a 5-minute run. FMOD's sound and Bink's
 video sound both start, and saves go through the real Steam Cloud. The Bink library is translated as a second image at `0xE1000000`.
 
-Speed, measured in the first level on an M5 Pro at 2560x1600: about 100 FPS at 1800 draw calls, about 90 at 2000, about 150 at 900, and about 230
+Direct3D 9 on Metal: `ARKHAM_RENDERER=metal tools/run.sh` runs the game without Feral's layer and Apple's OpenGL, and held the display's 120 FPS through the first level at 2560x1600 with
+4x anti-aliasing, where OpenGL gives 71-78. With nothing shown it does 146-198. It no longer waits for the display (`ARKHAM_MTL_VSYNC=1` brings that back), which gives 138-175 FPS in that level while the screen still takes 120 a second.
+So far it has been played by hand for about 10 minutes, past the first level. `tools/prebuild_shaders.sh` should be run once before playing. `docs/METAL_LAYER.md` has how and why.
+
+The rest of this section is about OpenGL, still the default. Speed, measured in the first level on an M5 Pro at 2560x1600: about 100 FPS at 1800 draw calls, about 90 at 2000, about 150 at 900, and about 230
 in the menus. There is no frame limit by default (`ARKHAM_FPS_CAP=120` sets one). It was 48 FPS with one guest thread at a time. In a 2000-draw
 frame of 10.7 ms the engine takes 4.2 ms, the Direct3D thread needs 4 ms more after that and the OpenGL thread 2.3 ms more, while the GPU sits
 near 60%. FPS stays close to 120 between about 1050 and 1400 draws without a limit being set; the cause isn't known. What got it here:
@@ -112,9 +116,6 @@ sound aside, so don't measure with it on.
 
 ## Next
 
-1. Try the shader build at the doors in play. If stalls remain, vertex shaders are next: find out how many of their variants can be predicted.
-2. The wait for occlusion results at the start of each frame, about half the frame. Answering "visible" without waiting nearly doubles the draw
-   calls (3700 instead of 1950), so the engine would have to read results one frame later. That means changing engine logic in the translated code.
-3. A Direct3D 9 layer on Metal in place of Feral's layer and Apple's OpenGL. The engine reaches graphics through COM interfaces that are already patched,
-   iPad and iPhone have no desktop OpenGL so they need this anyway, and pipelines could be built in parallel. It is a large piece of work.
-4. Steam callbacks, gamepads, and then iPad and iPhone.
+1. Play the Metal renderer by hand through more of the game, including a change of resolution and leaving with Cmd+Q. If it holds up, make it the default.
+2. iPhone and iPad: device creation without OpenGL, a UIKit shell, input, and the game's files on the device. `ios/probe` shows the address space, memory and speed are there.
+3. Steam on iOS, which isn't decided, and gamepads.

@@ -46,6 +46,9 @@ enum {
 typedef struct {
     u32 orig;
     guest_fn fn;
+    int host;     // fn is the Metal renderer's, not a guest function
+    int missing;  // a method of a Metal object that nothing implements
+    int noted;    // the engine's call to Feral's layer has been logged
     const char *name;
     u8 kind;
     signed char ptr[2];  // argument numbers, this being 0; -1 for none
@@ -297,6 +300,7 @@ static void extract_shaders(CPU *w, u32 top, u32 device) {
     fflush(stderr);
     _exit(0);
 }
+u64 rt_d3dq_busy_ticks;
 static void *worker_main(void *arg) {
     (void)arg;
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -317,6 +321,7 @@ static void *worker_main(void *arg) {
             pthread_mutex_unlock(&sleep_mu);
             continue;
         }
+        u64 busy_from = mach_absolute_time();
         while (tail != head) {
             Cmd *cmd = (Cmd *)(ring + (u32)(tail % RING_SIZE));
             if (cmd->fn) {
@@ -338,6 +343,7 @@ static void *worker_main(void *arg) {
             tail += cmd->size;
             __atomic_store_n(&q_tail, tail, __ATOMIC_RELEASE);
         }
+        rt_d3dq_busy_ticks += mach_absolute_time() - busy_from;
     }
     return NULL;
 }
@@ -475,6 +481,23 @@ static void run_async(CPU *c, const Method *m, u32 index, u32 ptr0, u32 bytes0, 
         method_async[index]++;
     }
 }
+// Calls Feral's own implementation of a method from a method of the Metal renderer, on the same thread.
+u32 rt_d3dq_feral(CPU *c, const char *name, const u32 *args, int n) {
+    const Method *m = method_named(name);
+    guest_fn fn = m ? rt_guest_fn(m->orig) : NULL;
+    if (!fn) {
+        fprintf(stderr, "[mtl] %s isn't in Feral's layer\n", name);
+        return 0x80004001u;
+    }
+    u32 saved = c->esp, esp = ((saved - 256u - (u32)n * 4u) & ~15u);
+    for (int i = 0; i < n; i++) G32(esp + (u32)i * 4u) = args[i];
+    esp -= 4;
+    G32(esp) = RT_HOST_RETURN;
+    c->esp = esp;
+    fn(c);
+    c->esp = saved;
+    return c->eax;
+}
 // Queues a call with explicit arguments, for a call the engine didn't make itself.
 static void run_async_with(u32 index, u32 this_arg) {
     const Method *m = &methods[index];
@@ -509,11 +532,157 @@ static void note_stats(void) {
     n_async = n_sync = wait_ticks = n_skipped = 0;
 }
 // The shim in every vtable slot. On return the dispatcher pops the return address, as for any other import.
+extern int rt_d3d_census_on;
+void rt_d3d_census(const char *m, CPU *c);
+int rt_d3d_census_start(void);
+int rt_d3dq_is_worker(CPU *c) { return c == worker_cpu; }
+// With Metal on, Feral's layer still creates its device, and its code calls itself through these same tables with its own objects.
+static int metal_on;
+static u32 layer_lo = ~0u, layer_hi;
+void rt_mtl_missing(CPU *c);
+// ARKHAM_D3D_TRACE=from,step,count: every call the engine makes to Direct3D during one frame as [d3d] lines, from that many seconds after the first Present, then every step seconds.
+// It sits in front of both renderers, so a run on each shows whether the engine asks for the same thing. Shaders go by the names of the files in logs/msl.
+uint32_t d3dsh_words(const uint32_t *code, uint32_t limit);
+static struct {
+    int enabled, on, left;
+    double from, step;
+    u64 first, pending_hash;
+    u32 pending;
+} dtr = {.enabled = -1};
+#define DTR_SHADERS (1u << 16)
+static struct {
+    u32 obj;
+    u64 hash;
+} dtr_shaders[DTR_SHADERS];
+// When keys are recorded or replayed, the moment a level starts is what both go by, and the trace's times too.
+void rt_input_level_started(void);
+static struct {
+    int on;
+    u32 draws;
+} lvl = {.on = -1};
+static void level_note(const Method *m) {
+    if (lvl.on < 0) lvl.on = getenv("ARKHAM_RECORD") || getenv("ARKHAM_REPLAY");
+    if (!lvl.on) return;
+    if (!strncmp(m->name, "Device.Draw", 11)) {
+        lvl.draws++;
+    } else if (!strcmp(m->name, "Device.Present")) {
+        if (lvl.draws > 300) {
+            rt_input_level_started();
+            lvl.on = 0;
+            dtr.first = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        }
+        lvl.draws = 0;
+    }
+}
+static u64 dtr_shader(u32 obj, u64 set) {
+    for (u32 i = (obj * 2654435761u) >> 16, n = 0; n < DTR_SHADERS; i = (i + 1) & (DTR_SHADERS - 1), n++) {
+        if (dtr_shaders[i].obj == obj || !dtr_shaders[i].obj) {
+            if (set) {
+                dtr_shaders[i].obj = obj;
+                dtr_shaders[i].hash = set;
+            }
+            return dtr_shaders[i].hash;
+        }
+    }
+    return 0;
+}
+// Seconds since the level started when keys are recorded or replayed, below zero before that.
+double rt_d3d_level_seconds(void) {
+    if (lvl.on != 0 || !dtr.first) return -1;
+    return (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - dtr.first) / 1e9;
+}
+// True once for each traced frame, to save a picture of it.
+int rt_d3d_trace_picture(void) {
+    static int was;
+    int on = dtr.on;
+    int edge = on && !was;
+    was = on;
+    return edge;
+}
+static void dtr_call(CPU *c, const Method *m) {
+    const char *n = m->name;
+    if (dtr.pending) {
+        u32 obj = G32(dtr.pending);
+        if (obj) dtr_shader(obj, dtr.pending_hash);
+        dtr.pending = 0;
+    }
+    if (!strcmp(n, "Device.CreatePixelShader") || !strcmp(n, "Device.CreateVertexShader")) {
+        const u32 *code = (const u32 *)GP(arg_of(c, 1));
+        u32 words = d3dsh_words(code, 1u << 18);
+        u64 h = 0xcbf29ce484222325ull;
+        for (u32 i = 0; i < words * 4; i++) h = (h ^ ((const u8 *)code)[i]) * 0x100000001b3ull;
+        dtr.pending = arg_of(c, 2);
+        dtr.pending_hash = h ? h : 1;
+        return;
+    }
+    if (!strcmp(n, "Device.Present")) {
+        if (lvl.on > 0) return;  // waiting for the level
+        u64 now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (!dtr.first) dtr.first = now;
+        if (dtr.on) fprintf(stderr, "[d3d] end\n");
+        dtr.on = 0;
+        double t = (double)(now - dtr.first) / 1e9;
+        if (dtr.left > 0 && t >= dtr.from) {
+            dtr.on = 1;
+            dtr.left--;
+            dtr.from = t + dtr.step;
+            fprintf(stderr, "[d3d] frame at %.1f s\n", t);
+        }
+        return;
+    }
+    if (!dtr.on) return;
+    if (!strcmp(n, "Device.SetPixelShader") || !strcmp(n, "Device.SetVertexShader")) {
+        fprintf(stderr, "[d3d] %s %016llx\n", n, (unsigned long long)dtr_shader(arg_of(c, 1), 0));
+    } else if (!strcmp(n, "Device.SetPixelShaderConstantF")) {
+        u32 start = arg_of(c, 1), count = arg_of(c, 3);
+        const float *v = (const float *)GP(arg_of(c, 2));
+        fprintf(stderr, "[d3d] %s %u %u:", n, start, count);
+        for (u32 i = 0; i < count && i < 16; i++) fprintf(stderr, " %.4g,%.4g,%.4g,%.4g", v[i * 4], v[i * 4 + 1], v[i * 4 + 2], v[i * 4 + 3]);
+        fputc('\n', stderr);
+    } else if (strstr(n, "AddRef") || strstr(n, "Release") || strstr(n, "VertexShaderConstantF")) {
+        return;
+    } else {
+        fprintf(stderr, "[d3d] %s %x %x %x %x %x %x\n", n, arg_of(c, 1), arg_of(c, 2), arg_of(c, 3), arg_of(c, 4), arg_of(c, 5), arg_of(c, 6));
+    }
+}
 static void method_shim(CPU *c) {
     u32 index = rt_dyn_cur_arg;
-    const Method *m = &methods[index];
+    Method *m = &methods[index];
+    if (__builtin_expect(rt_d3d_census_on > 0, 0) && c != worker_cpu) rt_d3d_census(m->name, c);
+    if (__builtin_expect(lvl.on != 0, 0) && c != worker_cpu) level_note(m);
+    if (__builtin_expect(dtr.enabled != 0, 0) && c != worker_cpu) {
+        if (dtr.enabled < 0) {
+            const char *v = getenv("ARKHAM_D3D_TRACE");
+            dtr.enabled = v && sscanf(v, "%lf,%lf,%d", &dtr.from, &dtr.step, &dtr.left) == 3;
+        }
+        if (dtr.enabled) dtr_call(c, m);
+    }
+    if (metal_on) {
+        u32 from = G32(c->esp);
+        if (from >= layer_lo && from < layer_hi) {
+            rt_dispatch(c, m->orig);
+            c->esp -= 4;
+            return;
+        }
+        if (m->missing) {
+            if (!m->noted) {
+                m->noted = 1;
+                fprintf(stderr, "[mtl] %s isn't implemented, called from %#x\n", m->name, from);
+            }
+            c->eax = 0x80004001u;
+            return;
+        }
+        if (!m->host && !m->noted) {
+            m->noted = 1;
+            fprintf(stderr, "[mtl] the engine calls %s in Feral's layer, from %#x\n", m->name, from);
+        }
+    }
     // Calls the layer makes on itself, and calls while the queue isn't running, go straight through.
     if (c == worker_cpu || m->kind == K_LOCAL) {
+        if (m->host) {
+            m->fn(c);
+            return;
+        }
         rt_dispatch(c, m->orig);
         c->esp -= 4;
         return;
@@ -672,7 +841,13 @@ static void method_shim(CPU *c) {
 }
 
 // The one function outside the interfaces that changes the layer's state: it switches a texture between sRGB and linear for each draw.
+int rt_mtl_on(void);
 void rt_d3dq_function(CPU *c, guest_fn body) {
+    if (rt_mtl_on()) {
+        // The sampler state says the same thing, and Feral's function would look inside an object it didn't make.
+        c->esp += 4;
+        return;
+    }
     if (c == worker_cpu || !ring) {
         body(c);
         return;
@@ -709,6 +884,18 @@ static void add_method(u32 vtable, u32 slot, const char *cls, const char *method
         }
     }
     if (slot == 2 || slot == 3) m->kind = K_REF;
+    {
+        void (*rt_mtl_method(const char *name, unsigned slot))(CPU *);
+        void (*metal)(CPU *) = rt_mtl_method(m->name, slot);
+        if (metal) {
+            m->fn = metal;
+            m->host = 1;
+            m->missing = metal == rt_mtl_missing;
+            metal_on = 1;
+        }
+    }
+    if (orig < layer_lo) layer_lo = orig;
+    if (orig + 0x400 > layer_hi) layer_hi = orig + 0x400;
     if (slot == 2 && !strcmp(cls, "Surface")) surface_addref_method = n_methods;
     if (!strcmp(name, "Device.CreateVertexShader")) method_create_vs = n_methods;
     if (!strcmp(name, "Device.CreatePixelShader")) method_create_ps = n_methods;
@@ -720,6 +907,7 @@ void rt_d3dq_start(void) {
     trace = getenv("ARKHAM_TRACE_D3DQ") != NULL;
     pipe_on = getenv("ARKHAM_TRACE_PIPE") != NULL;
     trace_shaders = getenv("ARKHAM_TRACE_PIPES") != NULL;
+    rt_d3d_census_start();
     ring_guest = rt_guest_alloc_pages(RING_SIZE);
     ring = rt_mem + ring_guest;
     pthread_t t;
@@ -739,5 +927,5 @@ void rt_d3dq_start(void) {
         for (char *w = strtok_r(copy, " ", &save); w; w = strtok_r(NULL, " ", &save), slot++) add_method(interfaces[k].vtable, slot, interfaces[k].cls, w);
         free(copy);
     }
-    fprintf(stderr, "[d3dq] %u methods go through the Direct3D thread\n", n_methods);
+    fprintf(stderr, "[d3dq] %u methods go through the Direct3D thread, the layer's code is around %#x-%#x\n", n_methods, layer_lo, layer_hi);
 }

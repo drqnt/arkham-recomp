@@ -474,7 +474,11 @@ SHIM(CGLFlushDrawable) {
         fprintf(stderr, "[frame] %lu draws=%lu total=%lu glerr=%#x shaders ok=%d bad=%d programs ok=%d bad=%d\n", frame, draws, rt_gl_draws, err,
                 shader_ok_n, shader_fail_n, link_ok_n, link_fail_n);
     }
-    if (snap_dir && (frame <= 3 || frame == 10 || frame == 30 || frame % 100 == 0)) {
+    // With a Direct3D trace, only the traced frames.
+    int rt_d3d_trace_picture(void);
+    static int snap_traced = -1;
+    if (snap_traced < 0) snap_traced = getenv("ARKHAM_D3D_TRACE") != NULL;
+    if (snap_dir && (snap_traced ? rt_d3d_trace_picture() : frame <= 3 || frame == 10 || frame == 30 || frame % 100 == 0)) {
         char path[1024];
         snprintf(path, sizeof path, "%s/frame_%05lu.png", snap_dir, frame);
         gl_save_frame(path);

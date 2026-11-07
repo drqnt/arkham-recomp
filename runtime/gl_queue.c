@@ -587,7 +587,11 @@ static int queue_guest_attribs(u32 max_vertex) {
     return 1;
 }
 // Called for every OpenGL import. Returns 1 when the call has been dealt with.
+extern int rt_d3d_census_on;
+int rt_d3dq_is_worker(CPU *c);
+void rt_d3d_census_gl(const char *name);
 int rt_glq_route(CPU *c, void (*f)(CPU *), u8 kind, int gated, const char *name) {
+    if (__builtin_expect(rt_d3d_census_on > 0, 0) && !rt_d3dq_is_worker(c)) rt_d3d_census_gl(name);
     if (__builtin_expect(glq_off != 0, 0)) {
         if (glq_off < 0) {
             // In one-at-a-time mode the render thread would hold the gate the worker needs.

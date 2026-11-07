@@ -6,6 +6,8 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 #define STEAM_MAGIC 0xEC000100u
 #define APP_ID "35140"
@@ -147,9 +149,32 @@ SHIM(store_FileWrite) {
     }
     int r = FLAT(signed char, "ISteamRemoteStorage_FileWrite", void *, const char *, const void *, int)(STORE, GS(ARG(1)), GP(ARG(2)), (int)ARG(3));
     fprintf(stderr, "[steam] cloud write %s, %d bytes -> %d\n", GS(ARG(1)), (int)ARG(3), r);
+    // Every save of a played game is kept in logs/saves/history, to go back to and to pick one for logs/saves/frozen.
+    if (strncmp(GS(ARG(1)), "Save", 4) == 0) {
+        char path[256];
+        snprintf(path, sizeof path, "logs/saves/history/%s.%ld", GS(ARG(1)), (long)time(NULL));
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(GP(ARG(2)), 1, (size_t)ARG(3), f);
+            fclose(f);
+        }
+    }
     RET(r);
 }
 SHIM(store_FileRead) {
+    // A test run starts from a frozen copy if there is one, so that the place it starts from doesn't move as the game is played.
+    if (cloud_read_only()) {
+        char path[256];
+        snprintf(path, sizeof path, "logs/saves/frozen/%s", GS(ARG(1)));
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            int n = (int)fread(GP(ARG(2)), 1, (size_t)ARG(3), f);
+            fclose(f);
+            fprintf(stderr, "[steam] test run: read frozen %s -> %d bytes\n", GS(ARG(1)), n);
+            RET(n);
+            return;
+        }
+    }
     int r = FLAT(int, "ISteamRemoteStorage_FileRead", void *, const char *, void *, int)(STORE, GS(ARG(1)), GP(ARG(2)), (int)ARG(3));
     fprintf(stderr, "[steam] cloud read %s -> %d bytes\n", GS(ARG(1)), r);
     RET(r);

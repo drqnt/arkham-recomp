@@ -15,7 +15,7 @@ ENV = dict(os.environ, DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer
 COMMON = ["-std=gnu11", "-fno-strict-aliasing", "-fwrapv", "-w", "-fno-stack-protector", "-fno-exceptions", "-funwind-tables",
           "-fno-math-errno", "-ffp-contract=off", "-mcpu=apple-m1", "-arch", "arm64", "-mmacosx-version-min=14.0",
           f"-I{ROOT}/runtime"]
-FRAMEWORKS = ["CoreFoundation", "CoreServices", "Foundation", "AppKit", "OpenGL", "ApplicationServices", "Carbon", "ImageIO", "CoreGraphics", "CoreText", "AudioToolbox", "AudioUnit", "CoreAudio"]
+FRAMEWORKS = ["CoreFoundation", "CoreServices", "Foundation", "AppKit", "OpenGL", "ApplicationServices", "Carbon", "ImageIO", "CoreGraphics", "CoreText", "AudioToolbox", "AudioUnit", "CoreAudio", "Metal", "QuartzCore"]
 
 
 EXTRA: list[str] = []
@@ -57,7 +57,7 @@ def main() -> int:
         if stale(src, obj, gen_headers):
             jobs.append((src, obj, opt))
     if not args.only:
-        for src in sorted(glob.glob(f"{ROOT}/runtime/*.c")):
+        for src in sorted(glob.glob(f"{ROOT}/runtime/*.c") + glob.glob(f"{ROOT}/runtime/*.m")):
             obj = os.path.join(objdir, "rt_" + os.path.basename(src)[:-2] + ".o")
             objs.append(obj)
             if stale(src, obj, headers):

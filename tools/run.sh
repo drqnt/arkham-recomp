@@ -7,8 +7,8 @@ export ARKHAM_STUB_ALL=1  # imports without a shim return 0 for now; they are li
 export ARKHAM_FPS=1       # on-screen frame rate counter
 export ARKHAM_TRACE_HITCH=1  # logs what each thread was doing when a frame comes late; costs nothing otherwise
 export ARKHAM_TRACE_PIPES=1  # logs the state of each draw that had to build a shader
-if pgrep -x warm_shaders > /dev/null; then
-  echo "tools/build_shader_cache.sh is still running. Metal would give the game an empty cache file: wait until it has finished."
+if pgrep -x warm_shaders > /dev/null || pgrep -f -- --prebuild-shaders > /dev/null; then
+  echo "Shaders are still being built ahead of play. Metal would give the game an empty cache file: wait until that has finished."
   exit 1
 fi
 built="$HOME/Library/Caches/arkham-recomp/built_for_samples"
