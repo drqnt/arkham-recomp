@@ -100,3 +100,31 @@ What makes the phone different, in the runtime:
 
 First look at the device (the iPhone the user calls iPhone Duo): 51.6 GB free, 3369 MB of memory for the app, and while unfolded a 951 x 669 point screen at 3x,
 2853 x 2007 pixels, more than the Mac's 2560 x 1600.
+
+## First play on the phone, 2026-11-07
+
+The game runs on the user's iPhone (iPhone19,4, unfolded 2853 x 2007): menus, a new game, cutscenes and play with a DualSense over Bluetooth, full screen.
+What it took after the app shell, all in the iOS paths of the runtime:
+
+- Case in file names: iOS's file system minds it, the game doesn't (it asks for `BMAAData/Binaries` and `BMGame`, which are `binaries` and `BmGame`).
+  Paths are looked up again ignoring case when they aren't there (`ci_path` in `shims_libc.c`), also for FSRefs.
+- Carbon's HFS paths (`Macintosh HD:Users:...`), through which Feral's code resolves `..`: iOS's CoreFoundation has no HFS style, so `shims_cf.c` converts
+  them, with the phone's one volume, `iPhone`, as `/`. FSCatalogInfo got folder numbers and the volume; FSGetVolumeInfo answers.
+- The game's main queue on the phone is its own and runs whenever the game pumps events, including Feral's `stop:` then `run` pump; the stand-in event
+  pump waits as AppKit's does, so the runtime's lock (not a fair one) isn't kept from the game's other threads.
+- Frameworks the phone lacks (`System.framework`, `CoreServices.framework`) get the app's bundle: Feral's code looked them up thousands of times a second.
+- Stand-ins return the same objects each time (`[NSScreen screens]` is asked every frame; new ones used up the bridge's 65,536 handles).
+- Sound: FMOD and the Bink library's channels are sources of one RemoteIO mixed in `shims_audio.c`; with a RemoteIO each the game went silent after a cutscene.
+- The engine's frame smoothing (62 FPS), which a first start writes on, is turned off as the engine reads `BmEngine.ini` (`ARKHAM_FRAME_LIMIT=1` keeps it).
+- Tools: `ARKHAM_TRACE_STALL=s` reports every thread when no frame comes for s seconds; `ARKHAM_TRACE_STRINGS=text`; file traces show callers;
+  running out of handles reports which code made them. On the phone `ARKHAM_METAL_HUD=1` and `ARKHAM_FPS=1` (a line with FPS, GPU time and the thermal
+  state) go in `Documents/arkham.env`.
+
+Measured: settings the game chose on its first start are 1424 x 1000 (half the screen), no MSAA, FXAA on, the highest detail, motion blur on. In play
+about 1300 draws a frame, GPU 7.5 ms, game thread 5.2 ms and render thread 4.1 ms of CPU; the menu reaches about 66 FPS, where the game, render and
+Direct3D threads and the GPU look to run one after another (about 15 ms in all). The first visit to a place compiles its shaders on the phone: 320 in
+14 s after the first cutscene.
+
+Next, in the user's order of interest: shaders built ahead for the phone; the frame's parts overlapping; touch controls like Feral's Tomb Raider for
+iOS; a settings screen (resolution, MSAA, 60/120 FPS cap); rumble (the DualSense's haptics engine fails to make a player on the phone); pausing when the
+app goes to the background.
