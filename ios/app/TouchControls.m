@@ -25,6 +25,7 @@
 #import <objc/message.h>
 
 void rt_touch_pad(float lx, float ly, float rx, float ry, float lt, float rt, unsigned buttons);
+void rt_touch_look(double yaw_right, double pitch_up);  // shims_hid.m: degrees the camera should turn, handed to the game a frame at a time
 void rt_touch_pad_on(int on);
 void rt_touch_pad_playstation(int ps);
 int rt_controller_connected(void);
@@ -48,8 +49,7 @@ enum { STYLE_PS, STYLE_XBOX, STYLE_ICONS };
 enum { SH_NONE, SH_CROSS, SH_CIRCLE, SH_SQUARE, SH_TRIANGLE };
 enum { SIDE_UP, SIDE_RIGHT, SIDE_DOWN, SIDE_LEFT };
 
-// The camera's numbers (see -frame: below): what a frame of the right stick's full push turns, and what a point of swipe turns at speed 1.
-#define STICK_DEG_PER_FRAME 18.3   // 600 (STICK_MOUSE_SPEED) x 0.0305 degrees, measured with scripted runs on the Mac
+// What a point of swipe turns the camera, at speed 1: a swipe across the phone's 951 points turns it about 270 degrees.
 #define CAMERA_DEG_PER_POINT 0.284
 
 // ---------- settings ----------
@@ -195,19 +195,6 @@ static UIImage *symbol(NSString *name, CGFloat size, UIColor *color) {
     return [img imageWithTintColor:color renderingMode:UIImageRenderingModeAlwaysOriginal];
 }
 
-// The camera's push after the PlayStation pad's 255 steps a stick has (shims_hid.m stick()): a slow swipe's push falls between two of them, so what's
-// left over goes on to the next frame and the camera still turns, on average, as far as the thumb moved. A quarter of a step more lands each value
-// on its step for sure; the Xbox pad's finer steps take it as it is.
-static float in_steps(float v, float *carry) {
-    if (v == 0) {
-        *carry = 0;
-        return 0;
-    }
-    float want = v * 127.5f + *carry, steps = roundf(want);
-    *carry = want - steps;
-    return steps == 0 ? 0 : (steps + 0.25f) / 127.5f;
-}
-
 @interface PadButton : NSObject
 @property(nonatomic) const Def *def;
 @property(nonatomic) CGPoint center;
@@ -244,11 +231,8 @@ static void open_settings(void);
     NSMapTable<UITouch *, NSValue *> *tap_start;
     NSMapTable<UITouch *, NSNumber *> *tap_time;
     UITouch *stick_touch, *look_touch, *pan_touch, *wheel_touch;
-    CGPoint stick_center, look_last, look_sum, pan_last, pan_sum;
+    CGPoint stick_center, look_last, pan_last, pan_sum;
     float lx, ly, rx, ry;
-    float look_prev_x, look_prev_y, carry_x, carry_y;
-    double game_fps, fps_since;
-    unsigned fps_frames;
     BOOL running;  // the stick pushed past its edge
     BOOL panning;  // the touch outside play has moved far enough to be a drag
     BOOL in_menu;  // outside play
@@ -790,26 +774,8 @@ static UIView *gear_view;
     [self restyle];
     fprintf(stderr, "[touch] %s\n", on ? "photo mode: everything hidden" : "photo mode over");
 }
-// The camera. The game takes the right stick as the mouse (shims_libc.c): each frame turns the camera by the stick's push times STICK_DEG_PER_FRAME,
-// with nothing of a joystick's acceleration, and while walking too. So the push is the thumb's speed over the game's frame rate, and the camera turns
-// by how far the thumb went times CAMERA_DEG_PER_POINT, whatever the speed or the frame rate: a swipe across the phone's 951 points at speed 1 turns
-// it about 270 degrees. A thumb going up looks up, as on a phone, unless the settings invert it. Two display frames are averaged, as touches and frames
-// don't come in step; that keeps the sum over a swipe.
-// The game's frames a second, over the last quarter of a second.
-- (double)gameFPS:(CFTimeInterval)now {
-    unsigned frames = rt_frames_presented();
-    if (fps_since <= 0) {
-        fps_since = now;
-        fps_frames = frames;
-        game_fps = 60;
-    } else if (now - fps_since >= 0.25) {
-        double f = (frames - fps_frames) / (now - fps_since);
-        if (f > 5) game_fps = game_fps * 0.5 + f * 0.5;
-        fps_since = now;
-        fps_frames = frames;
-    }
-    return MIN(MAX(game_fps, 20), 240);
-}
+// Each display frame: whether the game is in play, the buttons' colours, the map's drag outside play, the wheel's pulse. The camera isn't here: the
+// thumb's turning goes to the runtime as it moves (touchesMoved), which hands the game exactly each frame's share (shims_hid.m).
 - (void)frame:(CADisplayLink *)l {
     CFTimeInterval now = l.timestamp, dt = last_frame > 0 ? now - last_frame : 1.0 / 60;
     last_frame = now;
@@ -817,23 +783,7 @@ static UIView *gear_view;
     [self updatePlay:now];
     rt_want_picture_luma(!self.hidden && !photo);
     [self followPicture:dt];
-    double fps = [self gameFPS:now];
-    float nx = 0, ny = 0;
-    if (look_touch && !in_menu) {
-        double k = setting(@"swipeSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT / (STICK_DEG_PER_FRAME * fps);  // push for a point a second
-        nx = (float)(look_sum.x / dt * k);
-        ny = (float)(look_sum.y / dt * k * (setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 ? -1 : 1));
-        float m = hypotf(nx, ny);
-        if (m > 1) {
-            nx /= m;
-            ny /= m;
-        }
-    }
-    look_sum = CGPointZero;
-    rx = in_steps((nx + look_prev_x) * 0.5f, &carry_x);
-    ry = in_steps((ny + look_prev_y) * 0.5f, &carry_y);
-    look_prev_x = nx;
-    look_prev_y = ny;
+    rx = ry = 0;
     // Outside play a drag is the left stick, the other way from the finger: the map goes with it, as on a phone's map.
     if (in_menu) {
         float px = 0, py = 0;
@@ -969,11 +919,17 @@ static UIView *gear_view;
             ly = d > 0 ? (float)(-dy / d) * m : 0;
             [self showStickAt:stick_center knob:CGPointMake(stick_center.x + (d > 0 ? dx / d * shown : 0), stick_center.y + (d > 0 ? dy / d * shown : 0))];
         } else if (t == look_touch) {
+            // The camera: the thumb's travel, in degrees, as it comes. Right turns right; up looks up, unless the settings invert it.
+            CGPoint d = CGPointZero;
             for (UITouch *c in [event coalescedTouchesForTouch:t] ?: @[t]) {
                 CGPoint q = [c locationInView:self];
-                look_sum.x += q.x - look_last.x;
-                look_sum.y += q.y - look_last.y;
+                d.x += q.x - look_last.x;
+                d.y += q.y - look_last.y;
                 look_last = q;
+            }
+            if (!in_menu) {
+                double k = setting(@"swipeSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT;
+                rt_touch_look(d.x * k, -d.y * k * (setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 ? -1 : 1));
             }
         }
     }
@@ -1028,10 +984,7 @@ static UIView *gear_view;
             running = NO;
             stick_base.hidden = stick_knob.hidden = YES;
         }
-        if (t == look_touch) {
-            look_touch = nil;
-            look_sum = CGPointZero;
-        }
+        if (t == look_touch) look_touch = nil;
         [owners removeObjectForKey:t];
     }
     [self send];
@@ -1047,8 +1000,7 @@ static UIView *gear_view;
     [tap_time removeAllObjects];
     stick_touch = look_touch = pan_touch = wheel_touch = nil;
     lx = ly = rx = ry = 0;
-    look_sum = pan_sum = CGPointZero;
-    look_prev_x = look_prev_y = carry_x = carry_y = 0;
+    pan_sum = CGPointZero;
     running = panning = NO;
     pulse_bits = 0;
     stick_base.hidden = stick_knob.hidden = YES;

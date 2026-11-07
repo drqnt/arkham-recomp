@@ -667,10 +667,10 @@ extern int rt_no_frame_limit;
 // The game takes the stick as a joystick, with an acceleration of its own and the camera's own ideas while walking, so swipes (ios/app/TouchControls.m),
 // which reach it as that stick, felt like one. As the mouse, a frame turns the camera by exactly what came in that frame, while walking too. The mouse
 // itself can't do it: the game drops it while a pad's stick is held, and walking holds one. Scripted runs on the Mac showed all of it (docs/IOS_PORT.md).
-// The stick's raw axes (aRawRHJoyRight, aRawRHJoyUp, which some gadgets read) get Speed=5 against the fifth of its push a real controller is given in
-// shims_hid.m, and no dead zone. The text keeps its length, since the engine may take the size from stat(), and values are set, not multiplied, since
+// The stick's raw axes (aRawRHJoyRight, aRawRHJoyUp, which some gadgets read) get Speed=1.8 against the 0.55 at most a real controller's push is
+// given in shims_hid.m, so that they still see all of it, and no dead zone. The text keeps its length, since the engine may take the size from stat(), and values are set, not multiplied, since
 // the engine writes what it read back into BmInput.ini, which is then read again at the next start. On the Mac only with ARKHAM_RIGHT_STICK_MOUSE.
-#define STICK_MOUSE_SPEED 600
+#define STICK_MOUSE_SPEED 60
 static const char *right_stick_axis(const char *q, const char *end) {
     static const char *const names[] = {"Axis aTurn ", "Axis aLookup ", "Axis aRawRHJoyRight ", "Axis aRawRHJoyUp ", "Axis aMouseX ", "Axis aMouseY "};
     for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
@@ -735,7 +735,7 @@ static int right_stick_rewrite(char *text, size_t len) {
                     snprintf(cmd, sizeof cmd, "Axis %s Speed=%s%g DeadZone=0", x ? "aMouseX" : "aMouseY", neg ? "-" : "", mouse);
                     changed += set_command(q, cmd_end, cmd);
                 } else {
-                    changed += set_field(q, cmd_end, "Speed=", neg ? "-5" : "5");
+                    changed += set_field(q, cmd_end, "Speed=", neg ? "-1.8" : "1.8");
                     set_field(q, cmd_end, "DeadZone=", "0");
                 }
                 q = cmd_end;
@@ -823,6 +823,14 @@ static FILE *language_ini(const char *path, const char *mode) {
 }
 SHIM(fopen) {
     FILE *f = language_ini(GS(ARG(0)), GS(ARG(1)));
+#if !TARGET_OS_IPHONE
+    // As in open() below: an experiment's input settings aren't written back into the Mac's game.
+    size_t pl = strlen(GS(ARG(0)));
+    if (!f && GS(ARG(1))[0] != 'r' && stick_mouse_speed() > 0 && pl > 9 && !strcmp(GS(ARG(0)) + pl - 9, "Input.ini")) {
+        f = fopen("/dev/null", GS(ARG(1)));
+        fprintf(stderr, "[input] the engine's write of %s goes nowhere during this experiment\n", GS(ARG(0)));
+    }
+#endif
     CIBUF(0);
     if (!f) f = fopen(CIP(0), GS(ARG(1)));
     if (!f) set_errno();
@@ -887,6 +895,13 @@ SHIM(open) {
     int fd = language_file(GS(ARG(0)));
     CIBUF(0);
     if (fd < 0 && ((int)ARG(1) & O_ACCMODE) == O_RDONLY && stick_mouse_speed() > 0) fd = input_ini_file(CIP(0));
+#if !TARGET_OS_IPHONE
+    // An experiment on the Mac mustn't leave its input settings in the Mac's game: what the engine writes back to them goes nowhere.
+    if (fd < 0 && ((int)ARG(1) & O_ACCMODE) != O_RDONLY && stick_mouse_speed() > 0 && strlen(GS(ARG(0))) > 9 && !strcmp(GS(ARG(0)) + strlen(GS(ARG(0))) - 9, "Input.ini")) {
+        fd = open("/dev/null", O_WRONLY);
+        fprintf(stderr, "[input] the engine's write of %s goes nowhere during this experiment\n", GS(ARG(0)));
+    }
+#endif
     if (fd < 0) fd = open(CIP(0), (int)ARG(1), (int)ARG(2));
     if (fd < 0) set_errno();
     TFS("open", GS(ARG(0)), fd);

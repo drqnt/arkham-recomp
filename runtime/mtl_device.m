@@ -1255,8 +1255,13 @@ static u64 frame_wait_ns;
 void rt_set_async_pipelines(int on) { atomic_store(&async_pipelines, on && !getenv("ARKHAM_SYNC_PIPELINES")); }
 static id<MTLRenderPipelineState> build_in_background(PipeEntry *e, MTLRenderPipelineDescriptor *d, MTLFunctionConstantValues *cv, id<MTLLibrary> vlib,
                                                       NSString *vname, id<MTLLibrary> plib, NSString *pname, id<MTLFunction> fixed_ps) {
-    static dispatch_queue_t q;
-    if (!q) q = dispatch_queue_create("arkham.pipelines", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INITIATED, 0));
+    // Three at a time, at utility priority: on the phone's efficiency cores, so that a new place's hundreds don't take the CPU from the game and its sound
+    // (dozens at once at a higher priority left gaps in the sound).
+    static dispatch_queue_t qs[3];
+    static unsigned next_q;
+    if (!qs[0])
+        for (int i = 0; i < 3; i++) qs[i] = dispatch_queue_create("arkham.pipelines", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    dispatch_queue_t q = qs[next_q++ % 3];
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     dispatch_async(q, ^{
         void *pool = objc_autoreleasePoolPush();

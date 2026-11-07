@@ -232,3 +232,27 @@ app goes to the background.
   and at most 4 ms in all a frame, then is left out until the pipeline is ready. The system cache makes revisits fast: the second session's
   1,028 pipelines took 212 ms, against 4.7 s for 1,280 the first time. A setting turns this off, and so does `ARKHAM_SYNC_PIPELINES=1`.
 - **Startup:** `Documents/Logs/run.txt` lines now start with seconds since the process started (from the kernel), for finding the 15 s of black.
+
+## Controls v6: the camera from a frame's share through the game's measured mouse curve, 2026-11-07
+
+- **v5's swipes still felt like a joystick** for small moves. The PlayStation pad has 255 stick steps, and the runtime spread the remainder over
+  display frames (1, 0, 1, 0 at 120 Hz). The game reads 60 times a second, so it saw only the zeros or only the ones.
+- **The camera hook.** The game warps the cursor once a frame in play, right after reading its input. At that moment the runtime now hands over
+  exactly the thumb's turning since the last frame (`rt_touch_camera_frame`, `shims_hid.m`). It pushes the value at the game loop's next pass,
+  before the next frame reads it, through a run loop source, not from inside the warp.
+- **Measured with scripted Mac runs.** `walk.sh` steps `pad`, `shot`, `tlook`; shifts of the picture are measured from frames.
+  - The pad code drops a push under about 0.05 (6 of 127.5 steps).
+  - With the stick on `aMouseX` at Speed S and mouse smoothing off, the game turns the camera by about `0.038 · x^1.9` points of a 712-point
+    picture a frame, where x = S·push. That is the mouse's acceleration, about 7 points to a degree.
+  - The curve fits every hold: x from 1.4 to 19, at 60 and 155 FPS, and the same per frame at both.
+- **The runtime inverts that curve** at Speed 60. The smallest turn the pad lets through is about 0.05° a frame, and the largest about 12°.
+  The game smooths the stick over a few frames, so a lone one-frame push comes out far smaller. A finger's continuous travel is what the
+  inversion is for.
+- **Checked on the Mac at 60 FPS** through the same path as a finger, at 60 shares a second: 10° came out as 69 points (9.9°), 12° fast as
+  about 11°, and there and back left about 3°.
+- **A real controller** gets 0.055 to 0.55 of a push: the smallest that passes, up to about 250°/s at 60 FPS. The raw axes read at Speed 1.8,
+  so they still see the full push.
+- **Sound gaps** came with bursts of hundreds of pipelines building at once. The game's sound threads now run at user-interactive priority, and
+  pipelines build three at a time at utility priority.
+- **Mac safety.** A Mac run with `ARKHAM_RIGHT_STICK_MOUSE` sends the engine's writes of `*Input.ini` to `/dev/null`. One write still got
+  through and regenerated `MacInit/BmInput.ini` with the game's defaults, which is what it should hold.

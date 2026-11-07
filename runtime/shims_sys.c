@@ -292,9 +292,13 @@ SHIM(HIGetMousePosition) {
     RET(0);
 }
 // The game measures mouse motion as the distance from where it last put the cursor, so a scripted cursor has to follow too.
+void rt_touch_camera_frame(void);  // shims_hid.m
 SHIM(CGWarpMouseCursorPosition) {
     static u32 warps;
     if (warps++ % 600 == 0) fprintf(stderr, "[input] cursor warp %u to %.0f,%.0f\n", warps, ARGF(0), ARGF(1));
+    // The game warps once a frame in play, right after reading its input: the touch camera's moment to hand over a frame's turning (shims_hid.m).
+    // It does nothing unless the touch controls are what the game sees (or a scripted run on the Mac tests them).
+    rt_touch_camera_frame();
     if (scripted_mouse) {
         scripted_x = ARGF(0);
         scripted_y = ARGF(1);

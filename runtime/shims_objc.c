@@ -1156,6 +1156,7 @@ static void auto_play_schedule(void) {
 // and "50:pad:49:0" sets an axis of the pad with no hardware (ARKHAM_FAKE_PAD; page 1, usage 49 is the left stick's Y on the PlayStation one).
 void rt_request_snapshot(const char *name);  // mtl_device.m
 void rt_fake_pad_set(int page, int usage, int value);  // shims_hid.m
+void rt_touch_look(double yaw_right, double pitch_up);  // shims_hid.m: "50:tlook:2:0" turns the touch camera 2 degrees right (ARKHAM_TEST_TOUCH_CAMERA)
 void rt_set_scripted_mouse(double x, double y);
 static id script_window(void) {
     id app = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), SELR("sharedApplication"));
@@ -1251,6 +1252,90 @@ static void script_press(void) {
     for (unsigned long type = 1; type <= 2; type++)
         script_post(((mouse_fn)objc_msgSend)(CLS("NSEvent"), sel, type, at, 0, CFAbsoluteTimeGetCurrent(), num, nil, 0, 1, type == 1 ? 1.0f : 0.0f));
 }
+// A search of the game's memory, for finding where it keeps a value by changing it in play (scripted runs on the Mac only): "mbase" copies every
+// writable page of the guest's memory; "mstable" keeps what didn't change since; "mchange" lists what of that changed by ARKHAM_MSCAN_MIN..MAX (as a
+// 32-bit integer) since; "mback" shows those that came back within a quarter of their change; "mpoke:ADDR:DELTA" adds DELTA to the integer at a guest
+// address (decimal). For the camera's turning: copy, wait, keep the still ones, turn with the mouse, list, turn back, show.
+#if !TARGET_OS_IPHONE
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+typedef struct { mach_vm_address_t at; mach_vm_size_t size; u32 *copy; u8 *still; } MemRegion;
+static MemRegion *mregions;
+static int n_mregions;
+typedef struct { u32 guest; i32 base, changed; } MemHit;
+static MemHit *mhits;
+static size_t n_mhits;
+static void mscan(const char *what) {
+    if (!strcmp(what, "mbase")) {
+        for (int i = 0; i < n_mregions; i++) free(mregions[i].copy), free(mregions[i].still);
+        free(mregions);
+        mregions = NULL;
+        n_mregions = 0;
+        size_t total = 0;
+        for (mach_vm_address_t a = RT_MEM_BASE; a < RT_MEM_BASE + 0x100000000ull;) {
+            mach_vm_size_t size = 0;
+            vm_region_basic_info_data_64_t info;
+            mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t obj;
+            if (mach_vm_region(mach_task_self(), &a, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS || a >= RT_MEM_BASE + 0x100000000ull) break;
+            if ((info.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE)) {
+                mach_vm_size_t end = a + size > RT_MEM_BASE + 0x100000000ull ? RT_MEM_BASE + 0x100000000ull - a : size;
+                mregions = realloc(mregions, sizeof *mregions * (size_t)(n_mregions + 1));
+                MemRegion *r = &mregions[n_mregions++];
+                r->at = a;
+                r->size = end;
+                r->copy = malloc(end);
+                memcpy(r->copy, (void *)a, end);
+                r->still = calloc(end / 32 + 1, 1);
+                memset(r->still, 0xFF, end / 32 + 1);
+                total += end;
+            }
+            a += size;
+        }
+        fprintf(stderr, "[mscan] copied %d regions, %zu MB\n", n_mregions, total >> 20);
+    } else if (!strcmp(what, "mstable")) {
+        size_t still = 0;
+        for (int i = 0; i < n_mregions; i++) {
+            MemRegion *r = &mregions[i];
+            const u32 *now = (const u32 *)r->at;
+            for (size_t k = 0; k < r->size / 4; k++) {
+                if (now[k] != r->copy[k]) r->still[k >> 3] &= (u8)~(1u << (k & 7));
+                else still += r->still[k >> 3] >> (k & 7) & 1;
+                r->copy[k] = now[k];
+            }
+        }
+        fprintf(stderr, "[mscan] %zu values still\n", still);
+    } else if (!strcmp(what, "mchange")) {
+        long lo = getenv("ARKHAM_MSCAN_MIN") ? atol(getenv("ARKHAM_MSCAN_MIN")) : 3000, hi = getenv("ARKHAM_MSCAN_MAX") ? atol(getenv("ARKHAM_MSCAN_MAX")) : 400000;
+        free(mhits);
+        mhits = NULL;
+        n_mhits = 0;
+        size_t cap = 0;
+        for (int i = 0; i < n_mregions; i++) {
+            MemRegion *r = &mregions[i];
+            const i32 *now = (const i32 *)r->at;
+            for (size_t k = 0; k < r->size / 4; k++) {
+                if (!(r->still[k >> 3] >> (k & 7) & 1)) continue;
+                long d = (long)now[k] - (long)(i32)r->copy[k];
+                if (labs(d) < lo || labs(d) > hi) continue;
+                if (n_mhits == cap) mhits = realloc(mhits, sizeof *mhits * (cap = cap ? cap * 2 : 1024));
+                mhits[n_mhits++] = (MemHit){(u32)(r->at + k * 4 - RT_MEM_BASE), (i32)r->copy[k], now[k]};
+            }
+        }
+        fprintf(stderr, "[mscan] %zu still values changed by %ld..%ld\n", n_mhits, lo, hi);
+    } else if (!strcmp(what, "mback")) {
+        int shown = 0;
+        for (size_t j = 0; j < n_mhits && shown < 300; j++) {
+            i32 now = G32(mhits[j].guest);
+            long moved = (long)mhits[j].changed - mhits[j].base, back = (long)now - mhits[j].base;
+            if (labs(back) * 4 > labs(moved)) continue;
+            fprintf(stderr, "[mscan] %08x: %d -> %d -> %d\n", mhits[j].guest, mhits[j].base, mhits[j].changed, now);
+            shown++;
+        }
+        fprintf(stderr, "[mscan] %d came back\n", shown);
+    }
+}
+#endif
 static void input_schedule(void) {
     const char *spec = getenv("ARKHAM_INPUT");
     if (!spec) return;
@@ -1264,16 +1349,32 @@ static void input_schedule(void) {
         if (sscanf(item, "%lf:%15[a-z]:%lf:%lf", &secs, kind, &x, &y) < 3) continue;
         int is_key = !strcmp(kind, "key"), is_click = !strcmp(kind, "click");
         int is_down = !strcmp(kind, "down"), is_up = !strcmp(kind, "up"), is_look = !strcmp(kind, "look"), is_quit = !strcmp(kind, "quit"), is_press = !strcmp(kind, "press"), is_cmdq = !strcmp(kind, "cmdq");
-        int is_shot = !strcmp(kind, "shot"), is_pad = !strcmp(kind, "pad");
+        int is_shot = !strcmp(kind, "shot"), is_pad = !strcmp(kind, "pad"), is_tlook = !strcmp(kind, "tlook");
+        int is_mscan = !strcmp(kind, "mbase") || !strcmp(kind, "mstable") || !strcmp(kind, "mchange") || !strcmp(kind, "mback"), is_mpoke = !strcmp(kind, "mpoke");
+        int is_mdump = !strcmp(kind, "mdump");
+        char *kind_copy = is_mscan ? strdup(kind) : NULL;  // the block can't take an array
         CFRunLoopTimerRef t = CFRunLoopTimerCreateWithHandler(NULL, start + secs, 0, 0, 0, ^(CFRunLoopTimerRef tt) {
             (void)tt;
-            if (is_pad) {
+            if (is_mscan) {
+#if !TARGET_OS_IPHONE
+                mscan(kind_copy);
+#endif
+            } else if (is_mdump) {
+                for (u32 a = (u32)x; a < (u32)x + (u32)y * 4; a += 16)
+                    fprintf(stderr, "[mscan] dump %08x: %08x %08x %08x %08x\n", a, G32(a), G32(a + 4), G32(a + 8), G32(a + 12));
+            } else if (is_mpoke) {
+                G32((u32)x) += (u32)(i32)y;
+                fprintf(stderr, "[mscan] poked %08x by %d: now %d\n", (u32)x, (int)y, (i32)G32((u32)x));
+            } else if (is_tlook) {
+                rt_touch_look(x, y);
+            } else if (is_pad) {
                 rt_fake_pad_set(1, (int)x, (int)y);
             } else if (is_shot) {
                 char name[32];
                 snprintf(name, sizeof name, "shot-%d", (int)x);
                 rt_request_snapshot(name);
-                fprintf(stderr, "[input] shot %d\n", (int)x);
+                unsigned rt_frames_presented(void);
+                fprintf(stderr, "[input] shot %d at frame %u\n", (int)x, rt_frames_presented());
             } else if (is_press) {
                 script_press();
             } else if (is_cmdq) {

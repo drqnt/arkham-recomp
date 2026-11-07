@@ -444,6 +444,18 @@ static OSStatus out_render(void *ctx, AudioUnitRenderActionFlags *flags, const A
     return ring_render(&o->ring, frames, io);
 }
 
+// The threads that run the game's sound code ahead of the output: at the highest priority short of real time, so that busy moments elsewhere (on
+// the phone, the GPU's compiler building a new place's pipelines on every core) don't leave the output with nothing to play, which is a gap you hear.
+static pthread_attr_t *sound_thread_attr(void) {
+    static pthread_attr_t a;
+    static int made;
+    if (!made) {
+        pthread_attr_init(&a);
+        pthread_attr_set_qos_class_np(&a, QOS_CLASS_USER_INTERACTIVE, 0);
+        made = 1;
+    }
+    return &a;
+}
 // Calls the guest's render callback on a guest thread of its own whenever the ring runs low.
 static void *out_pump(void *p) {
     GOut *o = p;
@@ -647,7 +659,7 @@ SHIM(AudioOutputUnitStart) {
         o->pump_started = 1;
         ring_init(&o->ring, 8192, o->channels);
         atomic_store(&o->running, 1);
-        pthread_create(&o->pump, NULL, out_pump, o);
+        pthread_create(&o->pump, sound_thread_attr(), out_pump, o);
     }
 #if TARGET_OS_IPHONE
     if (o->pump_started && !o->mixed) {
@@ -871,7 +883,7 @@ SHIM(SndNewChannel) {
     s->ring.space = dispatch_semaphore_create(0);
     atomic_store(&s->ring.gain_l, 1.0f);
     atomic_store(&s->ring.gain_r, 1.0f);
-    pthread_create(&s->thread, NULL, snd_thread, s);
+    pthread_create(&s->thread, sound_thread_attr(), snd_thread, s);
     G32(ARG(0)) = s->handle;
     RET(0);
 }
