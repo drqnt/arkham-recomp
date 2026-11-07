@@ -1,5 +1,5 @@
-// Hand-written OpenGL and CGL shims: the calls whose memory or handles can't be forwarded mechanically,
-// plus CoreGraphics display queries.
+// Hand-written OpenGL and CGL shims: the calls whose memory or handles can't be forwarded mechanically. Mac only: displays, images and the
+// rest the phone needs too are in shims_cg.c.
 #define GL_SILENCE_DEPRECATION
 #include "shim.h"
 #include "shim_reg.h"
@@ -88,14 +88,83 @@ SHIM(glDeleteBuffers) {
 static int trace_gl;
 
 // ---------- strings handed back to guest memory ----------
+static void record_string(const char *what, u32 a, u32 b, const char *s, u32 from);
 SHIM(glGetString) {
     const char *s = (const char *)glGetString(ARG(0));
+    record_string("String", ARG(0), 0, s, G32(c->esp));
     if (trace_gl) fprintf(stderr, "[gl] glGetString(%#x) = %s\n", ARG(0), s ? s : "(null)");
     RET(s ? rt_guest_strdup(s) : 0);
 }
 SHIM(glGetStringi) {
     const char *s = (const char *)glGetStringi(ARG(0), ARG(1));
+    record_string("Stringi", ARG(0), ARG(1), s, G32(c->esp));
     RET(s ? rt_guest_strdup(s) : 0);
+}
+
+// ARKHAM_GL_RECORD=1: what the Mac's OpenGL answers to the game's questions, as [glrec] lines. With Metal drawing, these questions at start
+// are nearly all the OpenGL the game still uses, and the phone, which has no OpenGL, answers them the same way (ios_gl.c).
+static int gl_record = -1;
+static int recording(void) {
+    if (gl_record < 0) gl_record = getenv("ARKHAM_GL_RECORD") != NULL;
+    return gl_record;
+}
+#define UNSET 0x7EADBEEF
+static void record_ints(const char *what, u32 a, u32 b, const GLint *v, u32 from) {
+    int n = 0;
+    while (n < 16 && v[n] != UNSET) n++;
+    fprintf(stderr, "[glrec] %s %#x %#x from %08x:", what, a, b, from);
+    for (int i = 0; i < n; i++) fprintf(stderr, " %d", v[i]);
+    fprintf(stderr, "\n");
+}
+SHIM(glGetIntegerv) {
+    GLint v[16];
+    for (int i = 0; i < 16; i++) v[i] = UNSET;
+    glGetIntegerv(ARG(0), v);
+    if (recording()) record_ints("Integerv", ARG(0), 0, v, G32(c->esp));
+    int n = 0;
+    while (n < 16 && v[n] != UNSET) n++;
+    if (ARG(1)) memcpy(GP(ARG(1)), v, (size_t)n * 4);
+}
+SHIM(glGetFloatv) {
+    GLfloat v[16];
+    for (int i = 0; i < 16; i++) memcpy(&v[i], &(GLint){UNSET}, 4);
+    glGetFloatv(ARG(0), v);
+    int n = 0;
+    while (n < 16 && memcmp(&v[n], &(GLint){UNSET}, 4)) n++;
+    if (recording()) {
+        fprintf(stderr, "[glrec] Floatv %#x from %08x:", ARG(0), G32(c->esp));
+        for (int i = 0; i < n; i++) fprintf(stderr, " %g", v[i]);
+        fprintf(stderr, "\n");
+    }
+    if (ARG(1)) memcpy(GP(ARG(1)), v, (size_t)n * 4);
+}
+SHIM(glGetProgramivARB) {
+    GLint v[16];
+    for (int i = 0; i < 16; i++) v[i] = UNSET;
+    static void (*get)(GLenum, GLenum, GLint *);  // from the legacy profile, not in gl3.h
+    if (!get) get = dlsym(RTLD_DEFAULT, "glGetProgramivARB");
+    if (get) get(ARG(0), ARG(1), v);
+    if (recording()) record_ints("ProgramivARB", ARG(0), ARG(1), v, G32(c->esp));
+    int n = 0;
+    while (n < 16 && v[n] != UNSET) n++;
+    if (ARG(2)) memcpy(GP(ARG(2)), v, (size_t)n * 4);
+}
+SHIM(glGetQueryiv) {
+    GLint v[16];
+    for (int i = 0; i < 16; i++) v[i] = UNSET;
+    glGetQueryiv(ARG(0), ARG(1), v);
+    if (recording()) record_ints("Queryiv", ARG(0), ARG(1), v, G32(c->esp));
+    int n = 0;
+    while (n < 16 && v[n] != UNSET) n++;
+    if (ARG(2)) memcpy(GP(ARG(2)), v, (size_t)n * 4);
+}
+SHIM(glCheckFramebufferStatus) {
+    GLenum r = glCheckFramebufferStatus(ARG(0));
+    if (recording()) fprintf(stderr, "[glrec] CheckFramebufferStatus %#x from %08x: %#x\n", ARG(0), G32(c->esp), r);
+    RET(r);
+}
+static void record_string(const char *what, u32 a, u32 b, const char *s, u32 from) {
+    if (recording()) fprintf(stderr, "[glrec] %s %#x %u from %08x: %s\n", what, a, b, from, s ? s : "(null)");
 }
 
 // ---------- shaders ----------
@@ -548,138 +617,13 @@ SHIM(CGLDestroyRendererInfo) {
     RET(e);
 }
 
-// ---------- displays ----------
-SHIM(CGMainDisplayID) { RET(CGMainDisplayID()); }
-SHIM(CGGetActiveDisplayList) {
-    uint32_t n = 0;
-    CGError e = CGGetActiveDisplayList(ARG(0), NP(ARG(1)), &n);
-    if (ARG(2)) G32(ARG(2)) = n;
-    RET(e);
-}
-// CGRect comes back through a hidden pointer that the callee pops.
-SHIM(CGDisplayBounds) {
-    CGRect r = CGDisplayBounds(ARG(1));
-    u32 b = ARG(0);
-    *(f32a *)GP(b) = (float)r.origin.x;
-    *(f32a *)GP(b + 4) = (float)r.origin.y;
-    *(f32a *)GP(b + 8) = (float)r.size.width;
-    *(f32a *)GP(b + 12) = (float)r.size.height;
-    RET(b);
-    c->esp += 4;
-}
-SHIM(CGDisplayScreenSize) {
-    CGSize s = CGDisplayScreenSize(ARG(0));
-    float w = (float)s.width, h = (float)s.height;
-    memcpy(&c->eax, &w, 4);
-    memcpy(&c->edx, &h, 4);
-}
-SHIM(CGDisplayIDToOpenGLDisplayMask) { RET(CGDisplayIDToOpenGLDisplayMask(ARG(0))); }
-SHIM(CGDisplayCopyDisplayMode) { RET(cf_wrap(CGDisplayCopyDisplayMode(ARG(0)))); }
-SHIM(CGDisplayCopyAllDisplayModes) { RET(cf_wrap(CGDisplayCopyAllDisplayModes(ARG(0), NULL))); }
-SHIM(CGDisplayModeGetWidth) { RET(CGDisplayModeGetWidth((CGDisplayModeRef)cf_unwrap(ARG(0)))); }
-SHIM(CGDisplayModeGetHeight) { RET(CGDisplayModeGetHeight((CGDisplayModeRef)cf_unwrap(ARG(0)))); }
-SHIM(CGDisplayModeGetIOFlags) { RET(CGDisplayModeGetIOFlags((CGDisplayModeRef)cf_unwrap(ARG(0)))); }
-SHIM(CGDisplayModeGetRefreshRate) { RETF(CGDisplayModeGetRefreshRate((CGDisplayModeRef)cf_unwrap(ARG(0)))); }
-SHIM(CGDisplayModeCopyPixelEncoding) { RET(cf_wrap(CFStringCreateWithCString(NULL, "--------RRRRRRRRGGGGGGGGBBBBBBBB", kCFStringEncodingUTF8))); }
-SHIM(CGDisplayModeRelease) {}
-SHIM(cg_ok) { RET(0); }
-SHIM(CGWindowLevelForKey) { RET(CGWindowLevelForKey((CGWindowLevelKey)ARG(0))); }
-SHIM(CGGetDisplayTransferByTable) {
-    if (ARG(4)) G32(ARG(4)) = 0;
-    RET(0);
-}
-
-// ---------- keyboard layout ----------
-// The game names its keys after what the current layout types, so W would be bound as a Cyrillic letter on a Russian layout.
-// Answering with the ASCII layout keeps the key names and bindings the same whatever input language is selected.
-SHIM(TISCopyCurrentKeyboardLayoutInputSource) { RET(cf_wrap(TISCopyCurrentASCIICapableKeyboardLayoutInputSource())); }
-SHIM(TISCopyCurrentASCIICapableKeyboardLayoutInputSource) { RET(cf_wrap(TISCopyCurrentASCIICapableKeyboardLayoutInputSource())); }
-SHIM(TISCopyCurrentASCIICapableKeyboardInputSource) { RET(cf_wrap(TISCopyCurrentASCIICapableKeyboardInputSource())); }
-SHIM(TISCopyCurrentKeyboardInputSource) { RET(cf_wrap(TISCopyCurrentASCIICapableKeyboardInputSource())); }
-SHIM(TISGetInputSourceProperty) { RET(cf_wrap(TISGetInputSourceProperty((TISInputSourceRef)cf_unwrap(ARG(0)), (CFStringRef)cf_unwrap(ARG(1))))); }
-SHIM(LMGetKbdType) { RET(LMGetKbdType()); }
-
-// ---------- images through the real ImageIO and CoreGraphics ----------
-#include <ImageIO/ImageIO.h>
-#define OBJ(n) cf_unwrap(ARG(n))
-SHIM(CGImageSourceCreateWithData) { RET(cf_wrap(CGImageSourceCreateWithData((CFDataRef)OBJ(0), (CFDictionaryRef)OBJ(1)))); }
-SHIM(CGImageSourceGetCount) { RET(CGImageSourceGetCount((CGImageSourceRef)OBJ(0))); }
-SHIM(CGImageSourceCreateImageAtIndex) { RET(cf_wrap(CGImageSourceCreateImageAtIndex((CGImageSourceRef)OBJ(0), ARG(1), (CFDictionaryRef)OBJ(2)))); }
-SHIM(CGImageGetWidth) { RET(CGImageGetWidth((CGImageRef)OBJ(0))); }
-SHIM(CGImageGetHeight) { RET(CGImageGetHeight((CGImageRef)OBJ(0))); }
-SHIM(CGImageGetBitsPerComponent) { RET(CGImageGetBitsPerComponent((CGImageRef)OBJ(0))); }
-SHIM(CGImageGetBitsPerPixel) { RET(CGImageGetBitsPerPixel((CGImageRef)OBJ(0))); }
-SHIM(CGImageGetBytesPerRow) { RET(CGImageGetBytesPerRow((CGImageRef)OBJ(0))); }
-SHIM(CGImageGetBitmapInfo) { RET(CGImageGetBitmapInfo((CGImageRef)OBJ(0))); }
-SHIM(CGImageGetDataProvider) { RET(cf_wrap(CGImageGetDataProvider((CGImageRef)OBJ(0)))); }
-SHIM(CGDataProviderCopyData) { RET(cf_wrap(CGDataProviderCopyData((CGDataProviderRef)OBJ(0)))); }
-SHIM(CGDataProviderCreateWithCFData) { RET(cf_wrap(CGDataProviderCreateWithCFData((CFDataRef)OBJ(0)))); }
-SHIM(cf_release_any) {
-    CFTypeRef o = OBJ(0);
-    if (o) CFRelease(o);
-}
-SHIM(CGColorSpaceCreateDeviceRGB) { RET(cf_wrap(CGColorSpaceCreateDeviceRGB())); }
-SHIM(CGColorSpaceCreateDeviceGray) { RET(cf_wrap(CGColorSpaceCreateDeviceGray())); }
-SHIM(CGBitmapContextCreate) {
-    RET(cf_wrap(CGBitmapContextCreate(NP(ARG(0)), ARG(1), ARG(2), ARG(3), ARG(4), (CGColorSpaceRef)OBJ(5), ARG(6))));
-}
-static CGRect arg_rect(CPU *c, int n) {
-    return CGRectMake(ARGF(n), ARGF(n + 1), ARGF(n + 2), ARGF(n + 3));
-}
-SHIM(CGContextDrawImage) { CGContextDrawImage((CGContextRef)OBJ(0), arg_rect(c, 1), (CGImageRef)OBJ(5)); }
-SHIM(CGContextClearRect) { CGContextClearRect((CGContextRef)OBJ(0), arg_rect(c, 1)); }
-SHIM(CGContextFillRect) { CGContextFillRect((CGContextRef)OBJ(0), arg_rect(c, 1)); }
-SHIM(CGContextFlush) { CGContextFlush((CGContextRef)OBJ(0)); }
-SHIM(CGContextSynchronize) { CGContextSynchronize((CGContextRef)OBJ(0)); }
-SHIM(CGContextSaveGState) { CGContextSaveGState((CGContextRef)OBJ(0)); }
-SHIM(CGContextRestoreGState) { CGContextRestoreGState((CGContextRef)OBJ(0)); }
-SHIM(CGContextScaleCTM) { CGContextScaleCTM((CGContextRef)OBJ(0), ARGF(1), ARGF(2)); }
-SHIM(CGContextTranslateCTM) { CGContextTranslateCTM((CGContextRef)OBJ(0), ARGF(1), ARGF(2)); }
-SHIM(CGContextSetBlendMode) { CGContextSetBlendMode((CGContextRef)OBJ(0), (CGBlendMode)ARG(1)); }
-SHIM(CGContextSetRGBFillColor) { CGContextSetRGBFillColor((CGContextRef)OBJ(0), ARGF(1), ARGF(2), ARGF(3), ARGF(4)); }
-SHIM(CGContextSetShouldAntialias) { CGContextSetShouldAntialias((CGContextRef)OBJ(0), (bool)ARG(1)); }
-
-SHIM(GetCurrentEventTime) { RETF(GetCurrentEventTime()); }
-
-// The game asks which OS it runs on; it answers as the newest system the 32-bit build ever supported.
-SHIM(Gestalt) {
-    u32 sel = ARG(0);
-    i32 v = 0;
-    int ok = 1;
-    switch (sel) {
-        case 'sysv': v = 0x10A6; break;
-        case 'sys1': v = 10; break;
-        case 'sys2': v = 14; break;
-        case 'sys3': v = 6; break;
-        case 'ram ': v = 0x40000000; break;
-        default: ok = 0; break;
-    }
-    if (trace_gl) fprintf(stderr, "[gestalt] %c%c%c%c ok=%d\n", (char)(sel >> 24), (char)(sel >> 16), (char)(sel >> 8), (char)sel, ok);
-    if (ok && ARG(1)) G32(ARG(1)) = (u32)v;
-    RET(ok ? 0 : -5551);
-}
-
 void rt_gl_init(void) { trace_gl = getenv("ARKHAM_TRACE_GL") != NULL; }
 
 const ShimReg rt_shims_gl[] = {
-    R(glGetString) R(glGetStringi) R(glShaderSource) R(glTransformFeedbackVaryings) R(glMapBuffer) R(glMapBufferRange)
+    R(glGetString) R(glGetStringi) R(glGetIntegerv) R(glGetFloatv) R(glGetProgramivARB) R(glGetQueryiv) R(glCheckFramebufferStatus) R(glShaderSource) R(glTransformFeedbackVaryings) R(glMapBuffer) R(glMapBufferRange)
     R(glBindBuffer) R(glBindVertexArray) R(glDeleteBuffers) R(glCompileShader) R(glLinkProgram) R(glFlushMappedBufferRange) R2("_glFlushMappedBufferRangeAPPLE", glFlushMappedBufferRange) R(glUnmapBuffer)
     R(glFenceSync) R(glClientWaitSync) R(glDeleteSync) R(glFinish)
     R(CGLSetCurrentContext) R(CGLLockContext) R(CGLUnlockContext) R(CGLFlushDrawable) R(CGLSetParameter) R(CGLEnable) R(CGLDisable)
     R(CGLClearDrawable) R(CGLGetShareGroup) R(CGLQueryRendererInfo) R(CGLDescribeRenderer) R(CGLDestroyRendererInfo)
-    R(CGMainDisplayID) R(CGGetActiveDisplayList) R(CGDisplayBounds) R(CGDisplayScreenSize) R(CGDisplayIDToOpenGLDisplayMask)
-    R(CGDisplayCopyDisplayMode) R(CGDisplayCopyAllDisplayModes) R(CGDisplayModeGetWidth) R(CGDisplayModeGetHeight)
-    R(CGDisplayModeGetIOFlags) R(CGDisplayModeGetRefreshRate) R(CGDisplayModeCopyPixelEncoding) R(CGDisplayModeRelease)
-    R2("_SetFrontProcess", cg_ok) R2("_CGDisplayRegisterReconfigurationCallback", cg_ok) R2("_CGDisplayRemoveReconfigurationCallback", cg_ok)
-    R2("_CGSetDisplayTransferByTable", cg_ok) R2("_CGDisplayRestoreColorSyncSettings", cg_ok) R(CGGetDisplayTransferByTable)
-    R(CGWindowLevelForKey) R(TISCopyCurrentASCIICapableKeyboardLayoutInputSource) R(TISCopyCurrentASCIICapableKeyboardInputSource) R(TISCopyCurrentKeyboardLayoutInputSource) R(TISCopyCurrentKeyboardInputSource)
-    R(TISGetInputSourceProperty) R(LMGetKbdType) R(Gestalt) R(GetCurrentEventTime)
-    R(CGImageSourceCreateWithData) R(CGImageSourceGetCount) R(CGImageSourceCreateImageAtIndex) R(CGImageGetWidth) R(CGImageGetHeight)
-    R(CGImageGetBitsPerComponent) R(CGImageGetBitsPerPixel) R(CGImageGetBytesPerRow) R(CGImageGetBitmapInfo) R(CGImageGetDataProvider)
-    R(CGDataProviderCopyData) R(CGDataProviderCreateWithCFData) R2("_CGImageRelease", cf_release_any) R2("_CGColorSpaceRelease", cf_release_any)
-    R2("_CGContextRelease", cf_release_any) R(CGColorSpaceCreateDeviceRGB) R(CGColorSpaceCreateDeviceGray) R(CGBitmapContextCreate)
-    R(CGContextDrawImage) R(CGContextClearRect) R(CGContextFillRect) R(CGContextFlush) R(CGContextSynchronize) R(CGContextSaveGState)
-    R(CGContextRestoreGState) R(CGContextScaleCTM) R(CGContextTranslateCTM) R(CGContextSetBlendMode) R(CGContextSetRGBFillColor)
-    R(CGContextSetShouldAntialias)
     {NULL, NULL},
 };

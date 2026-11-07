@@ -752,7 +752,7 @@ SHIM(LSCopyDisplayNameForURL) {
 }
 SHIM(CFBundleCopyAuxiliaryExecutableURL) { RET(cf_wrap(CFBundleCopyAuxiliaryExecutableURL((CFBundleRef)O(0), S(1)))); }
 // Run loops are pumped by the game itself through AppKit; timers registered here don't fire yet.
-SHIM(CFRunLoopGetMain) { RET(cf_wrap(CFRunLoopGetMain())); }
+SHIM(CFRunLoopGetMain) { RET(cf_wrap(rt_guest_main_loop())); }
 SHIM(CFRunLoopGetCurrent) { RET(cf_wrap(CFRunLoopGetCurrent())); }
 // Real run loops and timers; callouts re-enter guest code holding the gate.
 typedef struct { u32 callout, info, handle; } TimerCtx;
@@ -832,7 +832,7 @@ static void net_answer(NetStream *n) {
         rt_call_guest(rt_current_cpu(), n->cb, 3, a);
         if (!held) rt_gate_release();
     });
-    CFRunLoopAddTimer(CFRunLoopGetMain(), t, kCFRunLoopCommonModes);
+    CFRunLoopAddTimer(rt_guest_main_loop(), t, kCFRunLoopCommonModes);
     CFRelease(t);
 }
 SHIM(CFHTTPMessageCreateRequest) { RET(cf_wrap(CFHTTPMessageCreateRequest(NULL, S(1), U(2), S(3)))); }

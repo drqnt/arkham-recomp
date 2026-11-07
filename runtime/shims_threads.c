@@ -314,7 +314,12 @@ SHIM(pthread_create) {
     G32(ARG(0)) = to_tid(t);
     pthread_attr_t attr;
     pthread_attr_init(&attr);
+#if TARGET_OS_IPHONE
+    // The phone's address space is tighter: the 4 GB window leaves about 2 GB in one piece (logs/probe_*.txt).
+    pthread_attr_setstacksize(&attr, 32u << 20);
+#else
     pthread_attr_setstacksize(&attr, 64u << 20);
+#endif
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     // The default class may land on efficiency cores, and the frame rate depends on these threads.
     pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
@@ -570,13 +575,33 @@ static int is_main_queue(u32 q) {
     if (!mq) mq = rt_import_addr("__dispatch_main_q");
     return q == mq;
 }
+#if TARGET_OS_IPHONE
+// The phone's main queue belongs to UIKit, and the game's main thread is another (rt_main): work for it goes to that thread's run loop, which the
+// stand-in NSApplication turns (ios_appkit.m).
+#include <CoreFoundation/CoreFoundation.h>
+static void to_guest_main(DCtx *d, dispatch_semaphore_t done) {
+    CFRunLoopRef loop = rt_guest_main_loop();
+    CFRunLoopPerformBlock(loop, kCFRunLoopCommonModes, ^{
+        main_queue_tramp(d);
+        if (done) dispatch_semaphore_signal(done);
+    });
+    CFRunLoopWakeUp(loop);
+}
+#endif
 static void run_on_main_sync(DCtx *d) {
-    if (pthread_main_np()) {
+    if (rt_on_guest_main()) {
         main_queue_tramp(d);
         return;
     }
     rt_gate_release();
+#if TARGET_OS_IPHONE
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    to_guest_main(d, done);
+    dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+    dispatch_release(done);
+#else
     dispatch_sync_f(dispatch_get_main_queue(), d, main_queue_tramp);
+#endif
     rt_gate_acquire_now();
 }
 // Blocks: {isa, flags, reserved, invoke, descriptor, captures...}; descriptor: {reserved, size, copy, dispose}.
@@ -605,7 +630,11 @@ static u32 block_copy(CPU *c, u32 b) {
 static void run_on_main_async(u32 fn, u32 arg, int is_block) {
     DCtx *d = malloc(sizeof *d);
     *d = (DCtx){fn, arg, is_block, 1};
+#if TARGET_OS_IPHONE
+    to_guest_main(d, NULL);
+#else
     dispatch_async_f(dispatch_get_main_queue(), d, main_queue_tramp);
+#endif
 }
 // ARKHAM_TRACE_DISPATCH: how often each place in the game synchronously waits for the main thread.
 static void note_main_sync(u32 site) {

@@ -146,8 +146,12 @@ SHIM(IOServiceGetMatchingServices) { G32(ARG(2)) = 0; RET(IO_ERROR); }
 #include <objc/message.h>
 static int scripted_mouse;
 SHIM(GetFrontProcess) {
+#if TARGET_OS_IPHONE
+    int active = 1;  // the game only runs while it's on screen
+#else
     id app = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
     int active = scripted_mouse || ((signed char (*)(id, SEL))objc_msgSend)(app, sel_registerName("isActive"));
+#endif
     G32(ARG(0)) = 0;
     G32(ARG(0) + 4) = active ? 2 : 1;  // the current process is {0, 2}
     RET(0);

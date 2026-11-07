@@ -246,7 +246,7 @@ static void start_timer(void) {
         (void)unused;
         tick();
     });
-    CFRunLoopAddTimer(CFRunLoopGetMain(), t, kCFRunLoopCommonModes);
+    CFRunLoopAddTimer(rt_guest_main_loop(), t, kCFRunLoopCommonModes);
     CFRelease(t);
 }
 

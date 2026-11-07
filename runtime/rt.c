@@ -786,8 +786,23 @@ static void *guest_main(void *arg) {
     exit(0);
 }
 
+// The game's main thread and its run loop, where the game's timers, run loop sources and main queue work go. On the Mac that's the process's main
+// thread, as AppKit wants. On the phone UIKit keeps the main thread, so the game's is a thread of its own (rt_main), and "main" means that one.
+#include <CoreFoundation/CoreFoundation.h>
+static CFRunLoopRef guest_loop;
+static pthread_t guest_main_thread;
+CFRunLoopRef rt_guest_main_loop(void) { return guest_loop ? guest_loop : CFRunLoopGetMain(); }
+int rt_on_guest_main(void) { return guest_loop ? pthread_equal(pthread_self(), guest_main_thread) : pthread_main_np(); }
+
 int rt_mtl_prebuild(const char *list);
+#if TARGET_OS_IPHONE
+// Called by the app shell (ios/app) on a thread of its own with a large stack: iOS gives the main thread 1 MB, and UIKit needs it anyway.
+int rt_main(int argc, char **argv) {
+    guest_loop = (CFRunLoopRef)CFRetain(CFRunLoopGetCurrent());
+    guest_main_thread = pthread_self();
+#else
 int main(int argc, char **argv) {
+#endif
     setvbuf(stderr, NULL, _IOLBF, 0);
     if (argc == 3 && !strcmp(argv[1], "--prebuild-shaders")) return rt_mtl_prebuild(argv[2]);
     rt_main_argc = argc;
@@ -795,6 +810,8 @@ int main(int argc, char **argv) {
     gate_init();
     map_guest();
     ht_build();
+    void rt_launcher_skip_install(void);
+    rt_launcher_skip_install();
     rt_heap_init();
     load_image(binary_path());
     // Guest NULL page (one host page) faults on access.
@@ -833,8 +850,8 @@ int main(int argc, char **argv) {
         pthread_detach(t);
     }
 
-    // Guest code runs on the real main thread because AppKit requires it. Translated functions mirror guest
-    // calls on the native stack, so the linker gives the main thread a large one (see tools/build.py).
+    // Guest code runs on the real main thread on the Mac because AppKit requires it. Translated functions mirror guest calls on the native
+    // stack, so the linker gives the main thread a large one (see tools/build.py); on the phone the app shell makes this thread with one.
     guest_main(NULL);
     return 0;
 }

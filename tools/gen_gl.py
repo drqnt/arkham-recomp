@@ -155,7 +155,9 @@ def main():
         rty = {"v": "void", "i": "unsigned int", "f": "float", "d": "double", "iptr": "long"}[rk]
         sig = ", ".join(ctypes) if ctypes else "void"
         call = f"f({', '.join(exprs)})"
-        body = f"static {rty} (*f)({sig}); if (!f) {{ f = dlsym(RTLD_DEFAULT, \"{name}\"); if (!f) {{ gl_missing(\"{name}\"); return; }} }} "
+        # Without the function (the phone has no OpenGL) a value-returning call answers 0 rather than whatever eax held.
+        none = {"v": "", "f": "RETF(0); ", "d": "RETF(0); "}.get(rk, "RET(0); ")
+        body = f"static {rty} (*f)({sig}); if (!f) {{ f = dlsym(RTLD_DEFAULT, \"{name}\"); if (!f) {{ gl_missing(\"{name}\"); {none}return; }} }} "
         if rk == "v":
             body += f"{call};"
         elif rk in ("f", "d"):

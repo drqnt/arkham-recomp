@@ -11,6 +11,9 @@ void rt_bind_cpu(CPU *c);
 u32 rt_call_guest(CPU *c, u32 addr, int nargs, const u32 *args);
 int rt_import_index(const char *name);
 const char *rt_game_root(void);
+// The game's main thread and run loop (rt.c): the process's main thread on the Mac, the game's own thread on the phone.
+struct __CFRunLoop *rt_guest_main_loop(void);
+int rt_on_guest_main(void);
 u32 rt_import_addr(const char *name);
 void rt_gate_acquire(void);
 void rt_gate_acquire_now(void);

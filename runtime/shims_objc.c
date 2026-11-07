@@ -13,6 +13,11 @@ void rt_gl_context_changed(void);
 #include <objc/runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if TARGET_OS_IPHONE
+// AppKit's classes are the stand-ins in ios_appkit.m there, under names of their own.
+Class rt_ios_class(const char *name);
+#define objc_getClass rt_ios_class
+#endif
 
 extern u32 cf_wrap(CFTypeRef o);
 extern CFTypeRef cf_unwrap(u32 g);
@@ -763,6 +768,44 @@ static id game_bundle(void) {
     if (!b) b = ((id(*)(id, SEL, id))objc_msgSend)(CLS("NSBundle"), SELR("bundleWithPath:"), ns_str(game_bundle_path()));
     return b;
 }
+#if TARGET_OS_IPHONE
+// The phone can't load AppKit nibs, so this makes what MainMenu.nib holds: the game's FeralApplication as the delegate, and the menu bar,
+// which the game adds items to. Its actions do nothing there.
+static id menu_item(const char *title, const char *key, unsigned long mods, id submenu) {
+    id i = ((id(*)(id, SEL))objc_msgSend)(CLS("NSMenuItem"), SELR("alloc"));
+    i = ((id(*)(id, SEL, id, SEL, id))objc_msgSend)(i, SELR("initWithTitle:action:keyEquivalent:"), ns_str(title), (SEL)0, ns_str(key));
+    if (mods) ((void (*)(id, SEL, unsigned long))objc_msgSend)(i, SELR("setKeyEquivalentModifierMask:"), mods);
+    if (submenu) ((void (*)(id, SEL, id))objc_msgSend)(i, SELR("setSubmenu:"), submenu);
+    return i;
+}
+static id menu_of(const char *title, id *items, int n) {
+    id m = ((id(*)(id, SEL))objc_msgSend)(CLS("NSMenu"), SELR("alloc"));
+    m = ((id(*)(id, SEL, id))objc_msgSend)(m, SELR("initWithTitle:"), ns_str(title));
+    for (int i = 0; i < n; i++) ((void (*)(id, SEL, id))objc_msgSend)(m, SELR("addItem:"), items[i]);
+    return m;
+}
+static void load_main_nib(id app) {
+    id del = ((id(*)(id, SEL))objc_msgSend)(CLS("FeralApplication"), SELR("alloc"));
+    del = ((id(*)(id, SEL))objc_msgSend)(del, SELR("init"));
+    ((void (*)(id, SEL, id))objc_msgSend)(app, SELR("setDelegate:"), del);
+    id sep = CLS("NSMenuItem");
+    const unsigned long cmd = 1ul << 20, opt = 1ul << 19;
+    id app_items[9] = {
+        menu_item("About FeralGame", "", 0, nil),
+        ((id(*)(id, SEL))objc_msgSend)(sep, SELR("separatorItem")),
+        menu_item("Services", "", 0, menu_of("Services", NULL, 0)),
+        ((id(*)(id, SEL))objc_msgSend)(sep, SELR("separatorItem")),
+        menu_item("Hide FeralGame", "h", cmd, nil),
+        menu_item("Hide Others", "h", cmd | opt, nil),
+        menu_item("Show All", "", 0, nil),
+        ((id(*)(id, SEL))objc_msgSend)(sep, SELR("separatorItem")),
+        menu_item("Quit FeralGame", "q", cmd, nil),
+    };
+    id top[2] = {menu_item("FeralGame", "", 0, menu_of("FeralGame", app_items, 9)), menu_item("Help", "", 0, menu_of("Help", NULL, 0))};
+    ((void (*)(id, SEL, id))objc_msgSend)(app, SELR("setMainMenu:"), menu_of("AMainMenu", top, 2));
+    fprintf(stderr, "[rt] main nib made by hand: delegate %s, menu present\n", del ? "FeralApplication" : "MISSING");
+}
+#else
 // What NSApplicationMain does with the bundle's main nib, including its menu bar.
 static void load_main_nib(id app) {
     char p[1300];
@@ -776,6 +819,7 @@ static void load_main_nib(id app) {
     id menu = ((id(*)(id, SEL))objc_msgSend)(app, SELR("mainMenu"));
     fprintf(stderr, "[rt] main nib %s, menu %s\n", nib ? "loaded" : "NOT loaded", menu ? "present" : "absent");
 }
+#endif
 
 typedef void (*msg_v0)(id, SEL);
 typedef void (*msg_vq)(id, SEL, long);
@@ -1403,6 +1447,30 @@ SHIM(NSApplicationLoad) { RET(1); }
 
 id rt_game_bundle(void) { return game_bundle(); }
 id rt_web_debug_delegate(void) { return web_debug_delegate(); }
+
+// ---------- skipping Feral's launcher ----------
+// The launcher is a web page in a window, run as a modal loop by F_2055740: it shows the window, pumps events until the page's Play stops the loop,
+// hides it, and returns the byte at +0x40 of its object, which Play sets. The phone has no web view to show it in, so there the loop answers at
+// once, as Play would. ARKHAM_SKIP_LAUNCHER=1 does the same on the Mac. It is only ever called through a vtable, so taking its place in the
+// dispatcher's table is enough.
+#define LAUNCHER_MODAL 0x2055740u
+static void launcher_play(CPU *c) {
+    u32 self = G32(c->esp + 4);
+    fprintf(stderr, "[rt] launcher skipped: modal loop of %08x answered as Play, called from %08x\n", self, G32(c->esp));
+    if (self) G8(self + 0x40) = 1;
+    c->eax = 1;
+    c->esp += 4;  // ret: a guest function pops its own return address
+}
+void rt_launcher_skip_install(void) {
+#if TARGET_OS_IPHONE
+    int skip = 1;
+#else
+    int skip = getenv("ARKHAM_SKIP_LAUNCHER") != NULL;
+#endif
+    if (!skip) return;
+    void rt_ht_add(u32 addr, guest_fn fn);
+    rt_ht_add(LAUNCHER_MODAL, launcher_play);
+}
 
 void rt_objc_init(void) {
     trace = getenv("ARKHAM_TRACE_OBJC") != NULL;

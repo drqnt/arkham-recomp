@@ -16,6 +16,7 @@ extern const ShimReg rt_shims_cf[];
 extern const ShimReg rt_shims_objc[];
 void rt_objc_init(void);
 extern const ShimReg rt_shims_gl[];
+extern const ShimReg rt_shims_cg[];
 extern const ShimReg rt_shims_gl_gen[];
 void rt_gl_init(void);
 extern const ShimReg rt_shims_text[];
