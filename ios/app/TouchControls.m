@@ -1261,7 +1261,7 @@ static UIView *gear_view;
     [self choice:@"Ограничение FPS" items:@[@"30", @"60", @"120", @"Без ограничения"] value:cap <= 0 ? 3 : cap <= 30 ? 0 : cap <= 60 ? 1 : 2 action:@selector(capChanged:)];
     [self toggle:@"Без рывков в новых местах" on:setting(@"asyncPipelines", "ARKHAM_ASYNC_PIPELINES", 1) > 0 action:@selector(asyncChanged:)];
     [self toggle:@"Строка FPS и нагрева" on:setting(@"showFPS", "ARKHAM_FPS", 1) > 0 action:@selector(fpsLineChanged:)];
-    [self toggle:@"Metal HUD" on:setting(@"metalHUD", "ARKHAM_METAL_HUD", 0) > 0 action:@selector(hudChanged:)];
+    [self toggle:@"Metal HUD (со следующего запуска)" on:setting(@"metalHUD", "ARKHAM_METAL_HUD", 0) > 0 action:@selector(hudChanged:)];
 
     [self section:@"Кнопки" footer:@"Кнопки светлеют над тёмной картинкой и темнеют над светлой. Глаз в углу прячет их все для скриншота; вернуть — коснуться экрана."];
     [self choice:@"Вид" items:@[@"PlayStation", @"Xbox", @"Иконки"] value:(NSInteger)setting(@"buttonStyle", "ARKHAM_TOUCH_STYLE", STYLE_PS) action:@selector(styleChanged:)];
@@ -1326,17 +1326,17 @@ static UIView *gear_view;
     set_setting(@"showFPS", s.on);
     rt_ios_overlay_enable(s.on);
 }
+// iOS shows Apple's HUD only in an app it was on for from the launch, and doesn't take it away while it runs; so the switch says what the next launch
+// does, and the HUD of this one stays as it is.
 - (void)hudChanged:(UISwitch *)s {
     set_setting(@"metalHUD", s.on);
-    [prefs() setBool:s.on forKey:@"MetalForceHudEnabled"];  // Metal's own key: the HUD on from the next launch
-    rt_set_metal_hud(s.on);
-    if (s.on && !rt_ios_hud_at_launch) {
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Metal HUD"
-                                                                   message:@"Появится со следующего запуска игры: iOS показывает его только в приложении, где он был включён с самого старта."
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:a animated:YES completion:nil];
-    }
+    [prefs() setBool:s.on forKey:@"MetalForceHudEnabled"];  // Metal's own key: the HUD from the next launch
+    if (s.on && rt_ios_hud_at_launch) rt_set_metal_hud(1);   // on in this process from its start: it can show again now
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Metal HUD"
+                                                               message:s.on ? @"Включится при следующем запуске игры." : @"Пропадёт при следующем запуске игры."
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 - (void)asyncChanged:(UISwitch *)s {
     set_setting(@"asyncPipelines", s.on);
