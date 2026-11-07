@@ -76,6 +76,7 @@ struct Obj {
     // shaders
     id<MTLLibrary> lib;
     id<MTLLibrary> all_outputs;  // vertex shaders: the translation that writes every output, for pixel shaders that read more than this one writes
+    char fn[20], all_fn[20];     // the entry functions' names in those: vs_main or ps_main, or s_<hash of the text> in a library built ahead
     D3dShaderInfo info;
     u32 *code;
     char *msl;  // until the first draw that needs it: most shaders the game creates are never drawn with
@@ -528,10 +529,57 @@ static void create_shader(CPU *c, Kind kind, u32 vtable) {  // this, code, out
     G32(ARG(2)) = o->guest;
     RET(0);
 }
-static u64 n_compiled, n_uncached;
+static u64 n_compiled, n_uncached, n_prebuilt;
 static u64 code_hash(Obj *o);
+// ---------- shaders built ahead (tools/build_ios_shaders.py) ----------
+// Libraries of compiled shaders, each function named s_<FNV-1a of its MSL text>: on the phone in Documents/Shaders, or where ARKHAM_SHADER_LIBS says.
+// A shader whose text has such a function needs no compile from source; any other text, a translator changed since among them, is compiled as before.
+static NSDictionary<NSString *, id<MTLLibrary>> *prebuilt;
+static u64 text_hash(const char *s) {
+    u64 h = 0xcbf29ce484222325ull;
+    for (; *s; s++) h = (h ^ (u8)*s) * 0x100000001b3ull;
+    return h ? h : 1;
+}
+static void load_prebuilt(void) {
+    const char *env = getenv("ARKHAM_SHADER_LIBS");
+    NSString *dir = env ? @(env) : nil;
+#if TARGET_OS_IPHONE
+    if (!dir) dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/Shaders"];
+#endif
+    if (!dir) return;
+    double t0 = CACurrentMediaTime();
+    NSMutableDictionary *names = [NSMutableDictionary dictionary];
+    int libs = 0;
+    for (NSString *f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil]) {
+        if (![f hasSuffix:@".metallib"]) continue;
+        NSError *err = nil;
+        id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:[dir stringByAppendingPathComponent:f]] error:&err];
+        if (!lib) {
+            fprintf(stderr, "[mtl] can't open %s: %s\n", f.UTF8String, err.localizedDescription.UTF8String);
+            continue;
+        }
+        libs++;
+        for (NSString *n in lib.functionNames) names[n] = lib;
+        [lib release];  // the dictionary holds it
+    }
+    if (libs) {
+        prebuilt = [names copy];
+        fprintf(stderr, "[mtl] %lu shaders built ahead, in %d libraries, read in %.0f ms\n", (unsigned long)prebuilt.count, libs, (CACurrentMediaTime() - t0) * 1000);
+    }
+}
 // A shader from Metal's cache takes well under a millisecond, and one compiled now about 40. Those are named, as the files in logs/msl are, to see what the prebuild missed.
-static id<MTLLibrary> compile_shader(Obj *o, const char *src, int all_outputs) {
+static id<MTLLibrary> compile_shader(Obj *o, const char *src, int all_outputs, char fn[20]) {
+    snprintf(fn, 20, "%s", o->kind == O_PS ? "ps_main" : "vs_main");
+    if (prebuilt) {
+        char name[20];
+        snprintf(name, sizeof name, "s_%016llx", (unsigned long long)text_hash(src));
+        id<MTLLibrary> lib = prebuilt[@(name)];
+        if (lib) {
+            memcpy(fn, name, sizeof name);
+            n_prebuilt++;
+            return [lib retain];
+        }
+    }
     u64 t0 = mach_absolute_time();
     id<MTLLibrary> lib = compile_msl(src);
     double ms = (double)(mach_absolute_time() - t0) * 125.0 / 3.0 / 1e6;
@@ -543,7 +591,7 @@ static id<MTLLibrary> compile_shader(Obj *o, const char *src, int all_outputs) {
 }
 static id<MTLLibrary> library_of(Obj *o) {
     if (!o->lib && o->msl) {
-        o->lib = compile_shader(o, o->msl, 0);
+        o->lib = compile_shader(o, o->msl, 0, o->fn);
         n_compiled++;
         free(o->msl);
         o->msl = NULL;
@@ -1176,14 +1224,19 @@ static MTLBlendOperation blend_op(u32 v) {
 // A pixel shader can read an output its vertex shader doesn't write, and Metal won't link that. Such a vertex shader gets a second translation that writes all ten, the extra ones as
 // (0, 0, 0, 1), and one is enough for any pixel shader, since a vertex shader may write more than is read. Before, each combination got its own, which tools/prebuild_shaders.sh
 // couldn't know about, and those were most of what stalled in play.
-static id<MTLLibrary> vs_library_for(Obj *vs, u32 needs) {
-    if (!(needs & ~vs->info.varyings)) return library_of(vs);
+static id<MTLLibrary> vs_library_for(Obj *vs, u32 needs, const char **fn) {
+    if (!(needs & ~vs->info.varyings)) {
+        id<MTLLibrary> lib = library_of(vs);
+        *fn = vs->fn;
+        return lib;
+    }
     if (!vs->all_outputs) {
         D3dShaderInfo info;
         char *msl = d3dsh_translate(vs->code, D3DSH_ALL_VARYINGS, &info);
-        vs->all_outputs = msl ? compile_shader(vs, msl, 1) : nil;
+        vs->all_outputs = msl ? compile_shader(vs, msl, 1, vs->all_fn) : nil;
         free(msl);
     }
+    *fn = vs->all_fn;
     return vs->all_outputs;
 }
 static id<MTLRenderPipelineState> pipeline_for(const PipeKey *k, Obj *vs, Obj *ps, Obj *decl) {
@@ -1199,8 +1252,9 @@ static id<MTLRenderPipelineState> pipeline_for(const PipeKey *k, Obj *vs, Obj *p
             [cv setConstantValue:&alpha type:MTLDataTypeBool atIndex:1];
             NSError *err = nil;
             MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor new] autorelease];
-            id<MTLLibrary> vlib = vs_library_for(vs, ps ? ps->info.varyings : 0);
-            d.vertexFunction = [[vlib newFunctionWithName:@"vs_main" constantValues:cv error:&err] autorelease];
+            const char *vfn = "vs_main";
+            id<MTLLibrary> vlib = vs_library_for(vs, ps ? ps->info.varyings : 0, &vfn);
+            d.vertexFunction = [[vlib newFunctionWithName:@(vfn) constantValues:cv error:&err] autorelease];
             if (!d.vertexFunction) fprintf(stderr, "[mtl] vertex function: %s\n", err.localizedDescription.UTF8String);
             // ARKHAM_MTL_CHEAP_PS=1: every pixel shader replaced by one color, so the GPU has almost nothing to shade and a run shows what limits the CPU side.
             static int cheap = -1;
@@ -1212,7 +1266,7 @@ static id<MTLRenderPipelineState> pipeline_for(const PipeKey *k, Obj *vs, Obj *p
             if (cheap && ps) {
                 d.fragmentFunction = cheap_fn;
             } else if (ps && library_of(ps)) {
-                d.fragmentFunction = [[ps->lib newFunctionWithName:@"ps_main" constantValues:cv error:&err] autorelease];
+                d.fragmentFunction = [[ps->lib newFunctionWithName:@(ps->fn) constantValues:cv error:&err] autorelease];
                 if (!d.fragmentFunction) fprintf(stderr, "[mtl] fragment function: %s\n", err.localizedDescription.UTF8String);
             }
             MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
@@ -2749,9 +2803,9 @@ static void note_frame(u64 draws) {
         void rt_thread_cpu_report(char *out, size_t cap, double frames);
         rt_thread_cpu_report(threads, sizeof threads, (double)fps_frames);
         double gpu_ms = (double)atomic_exchange(&gpu_ns, 0) / 1e6 / (double)fps_frames;
-        fprintf(stderr, "[fps] %.1f, worst frame %.1f ms, %llu draws, %llu passes; ms a frame: thread busy %.1f, gpu %.1f, drawable %.2f, waiting for gpu %.2f, engine waiting for queries %.1f; %llu quad clears, %llu not needed, %llu resolves in pass; %llu of %llu shaders compiled in %.0f ms, %llu not from the cache, %u pipelines in %.0f ms; on screen %.1f a second, %llu dropped, longest gap %.1f ms, %.1f ms from present; guest threads, CPU ms a frame: %s\n",
+        fprintf(stderr, "[fps] %.1f, worst frame %.1f ms, %llu draws, %llu passes; ms a frame: thread busy %.1f, gpu %.1f, drawable %.2f, waiting for gpu %.2f, engine waiting for queries %.1f; %llu quad clears, %llu not needed, %llu resolves in pass; %llu of %llu shaders compiled in %.0f ms, %llu not from the cache, %llu built ahead, %u pipelines in %.0f ms; on screen %.1f a second, %llu dropped, longest gap %.1f ms, %.1f ms from present; guest threads, CPU ms a frame: %s\n",
                 fps, (double)fps_worst / 1e6, draws_seen, n_passes / fps_frames, (double)rt_d3dq_busy_ticks * per_frame, gpu_ms, (double)ticks_drawable * per_frame,
-                (double)ticks_inflight * per_frame, (double)ticks_query_wait * per_frame, n_quad_clears / fps_frames, n_skipped_clears / fps_frames, n_resolves_in_pass / fps_frames, n_compiled, n_created, (double)compile_ticks * 125.0 / 3.0 / 1e6, n_uncached, n_pipes, (double)pipe_ticks * 125.0 / 3.0 / 1e6,
+                (double)ticks_inflight * per_frame, (double)ticks_query_wait * per_frame, n_quad_clears / fps_frames, n_skipped_clears / fps_frames, n_resolves_in_pass / fps_frames, n_compiled, n_created, (double)compile_ticks * 125.0 / 3.0 / 1e6, n_uncached, n_prebuilt, n_pipes, (double)pipe_ticks * 125.0 / 3.0 / 1e6,
                 (double)shown / secs, atomic_exchange(&n_not_shown, 0), (double)atomic_exchange(&shown_worst_us, 0) / 1e3, shown ? (double)atomic_exchange(&shown_wait_us, 0) / 1e3 / (double)shown : 0.0, threads);
         rt_d3dq_busy_ticks = ticks_drawable = ticks_inflight = ticks_query_wait = 0;
         n_passes = n_quad_clears = n_skipped_clears = n_resolves_in_pass = 0;
@@ -2948,6 +3002,7 @@ int rt_mtl_on(void) {
 static void start_device(void) {
     if (dev) return;
     dev = MTLCreateSystemDefaultDevice();
+    load_prebuilt();
     queue = [dev newCommandQueueWithMaxCommandBufferCount:64];
     frames_in_flight = dispatch_semaphore_create(TRANSIENT_FRAMES - 1);
     for (int i = 0; i < TRANSIENT_FRAMES; i++) transient[i][0] = [dev newBufferWithLength:TRANSIENT_SIZE options:MTLResourceStorageModeShared];

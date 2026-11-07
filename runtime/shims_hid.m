@@ -194,10 +194,52 @@ static void fake_events(Profile *f) {
     }
     free(copy);
 }
+// ---------- the phone's touch controls (ios/app/TouchControls.m) ----------
+// When no controller is connected, what the player's thumbs do on the screen is a pad of its own, shown to the game as the Xbox one so that its prompts
+// name the buttons drawn. Sticks from -1 to 1 with up positive, triggers from 0 to 1, and a bit for each button, set from the app's main thread.
+static struct {
+    _Atomic float lx, ly, lt, rt;
+    _Atomic u32 buttons;  // 1 << B_SOUTH and the rest, as in the enum above
+    _Atomic int on;
+} touch;
+void rt_touch_pad(float lx, float ly, float lt, float rt, u32 buttons) {
+    atomic_store(&touch.lx, lx);
+    atomic_store(&touch.ly, ly);
+    atomic_store(&touch.lt, lt);
+    atomic_store(&touch.rt, rt);
+    atomic_store(&touch.buttons, buttons);
+}
+void rt_touch_pad_on(int on) { atomic_store(&touch.on, on); }
+// Whether a real controller is connected, for the app to hide its controls.
+int rt_controller_connected(void) {
+    for (GCController *k in GCController.controllers)
+        if (k.extendedGamepad && !k.isSnapshot) return 1;
+    return 0;
+}
+static int read_touch(const Profile *f, const Control *k) {
+    u32 b = atomic_load(&touch.buttons);
+    switch (k->what) {
+        case LX: return stick(f, atomic_load(&touch.lx));
+        case LY: return stick(f, -atomic_load(&touch.ly));
+        case RX: case RY: return stick(f, 0);  // the camera follows swipes as mouse motion instead (rt_touch_look in shims_sys.c)
+        case LT: return clamp((int)(atomic_load(&touch.lt) * 255.0f + 0.5f), 0, 255);
+        case RT: return clamp((int)(atomic_load(&touch.rt) * 255.0f + 0.5f), 0, 255);
+        case HAT: {
+            int up = b >> D_UP & 1, down = b >> D_DOWN & 1, left = b >> D_LEFT & 1, right = b >> D_RIGHT & 1;
+            if (up && right) return 1;
+            if (down && right) return 3;
+            if (down && left) return 5;
+            if (up && left) return 7;
+            return up ? 0 : right ? 2 : down ? 4 : left ? 6 : 8;
+        }
+        default: return (int)(b >> k->what & 1);
+    }
+}
 static void tick(void) {
     if (fake_pad < 0) fake_pad = getenv("ARKHAM_FAKE_PAD") != NULL;
     GCExtendedGamepad *g = nil;
     Profile *want = NULL;
+    int touching = 0;
     if (fake_pad) {
         want = fake_profile();
         fake_events(want);
@@ -215,6 +257,10 @@ static void tick(void) {
             fprintf(stderr, "[pad] disconnected\n");
             pad = nil;
         }
+        if (!g && atomic_load(&touch.on)) {
+            want = &profiles[1];
+            touching = 1;
+        }
     }
     if (shown && shown != want) {
         if (removal_cb) call_game(removal_cb, removal_ctx, 0, g_manager, shown->guest);
@@ -230,7 +276,7 @@ static void tick(void) {
     if (!input_cb) return;
     for (int i = 0; i < want->n; i++) {
         Control *k = &want->controls[i];
-        int v = fake_pad ? k->fake : read_control(want, g, k);
+        int v = fake_pad ? k->fake : touching ? read_touch(want, k) : read_control(want, g, k);
         if (v == k->last) continue;
         k->last = v;
         current = k;

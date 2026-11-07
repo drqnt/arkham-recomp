@@ -218,6 +218,16 @@ static void cap_setup(void) {
 }
 #endif
 
+// The phone's swipes to look around (ios/app/TouchControls.m): motion added to what the game reads as the mouse while it holds the camera, in its points.
+void rt_touch_look(double dx, double dy) {
+    pthread_mutex_lock(&cap_mu);
+    if (cap_active) {
+        cap_dx += dx;
+        cap_dy += dy;
+    }
+    pthread_mutex_unlock(&cap_mu);
+}
+
 // ---------- mouse and keyboard state ----------
 // A scripted test run answers with its own position instead of the player's cursor.
 static double scripted_x, scripted_y;

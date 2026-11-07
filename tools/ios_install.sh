@@ -5,6 +5,7 @@
 #  2. copies the game's Steam folder into the app's Documents, without the French, German, Italian, Spanish and Polish language packs
 #     (0.7 GB of 10): Russian and English stay. Files already there and unchanged are skipped, so running this again is quick.
 #  3. copies Steam's answer, and the cloud saves only if the device has none yet, so saves made on the device are never overwritten.
+#  4. copies the shaders built ahead for the phone, if tools/build_ios_shaders.py has built them.
 # The app must be on the device first: ios/app/run.sh [device] install-only. Nothing here changes the game's folder on the Mac.
 cd "$(dirname "$0")/.." || exit 1
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
@@ -65,5 +66,17 @@ if xcrun devicectl device info files --device "$id" --domain-type appDataContain
 else
   xcrun devicectl device copy to --device "$id" --domain-type appDataContainer --domain-identifier "$bundle" \
     --source logs/ios/steam/cloud --destination "Documents/Steam/cloud" 2>&1 | tail -1 | cut -c1-160
+fi
+echo "4. Shaders built ahead (tools/build_ios_shaders.py)"
+if ls build/ios/shaders/*.metallib > /dev/null 2>&1; then
+  stage=build/ios/stage-shaders
+  rm -rf "$stage" && mkdir -p "$stage/Shaders"
+  ln build/ios/shaders/*.metallib "$stage/Shaders/"
+  xcrun devicectl device copy to --device "$id" --domain-type appDataContainer --domain-identifier "$bundle" \
+    --source "$stage/Shaders" --destination "Documents/Shaders" 2>&1 | grep -i error | cut -c1-160
+  echo "   $(ls "$stage/Shaders" | wc -l | tr -d ' ') libraries, $(du -sh "$stage/Shaders" | cut -f1)"
+  rm -rf "$stage"
+else
+  echo "   none built: tools/build_ios_shaders.py builds them, and without them the phone compiles each shader the first time it's needed"
 fi
 echo "Done. ios/app/run.sh starts the game."

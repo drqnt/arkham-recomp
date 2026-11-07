@@ -215,6 +215,8 @@ static void show_text(UIViewController *vc, NSString *text) {
         return;
     }
     rt_ios_game_view = vc.view;
+    void rt_ios_touch_controls(UIView *over);  // TouchControls.m
+    rt_ios_touch_controls(vc.view);
     // Where Feral's code keeps its settings and caches, as on a Mac; a new app's container may not have them yet.
     NSString *lib = [NSHomeDirectory() stringByAppendingPathComponent:@"Library"];
     for (NSString *d in @[@"Application Support", @"Preferences", @"Caches"])
