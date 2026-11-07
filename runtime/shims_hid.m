@@ -150,15 +150,17 @@ static int hat(GCControllerDirectionPad *d) {
     if (left) return 6;
     return 8;
 }
-// On the phone the game reads its right stick 10 times faster and with no dead zone (BmInput.ini, as shims_libc.c gives it), for the touch controls'
-// swipes. A real controller's stick gets the game's own dead zone back and a tenth of its push, which turns the camera as before. Not in menus, where
-// the game takes the stick as it comes, as its gamepad mouse (DefaultInput.ini, [GFxUI.GamepadMouse]): there it's left as it is.
+// On the phone the game takes its right stick as the mouse (BmInput.ini as shims_libc.c gives it, for the touch controls' swipes): each frame turns the
+// camera by the stick's push times about 18 degrees. A real controller's stick gets a dead zone of 0.15 and a fifth of its push, so that held all the
+// way it turns the camera about 220 degrees a second at 60 frames a second, and the stick's raw axes, read at 5 times, still see all of it. Not in
+// menus, where the game takes the stick as it comes, as its gamepad mouse (DefaultInput.ini, [GFxUI.GamepadMouse]): there it's left as it is.
 int rt_game_holds_cursor(void);  // shims_sys.c: in play
 static float right_stick(float v) {
 #if TARGET_OS_IPHONE
     if (!rt_game_holds_cursor()) return v;
-    if (fabsf(v) < 0.2f) return 0;
-    return v / 10.0f;
+    float a = fabsf(v);
+    if (a < 0.15f) return 0;
+    return copysignf((a - 0.15f) / 0.85f * 0.2f, v);
 #else
     return v;
 #endif
@@ -194,18 +196,41 @@ static Profile *fake_profile(void) {
     const char *t = getenv("ARKHAM_FAKE_PAD_TYPE");
     return t && !strcmp(t, "ps") ? &profiles[0] : &profiles[1];
 }
+// Each of ARKHAM_FAKE_PAD's events is applied once, when its time comes, so that a scripted run's "pad" steps (shims_objc.c, on the script's own
+// clock) aren't undone by an earlier event on the next tick.
 static void fake_events(Profile *f) {
-    const char *spec = getenv("ARKHAM_FAKE_PAD");
-    double now = CFAbsoluteTimeGetCurrent() - started;
-    char *copy = strdup(spec), *save = NULL;
-    for (char *item = strtok_r(copy, ",", &save); item; item = strtok_r(NULL, ",", &save)) {
-        double t;
-        int page, usage, value;
-        if (sscanf(item, "%lf:%d:%d:%d", &t, &page, &usage, &value) != 4 || t > now) continue;
-        for (int i = 0; i < f->n; i++)
-            if (f->controls[i].page == page && f->controls[i].usage == usage) f->controls[i].fake = value;
+    static struct { double t; int page, usage, value, done; } *items;
+    static int n_items = -1;
+    if (n_items < 0) {
+        n_items = 0;
+        char *copy = strdup(getenv("ARKHAM_FAKE_PAD")), *save = NULL;
+        for (char *item = strtok_r(copy, ",", &save); item; item = strtok_r(NULL, ",", &save)) {
+            double t;
+            int page, usage, value;
+            if (sscanf(item, "%lf:%d:%d:%d", &t, &page, &usage, &value) != 4) continue;
+            items = realloc(items, sizeof *items * (size_t)(n_items + 1));
+            items[n_items].t = t;
+            items[n_items].page = page;
+            items[n_items].usage = usage;
+            items[n_items].value = value;
+            items[n_items++].done = 0;
+        }
+        free(copy);
     }
-    free(copy);
+    double now = CFAbsoluteTimeGetCurrent() - started;
+    for (int j = 0; j < n_items; j++) {
+        if (items[j].done || items[j].t > now) continue;
+        items[j].done = 1;
+        for (int i = 0; i < f->n; i++)
+            if (f->controls[i].page == items[j].page && f->controls[i].usage == items[j].usage) f->controls[i].fake = items[j].value;
+    }
+}
+// A scripted run's "pad" step: one control of the pad with no hardware set now.
+void rt_fake_pad_set(int page, int usage, int value) {
+    Profile *f = fake_profile();
+    for (int i = 0; i < f->n; i++)
+        if (f->controls[i].page == page && f->controls[i].usage == usage) f->controls[i].fake = value;
+    fprintf(stderr, "[pad] scripted %d:%d = %d\n", page, usage, value);
 }
 // ---------- the phone's touch controls (ios/app/TouchControls.m) ----------
 // When no controller is connected, what the player's thumbs do on the screen is a pad of its own, shown to the game as the Xbox one so that its prompts

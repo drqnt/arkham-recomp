@@ -1241,8 +1241,56 @@ static id<MTLLibrary> vs_library_for(Obj *vs, u32 needs, const char **fn) {
     *fn = vs->all_fn;
     return vs->all_outputs;
 }
+static u64 n_pipe_waits;  // draws left out a frame because their pipeline was still being built
+#if TARGET_OS_IPHONE
+// On the phone a pipeline the system hasn't compiled before takes the GPU's compiler 4 ms on average and up to a hundred, and a new place asks for
+// dozens at once: the game stopped for a third of a second at a time. So a new one is built off the D3D thread, several at once, and the frame waits
+// for it only briefly: one compiled before comes back from the system's cache in a fraction of a millisecond. One that doesn't come in time leaves its
+// draw out of that frame (a thing appears a frame or a few later, the first time a place is seen), and is there from the next frame it's ready.
+// The settings can turn this off (rt_set_async_pipelines), and so can ARKHAM_SYNC_PIPELINES=1.
+static _Atomic int async_pipelines = -1;
+static u64 frame_wait_ns;
+#define PIPE_WAIT_NS 2000000ull        // for one pipeline
+#define PIPE_FRAME_WAIT_NS 4000000ull  // for all of a frame's
+void rt_set_async_pipelines(int on) { atomic_store(&async_pipelines, on && !getenv("ARKHAM_SYNC_PIPELINES")); }
+static id<MTLRenderPipelineState> build_in_background(PipeEntry *e, MTLRenderPipelineDescriptor *d, MTLFunctionConstantValues *cv, id<MTLLibrary> vlib,
+                                                      NSString *vname, id<MTLLibrary> plib, NSString *pname, id<MTLFunction> fixed_ps) {
+    static dispatch_queue_t q;
+    if (!q) q = dispatch_queue_create("arkham.pipelines", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INITIATED, 0));
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    dispatch_async(q, ^{
+        void *pool = objc_autoreleasePoolPush();
+        u64 t0 = mach_absolute_time();
+        NSError *err = nil;
+        d.vertexFunction = [[vlib newFunctionWithName:vname constantValues:cv error:&err] autorelease];
+        if (!d.vertexFunction) fprintf(stderr, "[mtl] vertex function: %s\n", err.localizedDescription.UTF8String);
+        if (fixed_ps) {
+            d.fragmentFunction = fixed_ps;
+        } else if (plib) {
+            d.fragmentFunction = [[plib newFunctionWithName:pname constantValues:cv error:&err] autorelease];
+            if (!d.fragmentFunction) fprintf(stderr, "[mtl] fragment function: %s\n", err.localizedDescription.UTF8String);
+        }
+        id<MTLRenderPipelineState> st = d.vertexFunction ? [dev newRenderPipelineStateWithDescriptor:d error:&err] : nil;
+        if (!st && d.vertexFunction) fprintf(stderr, "[mtl] pipeline: %s\n", err.localizedDescription.UTF8String);
+        __atomic_add_fetch(&pipe_ticks, mach_absolute_time() - t0, __ATOMIC_RELAXED);
+        __atomic_store_n((void **)&e->state, (void *)st, __ATOMIC_RELEASE);
+        dispatch_semaphore_signal(done);
+        objc_autoreleasePoolPop(pool);
+    });
+    u64 left = frame_wait_ns < PIPE_FRAME_WAIT_NS ? PIPE_FRAME_WAIT_NS - frame_wait_ns : 0, t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (left) dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)MIN(left, PIPE_WAIT_NS)));
+    frame_wait_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    dispatch_release(done);
+    id<MTLRenderPipelineState> st = (id)__atomic_load_n((void **)&e->state, __ATOMIC_ACQUIRE);
+    if (!st) n_pipe_waits++;
+    return st;
+}
+#endif
 static id<MTLRenderPipelineState> pipeline_for(const PipeKey *k, Obj *vs, Obj *ps, Obj *decl) {
     if (!pipes) pipes = calloc(PIPES, sizeof *pipes);
+#if TARGET_OS_IPHONE
+    if (atomic_load(&async_pipelines) < 0) atomic_store(&async_pipelines, !getenv("ARKHAM_SYNC_PIPELINES"));
+#endif
     u64 h = hash_bytes(k, sizeof *k);
     for (u32 i = (u32)h % PIPES, tries = 0; tries < PIPES; i = (i + 1) % PIPES, tries++) {
         if (!pipes[i].state && !pipes[i].key.vs) {
@@ -1256,8 +1304,7 @@ static id<MTLRenderPipelineState> pipeline_for(const PipeKey *k, Obj *vs, Obj *p
             MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor new] autorelease];
             const char *vfn = "vs_main";
             id<MTLLibrary> vlib = vs_library_for(vs, ps ? ps->info.varyings : 0, &vfn);
-            d.vertexFunction = [[vlib newFunctionWithName:@(vfn) constantValues:cv error:&err] autorelease];
-            if (!d.vertexFunction) fprintf(stderr, "[mtl] vertex function: %s\n", err.localizedDescription.UTF8String);
+            NSString *vname = @(vfn), *pname = nil;
             // ARKHAM_MTL_CHEAP_PS=1: every pixel shader replaced by one color, so the GPU has almost nothing to shade and a run shows what limits the CPU side.
             static int cheap = -1;
             static id<MTLFunction> cheap_fn;
@@ -1265,11 +1312,13 @@ static id<MTLRenderPipelineState> pipeline_for(const PipeKey *k, Obj *vs, Obj *p
                 cheap = getenv("ARKHAM_MTL_CHEAP_PS") != NULL;
                 if (cheap) cheap_fn = [compile_msl("#include <metal_stdlib>\nfragment float4 cheap_ps() { return float4(0.5, 0.5, 0.5, 1.0); }\n") newFunctionWithName:@"cheap_ps"];
             }
+            id<MTLFunction> fixed_ps = nil;
+            id<MTLLibrary> plib = nil;
             if (cheap && ps) {
-                d.fragmentFunction = cheap_fn;
+                fixed_ps = cheap_fn;
             } else if (ps && library_of(ps)) {
-                d.fragmentFunction = [[ps->lib newFunctionWithName:@(ps->fn) constantValues:cv error:&err] autorelease];
-                if (!d.fragmentFunction) fprintf(stderr, "[mtl] fragment function: %s\n", err.localizedDescription.UTF8String);
+                plib = ps->lib;
+                pname = @(ps->fn);
             }
             MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
             u32 buffers_used = 0;
@@ -1332,16 +1381,31 @@ static id<MTLRenderPipelineState> pipeline_for(const PipeKey *k, Obj *vs, Obj *p
                 d.depthAttachmentPixelFormat = (MTLPixelFormat)k->depth;
                 if (k->depth == MTLPixelFormatDepth32Float_Stencil8) d.stencilAttachmentPixelFormat = (MTLPixelFormat)k->depth;
             }
+            pipes[i].key = *k;  // taken: until it's built, a draw that needs it is left out
+            n_pipes++;
+#if TARGET_OS_IPHONE
+            if (atomic_load(&async_pipelines)) return build_in_background(&pipes[i], d, cv, vlib, vname, plib, pname, fixed_ps);
+#endif
             u64 pipe_t0 = mach_absolute_time();
+            d.vertexFunction = [[vlib newFunctionWithName:vname constantValues:cv error:&err] autorelease];
+            if (!d.vertexFunction) fprintf(stderr, "[mtl] vertex function: %s\n", err.localizedDescription.UTF8String);
+            if (fixed_ps) {
+                d.fragmentFunction = fixed_ps;
+            } else if (plib) {
+                d.fragmentFunction = [[plib newFunctionWithName:pname constantValues:cv error:&err] autorelease];
+                if (!d.fragmentFunction) fprintf(stderr, "[mtl] fragment function: %s\n", err.localizedDescription.UTF8String);
+            }
             id<MTLRenderPipelineState> st = [dev newRenderPipelineStateWithDescriptor:d error:&err];
             pipe_ticks += mach_absolute_time() - pipe_t0;
             if (!st) fprintf(stderr, "[mtl] pipeline: %s\n", err.localizedDescription.UTF8String);
-            pipes[i].key = *k;
             pipes[i].state = st;
-            n_pipes++;
             return st;
         }
-        if (!memcmp(&pipes[i].key, k, sizeof *k)) return pipes[i].state;
+        if (!memcmp(&pipes[i].key, k, sizeof *k)) {
+            id<MTLRenderPipelineState> st = (id)__atomic_load_n((void **)&pipes[i].state, __ATOMIC_ACQUIRE);
+            if (!st) n_pipe_waits++;
+            return st;
+        }
     }
     return nil;
 }
@@ -2830,9 +2894,9 @@ static void note_frame(u64 draws) {
         void rt_thread_cpu_report(char *out, size_t cap, double frames);
         rt_thread_cpu_report(threads, sizeof threads, (double)fps_frames);
         double gpu_ms = (double)atomic_exchange(&gpu_ns, 0) / 1e6 / (double)fps_frames;
-        fprintf(stderr, "[fps] %.1f, worst frame %.1f ms, %llu draws, %llu passes; ms a frame: thread busy %.1f, gpu %.1f, drawable %.2f, waiting for gpu %.2f, engine waiting for queries %.1f; %llu quad clears, %llu not needed, %llu resolves in pass; %llu of %llu shaders compiled in %.0f ms, %llu not from the cache, %llu built ahead, %u pipelines in %.0f ms; on screen %.1f a second, %llu dropped, longest gap %.1f ms, %.1f ms from present; guest threads, CPU ms a frame: %s\n",
+        fprintf(stderr, "[fps] %.1f, worst frame %.1f ms, %llu draws, %llu passes; ms a frame: thread busy %.1f, gpu %.1f, drawable %.2f, waiting for gpu %.2f, engine waiting for queries %.1f; %llu quad clears, %llu not needed, %llu resolves in pass; %llu of %llu shaders compiled in %.0f ms, %llu not from the cache, %llu built ahead, %u pipelines in %.0f ms (%llu draws left out waiting for one); on screen %.1f a second, %llu dropped, longest gap %.1f ms, %.1f ms from present; guest threads, CPU ms a frame: %s\n",
                 fps, (double)fps_worst / 1e6, draws_seen, n_passes / fps_frames, (double)rt_d3dq_busy_ticks * per_frame, gpu_ms, (double)ticks_drawable * per_frame,
-                (double)ticks_inflight * per_frame, (double)ticks_query_wait * per_frame, n_quad_clears / fps_frames, n_skipped_clears / fps_frames, n_resolves_in_pass / fps_frames, n_compiled, n_created, (double)compile_ticks * 125.0 / 3.0 / 1e6, n_uncached, n_prebuilt, n_pipes, (double)pipe_ticks * 125.0 / 3.0 / 1e6,
+                (double)ticks_inflight * per_frame, (double)ticks_query_wait * per_frame, n_quad_clears / fps_frames, n_skipped_clears / fps_frames, n_resolves_in_pass / fps_frames, n_compiled, n_created, (double)compile_ticks * 125.0 / 3.0 / 1e6, n_uncached, n_prebuilt, n_pipes, (double)pipe_ticks * 125.0 / 3.0 / 1e6, n_pipe_waits,
                 (double)shown / secs, atomic_exchange(&n_not_shown, 0), (double)atomic_exchange(&shown_worst_us, 0) / 1e3, shown ? (double)atomic_exchange(&shown_wait_us, 0) / 1e3 / (double)shown : 0.0, threads);
         rt_d3dq_busy_ticks = ticks_drawable = ticks_inflight = ticks_query_wait = 0;
         n_passes = n_quad_clears = n_skipped_clears = n_resolves_in_pass = 0;
@@ -2843,6 +2907,7 @@ static void note_frame(u64 draws) {
 #endif
         fps_start = now;
         fps_frames = 0;
+        n_pipe_waits = 0;
         fps_worst = 0;
     }
     rt_hitch_tick();
@@ -2937,7 +3002,9 @@ static void sample_luma(void) {
         atomic_store(&luma_busy, 0);
     }];
 }
-// A picture of the next finished frame in Documents/Shots/<name>.png, written off the game's threads once the GPU has it, so the game doesn't wait.
+#endif
+// A picture of the next finished frame in <name>.png, written off the game's threads once the GPU has it, so the game doesn't wait: on the phone in
+// Documents/Shots, on the Mac in ARKHAM_SHOTS or logs/shots (a scripted run's "shot" step, shims_objc.c).
 static _Atomic(char *) shot_wanted;
 void rt_request_snapshot(const char *name) { free(atomic_exchange(&shot_wanted, strdup(name))); }
 static void take_snapshot(void) {
@@ -2958,16 +3025,20 @@ static void take_snapshot(void) {
         (void)done;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             char dir[1024], path[1200];
+#if TARGET_OS_IPHONE
             snprintf(dir, sizeof dir, "%s/Documents/Shots", getenv("HOME"));
+#else
+            snprintf(dir, sizeof dir, "%s", getenv("ARKHAM_SHOTS") ? getenv("ARKHAM_SHOTS") : "logs/shots");
+#endif
             mkdir(dir, 0755);
             snprintf(path, sizeof path, "%s/%s.png", dir, name);
             write_png((u8 *)buf.contents, w, h, path);
+            fprintf(stderr, "[snap] wrote %s\n", path);
             [buf release];
             free(name);
         });
     }];
 }
-#endif
 // ARKHAM_PREBUILD_IN_GAME=list: the same as --prebuild-shaders, but from the running game once its window is up, then quits. With Apple's Metal HUD on, Metal files compiled
 // shaders under another key, so the HUD's side of the cache can only be filled from a game whose HUD is showing. tools/prebuild_shaders.sh does this when config.local has it.
 static void m_Present(CPU *c) {
@@ -2999,11 +3070,9 @@ static void m_Present(CPU *c) {
         save_png(back_buffer->tex, path);
     }
 #if TARGET_OS_IPHONE
-    if (back_buffer) {
-        sample_luma();
-        take_snapshot();
-    }
+    if (back_buffer) sample_luma();
 #endif
+    if (back_buffer) take_snapshot();
     {
         static double map_at = -1;
         static u64 map_start;
@@ -3084,6 +3153,9 @@ static void m_Present(CPU *c) {
     }];
     commit_cb();
     frame_no++;
+#if TARGET_OS_IPHONE
+    frame_wait_ns = 0;
+#endif
     note_frame(n_draws);
     n_draws = 0;
     fxaa_done = 0;

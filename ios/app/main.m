@@ -16,6 +16,8 @@
 #include <os/proc.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 extern UIView *rt_ios_game_view;
@@ -48,14 +50,37 @@ static void settings(void) {
 // ---------- the log ----------
 // The game's stderr goes both where it went (the Mac's console when started from there) and to Documents/Logs/run.txt, for the runs
 // nobody is watching.
+// In the file each line starts with the seconds since the process started, for seeing where time goes, at start above all.
 static int log_fd = -1, console_fd = -1;
 static dispatch_semaphore_t log_drained;
+static double process_started;  // seconds, on the clock below
+static double now_seconds(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + tv.tv_usec / 1e6;
+}
 static void *log_pump(void *arg) {
     int in = (int)(intptr_t)arg;
-    char buf[16384];
+    char buf[16384], out[sizeof buf * 2];
+    int line_start = 1;
     for (ssize_t n; (n = read(in, buf, sizeof buf)) > 0;) {
         if (console_fd >= 0) write(console_fd, buf, (size_t)n);
-        if (log_fd >= 0) write(log_fd, buf, (size_t)n);
+        if (log_fd < 0) continue;
+        size_t o = 0;
+        double t = now_seconds() - process_started;
+        for (ssize_t i = 0; i < n; i++) {
+            if (line_start) {
+                o += (size_t)snprintf(out + o, 16, "%7.2f ", t);
+                line_start = 0;
+            }
+            out[o++] = buf[i];
+            if (buf[i] == '\n') line_start = 1;
+            if (o > sizeof out - 32) {
+                write(log_fd, out, o);
+                o = 0;
+            }
+        }
+        write(log_fd, out, o);
     }
     dispatch_semaphore_signal(log_drained);
     return NULL;
@@ -70,6 +95,11 @@ static void finish_log(void) {
     dispatch_semaphore_wait(log_drained, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC));
 }
 static void start_log(void) {
+    // When the process started, from the kernel: what came before main() (loading the app, its 300 MB of code) counts too.
+    struct kinfo_proc kp;
+    size_t len = sizeof kp;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    process_started = sysctl(mib, 4, &kp, &len, NULL, 0) == 0 ? (double)kp.kp_proc.p_starttime.tv_sec + kp.kp_proc.p_starttime.tv_usec / 1e6 : now_seconds();
     NSString *dir = [documents() stringByAppendingPathComponent:@"Logs"];
     [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *run = [dir stringByAppendingPathComponent:@"run.txt"], *prev = [dir stringByAppendingPathComponent:@"run.previous.txt"];

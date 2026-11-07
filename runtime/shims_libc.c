@@ -662,16 +662,17 @@ static int trace_fs_early(void) { return getenv("ARKHAM_TRACE_FS") != NULL; }
 // - bSmoothFrameRate, the engine's own frame limit at MaxSmoothedFrameRate (62), off unless ARKHAM_FRAME_LIMIT=1 (rt_no_frame_limit); a first start
 //   on a new machine writes it on. ARKHAM_FPS_CAP is the runtime's own limit.
 extern int rt_no_frame_limit;
-#if TARGET_OS_IPHONE
-// The input settings on the phone (BaseInput.ini, DefaultInput.ini, BmInput.ini, UserInput.ini), as the engine reads them with open(): everything the
-// right stick feeds (aTurn and aLookup, which turn the camera, and the game's own raw aRawRHJoyRight and aRawRHJoyUp) at Speed=10 instead of 1 and
-// without the game's dead zone, so that swipes, which reach the game as that stick (ios/app/TouchControls.m), can turn the camera as far as a thumb
-// moves. A real controller's right stick is given back its dead zone and a tenth of its push in shims_hid.m, so it turns as it always did.
-// The text keeps its length, since the engine may take the size from stat(), and the speed is set, not multiplied, since the engine writes what it
-// read back into BmInput.ini, which is then read again at the next start.
-#define RIGHT_STICK_SPEED 10.0
+// The input settings on the phone (BaseInput.ini, DefaultInput.ini, BmInput.ini, UserInput.ini), as the engine reads them with open(): the right
+// stick's turning (aTurn, aLookup) goes to the mouse's axes (aMouseX, aMouseY) at STICK_MOUSE_SPEED, and the engine's mouse smoothing is off.
+// The game takes the stick as a joystick, with an acceleration of its own and the camera's own ideas while walking, so swipes (ios/app/TouchControls.m),
+// which reach it as that stick, felt like one. As the mouse, a frame turns the camera by exactly what came in that frame, while walking too. The mouse
+// itself can't do it: the game drops it while a pad's stick is held, and walking holds one. Scripted runs on the Mac showed all of it (docs/IOS_PORT.md).
+// The stick's raw axes (aRawRHJoyRight, aRawRHJoyUp, which some gadgets read) get Speed=5 against the fifth of its push a real controller is given in
+// shims_hid.m, and no dead zone. The text keeps its length, since the engine may take the size from stat(), and values are set, not multiplied, since
+// the engine writes what it read back into BmInput.ini, which is then read again at the next start. On the Mac only with ARKHAM_RIGHT_STICK_MOUSE.
+#define STICK_MOUSE_SPEED 600
 static const char *right_stick_axis(const char *q, const char *end) {
-    static const char *const names[] = {"Axis aTurn ", "Axis aLookup ", "Axis aRawRHJoyRight ", "Axis aRawRHJoyUp "};
+    static const char *const names[] = {"Axis aTurn ", "Axis aLookup ", "Axis aRawRHJoyRight ", "Axis aRawRHJoyUp ", "Axis aMouseX ", "Axis aMouseY "};
     for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
         size_t n = strlen(names[i]);
         if ((size_t)(end - q) > n && !strncmp(q, names[i], n)) return q;
@@ -690,12 +691,37 @@ static int set_field(char *cmd, char *cmd_end, const char *name, const char *val
     memcpy(v, value, vl);
     return 1;
 }
+static double stick_mouse_speed(void) {
+    const char *v = getenv("ARKHAM_RIGHT_STICK_MOUSE");
+    if (v && *v) return atof(v);
+#if TARGET_OS_IPHONE
+    return STICK_MOUSE_SPEED;
+#else
+    return 0;
+#endif
+}
+// A whole command replaced by another no longer than it, padded with spaces to its length.
+static int set_command(char *cmd, char *cmd_end, const char *text) {
+    size_t room = (size_t)(cmd_end - cmd), n = strlen(text);
+    if (n > room) return 0;
+    memset(cmd, ' ', room);
+    memcpy(cmd, text, n);
+    return 1;
+}
 static int right_stick_rewrite(char *text, size_t len) {
     int changed = 0;
+    double mouse = stick_mouse_speed();
     char *end_all = text + len;
     for (char *line = text; line < end_all;) {
         char *nl = memchr(line, '\n', (size_t)(end_all - line));
         char *line_end = nl ? nl : end_all;
+        // With the stick on the mouse's axes, the engine's mouse smoothing off: it spreads a mouse's samples over the frames between them, and took most
+        // of a stick's turning away, which counts no samples. Then each frame turns the camera by exactly what came in that frame.
+        static const char smoothing[] = "bEnableMouseSmoothing=true";
+        if (mouse > 0 && (size_t)(line_end - line) >= sizeof smoothing - 1 && !strncmp(line, smoothing, sizeof smoothing - 1)) {
+            memcpy(line + 22, "0   ", 4);
+            changed++;
+        }
         if (memmem(line, (size_t)(line_end - line), "XboxTypeS_RightX", 16) || memmem(line, (size_t)(line_end - line), "XboxTypeS_RightY", 16)) {
             for (char *q = line; q < line_end; q++) {
                 if (!right_stick_axis(q, line_end)) continue;
@@ -703,8 +729,15 @@ static int right_stick_rewrite(char *text, size_t len) {
                 while (cmd_end < line_end && *cmd_end != '|' && *cmd_end != '"') cmd_end++;
                 char *sp = memmem(q, (size_t)(cmd_end - q), "Speed=", 6);
                 int neg = sp && sp[6] == '-';
-                changed += set_field(q, cmd_end, "Speed=", neg ? "-10" : "10");
-                set_field(q, cmd_end, "DeadZone=", "0");
+                int x = !strncmp(q, "Axis aTurn ", 11) || !strncmp(q, "Axis aMouseX ", 13), y = !strncmp(q, "Axis aLookup ", 13) || !strncmp(q, "Axis aMouseY ", 13);
+                if (x || y) {
+                    char cmd[64];
+                    snprintf(cmd, sizeof cmd, "Axis %s Speed=%s%g DeadZone=0", x ? "aMouseX" : "aMouseY", neg ? "-" : "", mouse);
+                    changed += set_command(q, cmd_end, cmd);
+                } else {
+                    changed += set_field(q, cmd_end, "Speed=", neg ? "-5" : "5");
+                    set_field(q, cmd_end, "DeadZone=", "0");
+                }
                 q = cmd_end;
             }
         }
@@ -732,7 +765,7 @@ static int input_ini_file(const char *path) {
         got += (size_t)r;
     }
     close(in);
-    int changed = got == size ? right_stick_rewrite(text, size) : 0;
+    int changed = got == size && stick_mouse_speed() > 0 ? right_stick_rewrite(text, size) : 0;
     int fd = -1;
     if (changed) {
         const char *dir = getenv("TMPDIR");
@@ -748,13 +781,12 @@ static int input_ini_file(const char *path) {
         }
         static int told;
         if (fd >= 0 && told++ < 8)
-            fprintf(stderr, "[input] the engine reads %s with %d right-stick axes at Speed=%g and no dead zone\n", strrchr(path, '/') ? strrchr(path, '/') + 1 : path,
-                    changed, RIGHT_STICK_SPEED);
+            fprintf(stderr, "[input] the engine reads %s with the right stick on the mouse's axes at %g a frame, mouse smoothing off\n",
+                    strrchr(path, '/') ? strrchr(path, '/') + 1 : path, stick_mouse_speed());
     }
     free(text);
     return fd;
 }
-#endif
 static FILE *language_ini(const char *path, const char *mode) {
     static const char *const codes[][2] = {{"en", "int"}, {"fr", "fra"}, {"de", "deu"}, {"it", "ita"}, {"es", "esn"}, {"pl", "pol"}, {"ru", "rus"}};
     static const char tail[] = "/BmEngine.ini";
@@ -854,9 +886,7 @@ static int language_file(const char *path) {
 SHIM(open) {
     int fd = language_file(GS(ARG(0)));
     CIBUF(0);
-#if TARGET_OS_IPHONE
-    if (fd < 0 && ((int)ARG(1) & O_ACCMODE) == O_RDONLY) fd = input_ini_file(CIP(0));
-#endif
+    if (fd < 0 && ((int)ARG(1) & O_ACCMODE) == O_RDONLY && stick_mouse_speed() > 0) fd = input_ini_file(CIP(0));
     if (fd < 0) fd = open(CIP(0), (int)ARG(1), (int)ARG(2));
     if (fd < 0) set_errno();
     TFS("open", GS(ARG(0)), fd);

@@ -1152,7 +1152,10 @@ static void auto_play_schedule(void) {
     CFRelease(t);
 }
 // Debug aid: scripted input for test runs. ARKHAM_INPUT="40:key:36,45:click:900:600,50:move:10:10" posts real AppKit events
-// at those seconds after launch. Coordinates are points from the window's top left corner.
+// at those seconds after launch. Coordinates are points from the window's top left corner. "50:shot:3" saves the next frame as logs/shots/shot-3.png,
+// and "50:pad:49:0" sets an axis of the pad with no hardware (ARKHAM_FAKE_PAD; page 1, usage 49 is the left stick's Y on the PlayStation one).
+void rt_request_snapshot(const char *name);  // mtl_device.m
+void rt_fake_pad_set(int page, int usage, int value);  // shims_hid.m
 void rt_set_scripted_mouse(double x, double y);
 static id script_window(void) {
     id app = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), SELR("sharedApplication"));
@@ -1261,9 +1264,17 @@ static void input_schedule(void) {
         if (sscanf(item, "%lf:%15[a-z]:%lf:%lf", &secs, kind, &x, &y) < 3) continue;
         int is_key = !strcmp(kind, "key"), is_click = !strcmp(kind, "click");
         int is_down = !strcmp(kind, "down"), is_up = !strcmp(kind, "up"), is_look = !strcmp(kind, "look"), is_quit = !strcmp(kind, "quit"), is_press = !strcmp(kind, "press"), is_cmdq = !strcmp(kind, "cmdq");
+        int is_shot = !strcmp(kind, "shot"), is_pad = !strcmp(kind, "pad");
         CFRunLoopTimerRef t = CFRunLoopTimerCreateWithHandler(NULL, start + secs, 0, 0, 0, ^(CFRunLoopTimerRef tt) {
             (void)tt;
-            if (is_press) {
+            if (is_pad) {
+                rt_fake_pad_set(1, (int)x, (int)y);
+            } else if (is_shot) {
+                char name[32];
+                snprintf(name, sizeof name, "shot-%d", (int)x);
+                rt_request_snapshot(name);
+                fprintf(stderr, "[input] shot %d\n", (int)x);
+            } else if (is_press) {
                 script_press();
             } else if (is_cmdq) {
                 fprintf(stderr, "[input] cmd-q\n");

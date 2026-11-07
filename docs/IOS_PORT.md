@@ -206,3 +206,29 @@ app goes to the background.
 - **Not shaders:** the lags at level loads, turns and fights come from pipelines. In the first long session, all 591 shaders came from the
   prebuilt libraries (0 ms compiling), but 1,280 pipeline states took 4.7 s to create: the driver's final compile for this GPU, on first use. They
   came in bursts of 30 to 100, as frames of 100 to 380 ms.
+
+## Controls v5: the camera through the mouse's axes, pipelines off the game's thread, 2026-11-07
+
+- **Why swipes felt like a joystick.** The game takes the right stick through its own joystick handling, with acceleration and the camera's own
+  ideas while walking. The mouse turns the camera directly, but the game drops the mouse while a pad's stick is held, and walking holds one.
+  Scripted runs on the Mac (`tools/walk.sh` with the new `pad`, `shot` and `look` steps, and `ARKHAM_FAKE_PAD`) showed it:
+  - standing, 20 mouse moves of 40 points turned the camera about 180 degrees;
+  - the same moves while the pad walked turned nothing;
+  - the pad's right stick bound to the mouse's axis (`aMouseX`) turned the camera while walking too.
+- **How the camera works now.** On the phone, `shims_libc.c` rewrites every `*Input.ini` as the engine opens it:
+  - the right stick's `aTurn`/`aLookup` become `aMouseX`/`aMouseY` at Speed 600, with no dead zone;
+  - the stick's raw axes get Speed 5;
+  - `bEnableMouseSmoothing` is off. It had taken most of a stick's turning, which counts no mouse samples.
+- **Measured on the Mac.** The mouse axis is applied once a frame: about 0.0305 degrees per unit, so 18.3 degrees a frame at the full push.
+  The same push turned 2.5 times less at 60 FPS than at 155.
+- **What a swipe sends.** `TouchControls.m` sends the thumb's speed divided by the game's measured frame rate. The camera then turns 0.284 degrees
+  per point at speed 1 (about 270 degrees across the screen's width), at any speed or frame rate.
+- **Directions.** A thumb going up looks up; the game's own default is inverted (stick up looks down), and a setting inverts it back.
+- **A real controller** on the phone gets a 0.15 dead zone and a fifth of its push. That turns about 220 degrees a second at 60 FPS, and the raw
+  axes (Speed 5) still see all of it.
+- **Careful:** the engine writes the input settings it read back into `MacInit/BmInput.ini`. A run on the Mac with `ARKHAM_RIGHT_STICK_MOUSE`
+  leaves the Mac's game with the stick on the mouse, so the experiment's lines were restored by hand afterwards.
+- **Pipelines** (the lags): on the phone, a pipeline the system hasn't compiled before is built off the D3D thread. Its draw waits at most 2 ms,
+  and at most 4 ms in all a frame, then is left out until the pipeline is ready. The system cache makes revisits fast: the second session's
+  1,028 pipelines took 212 ms, against 4.7 s for 1,280 the first time. A setting turns this off, and so does `ARKHAM_SYNC_PIPELINES=1`.
+- **Startup:** `Documents/Logs/run.txt` lines now start with seconds since the process started (from the kernel), for finding the 15 s of black.

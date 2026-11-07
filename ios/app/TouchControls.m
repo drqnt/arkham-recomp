@@ -37,6 +37,7 @@ void rt_ios_click(double share_x, double share_y);
 void rt_ios_park_cursor(void);
 void rt_set_fps_cap(double n);
 void rt_set_metal_hud(int on);
+void rt_set_async_pipelines(int on);  // mtl_device.m: new pipelines built off the game's thread
 void rt_ios_overlay_enable(int on);  // main.m: the frame rate line
 void rt_ios_overlay_hidden(int hidden);
 CGRect rt_ios_game_rect(void);       // main.m: where the game's picture is
@@ -46,6 +47,10 @@ enum { C_LT = 4, C_RT = 5, B_SOUTH = 7, B_EAST, B_WEST, B_NORTH, B_LB, B_RB, B_S
 enum { STYLE_PS, STYLE_XBOX, STYLE_ICONS };
 enum { SH_NONE, SH_CROSS, SH_CIRCLE, SH_SQUARE, SH_TRIANGLE };
 enum { SIDE_UP, SIDE_RIGHT, SIDE_DOWN, SIDE_LEFT };
+
+// The camera's numbers (see -frame: below): what a frame of the right stick's full push turns, and what a point of swipe turns at speed 1.
+#define STICK_DEG_PER_FRAME 18.3   // 600 (STICK_MOUSE_SPEED) x 0.0305 degrees, measured with scripted runs on the Mac
+#define CAMERA_DEG_PER_POINT 0.284
 
 // ---------- settings ----------
 static NSUserDefaults *prefs(void) { return NSUserDefaults.standardUserDefaults; }
@@ -98,7 +103,7 @@ static const Def defs[] = {
     // Above the left thumb's stick.
     {"l1", B_LB, {BL, 68, -262, 28}, {TL, 76, 55, 33}, "L1", "LB", "eye.fill", "Режим детектива", SH_NONE, 0xFFFFFF, 0xFFFFFF},
     {"l2", C_LT, {BL, 166, -276, 28}, {TL, 185, 55, 33}, "L2", "LT", "scope", "Прицел гаджета", SH_NONE, 0xFFFFFF, 0xFFFFFF},
-    {"l3", B_L3, {BL, 60, -350, 20}, {TL, 60, 153, 26}, "L3", "LS", "camera.metering.center.weighted", "Камера за спину", SH_NONE, 0xFFFFFF, 0xFFFFFF},
+    {"l3", B_L3, {BL, 60, -350, 20}, {TL, 60, 153, 26}, "L3", "LS", "camera.rotate.fill", "Камера за спину", SH_NONE, 0xFFFFFF, 0xFFFFFF},
     // The gadgets: one button for the pad's cross, a wheel of its four sides. Drawn as a batarang.
     {"gadgets", C_WHEEL, {TL, 124, 144, 30}, {BC, 0, -77, 37}, "", "", "batarang", "Гаджеты: зажмите и ведите в сторону", SH_NONE, 0xFFFFFF, 0xFFFFFF},
     // The top: the map and the pause, and, at the top left, hiding all of them for a picture.
@@ -242,6 +247,8 @@ static void open_settings(void);
     CGPoint stick_center, look_last, look_sum, pan_last, pan_sum;
     float lx, ly, rx, ry;
     float look_prev_x, look_prev_y, carry_x, carry_y;
+    double game_fps, fps_since;
+    unsigned fps_frames;
     BOOL running;  // the stick pushed past its edge
     BOOL panning;  // the touch outside play has moved far enough to be a drag
     BOOL in_menu;  // outside play
@@ -351,8 +358,9 @@ static void open_settings(void);
     link = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     if (@available(iOS 15.0, *)) link.preferredFrameRateRange = CAFrameRateRangeMake(60, 120, 120);
     [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    fprintf(stderr, "[touch] camera speed %.2f (a swipe of %.0f points a second is the stick's full push)\n", setting(@"cameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0),
-            3000.0 / setting(@"cameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0));
+    fprintf(stderr, "[touch] camera: %.0f degrees across the screen's width (speed %.2f)%s\n",
+            setting(@"swipeSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT * MAX(frame.size.width, frame.size.height), setting(@"swipeSpeed", "ARKHAM_TOUCH_LOOK", 1.0),
+            setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 ? ", up and down inverted" : "");
     return self;
 }
 
@@ -782,8 +790,26 @@ static UIView *gear_view;
     [self restyle];
     fprintf(stderr, "[touch] %s\n", on ? "photo mode: everything hidden" : "photo mode over");
 }
-// The camera: the thumb's speed as the right stick's push, so that it turns as far as the thumb moves. Two display frames are averaged, as touches and
-// frames don't come in step; that keeps the sum over a swipe.
+// The camera. The game takes the right stick as the mouse (shims_libc.c): each frame turns the camera by the stick's push times STICK_DEG_PER_FRAME,
+// with nothing of a joystick's acceleration, and while walking too. So the push is the thumb's speed over the game's frame rate, and the camera turns
+// by how far the thumb went times CAMERA_DEG_PER_POINT, whatever the speed or the frame rate: a swipe across the phone's 951 points at speed 1 turns
+// it about 270 degrees. A thumb going up looks up, as on a phone, unless the settings invert it. Two display frames are averaged, as touches and frames
+// don't come in step; that keeps the sum over a swipe.
+// The game's frames a second, over the last quarter of a second.
+- (double)gameFPS:(CFTimeInterval)now {
+    unsigned frames = rt_frames_presented();
+    if (fps_since <= 0) {
+        fps_since = now;
+        fps_frames = frames;
+        game_fps = 60;
+    } else if (now - fps_since >= 0.25) {
+        double f = (frames - fps_frames) / (now - fps_since);
+        if (f > 5) game_fps = game_fps * 0.5 + f * 0.5;
+        fps_since = now;
+        fps_frames = frames;
+    }
+    return MIN(MAX(game_fps, 20), 240);
+}
 - (void)frame:(CADisplayLink *)l {
     CFTimeInterval now = l.timestamp, dt = last_frame > 0 ? now - last_frame : 1.0 / 60;
     last_frame = now;
@@ -791,11 +817,12 @@ static UIView *gear_view;
     [self updatePlay:now];
     rt_want_picture_luma(!self.hidden && !photo);
     [self followPicture:dt];
+    double fps = [self gameFPS:now];
     float nx = 0, ny = 0;
     if (look_touch && !in_menu) {
-        double full = 3000.0 / setting(@"cameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0);  // points a second for the stick's full push
-        nx = (float)(look_sum.x / dt / full);
-        ny = (float)(-look_sum.y / dt / full);
+        double k = setting(@"swipeSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT / (STICK_DEG_PER_FRAME * fps);  // push for a point a second
+        nx = (float)(look_sum.x / dt * k);
+        ny = (float)(look_sum.y / dt * k * (setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 ? -1 : 1));
         float m = hypotf(nx, ny);
         if (m > 1) {
             nx /= m;
@@ -1260,9 +1287,12 @@ static UIView *gear_view;
     rows = [NSMutableArray array];
     actions = [NSMutableDictionary dictionary];
 
-    [self section:@"Изображение" footer:@"Экран показывает не больше 120 кадров в секунду; ограничение 60 бережёт батарею и греет меньше."];
+    [self section:@"Изображение"
+           footer:@"Экран показывает не больше 120 кадров в секунду; ограничение 60 бережёт батарею и греет меньше. Без рывков: в месте, где вы ещё не были, "
+                  @"новый объект или эффект может появиться на кадр-другой позже, зато игра не замирает, пока видеокарта готовит его в первый раз."];
     double cap = setting(@"fpsCap", "ARKHAM_FPS_CAP", 0);
     [self choice:@"Ограничение FPS" items:@[@"30", @"60", @"120", @"Без ограничения"] value:cap <= 0 ? 3 : cap <= 30 ? 0 : cap <= 60 ? 1 : 2 action:@selector(capChanged:)];
+    [self toggle:@"Без рывков в новых местах" on:setting(@"asyncPipelines", "ARKHAM_ASYNC_PIPELINES", 1) > 0 action:@selector(asyncChanged:)];
     [self toggle:@"Строка FPS и нагрева" on:setting(@"showFPS", "ARKHAM_FPS", 1) > 0 action:@selector(fpsLineChanged:)];
     [self toggle:@"Metal HUD" on:setting(@"metalHUD", "ARKHAM_METAL_HUD", 0) > 0 action:@selector(hudChanged:)];
 
@@ -1273,8 +1303,9 @@ static UIView *gear_view;
     [self toggle:@"Прятать вне игры" on:setting(@"hideInMenus", "ARKHAM_TOUCH_HIDE", 1) > 0 action:@selector(hideChanged:)];
     [self action:@"Расположение кнопок" selector:@selector(editLayout)];
 
-    [self section:@"Управление" footer:@"Камера поворачивается на столько, на сколько проведён палец, с любой скоростью."];
-    look_value = [self slider:@"Скорость камеры" min:0.25 max:4.0 value:setting(@"cameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) action:@selector(lookChanged:)];
+    [self section:@"Управление" footer:@"Камера поворачивается ровно на столько, на сколько проведён палец, с любой скоростью и на ходу. Скорость — на сколько градусов поворачивает свайп через весь экран."];
+    look_value = [self slider:@"Скорость камеры" min:0.25 max:3.0 value:setting(@"swipeSpeed", "ARKHAM_TOUCH_LOOK", 1.0) action:@selector(lookChanged:)];
+    [self toggle:@"Инвертировать вверх-вниз" on:setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 action:@selector(invertChanged:)];
     [self toggle:@"Бег: стик за край" on:setting(@"autoRun", "ARKHAM_TOUCH_RUN", 1) > 0 action:@selector(runChanged:)];
     [self showValues];
     return self;
@@ -1282,7 +1313,7 @@ static UIView *gear_view;
 - (void)showValues {
     size_value.text = [NSString stringWithFormat:@"%.0f %%", setting(@"buttonScale", "ARKHAM_TOUCH_SIZE", 1.0) * 100];
     opacity_value.text = [NSString stringWithFormat:@"%.0f %%", setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.6) * 100];
-    look_value.text = [NSString stringWithFormat:@"%.2f×", setting(@"cameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0)];
+    look_value.text = [NSString stringWithFormat:@"%.0f° на экран", setting(@"swipeSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT * 951];
 }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)t { return (NSInteger)rows.count; }
 - (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return (NSInteger)rows[(NSUInteger)s].count; }
@@ -1314,9 +1345,10 @@ static UIView *gear_view;
     [controls restyle];
 }
 - (void)lookChanged:(UISlider *)s {
-    set_setting(@"cameraSpeed", s.value);
+    set_setting(@"swipeSpeed", s.value);
     [self showValues];
 }
+- (void)invertChanged:(UISwitch *)s { set_setting(@"invertLook", s.on); }
 - (void)runChanged:(UISwitch *)s { set_setting(@"autoRun", s.on); }
 - (void)hideChanged:(UISwitch *)s { set_setting(@"hideInMenus", s.on); }
 - (void)fpsLineChanged:(UISwitch *)s {
@@ -1326,6 +1358,10 @@ static UIView *gear_view;
 - (void)hudChanged:(UISwitch *)s {
     set_setting(@"metalHUD", s.on);
     rt_set_metal_hud(s.on);
+}
+- (void)asyncChanged:(UISwitch *)s {
+    set_setting(@"asyncPipelines", s.on);
+    rt_set_async_pipelines(s.on);
 }
 - (void)editLayout {
     [self.navigationController dismissViewControllerAnimated:YES completion:^{
@@ -1358,6 +1394,7 @@ static void update_visibility(void) {
 // What the settings say, applied once at start: the frame rate limit, the HUD and the frame rate line.
 void rt_ios_apply_settings(void) {
     rt_set_fps_cap(setting(@"fpsCap", "ARKHAM_FPS_CAP", 0));
+    rt_set_async_pipelines(setting(@"asyncPipelines", "ARKHAM_ASYNC_PIPELINES", 1) > 0);
     rt_set_metal_hud(setting(@"metalHUD", "ARKHAM_METAL_HUD", 0) > 0);
     rt_ios_overlay_enable(setting(@"showFPS", "ARKHAM_FPS", 1) > 0);
 }
