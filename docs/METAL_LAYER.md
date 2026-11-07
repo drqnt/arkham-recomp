@@ -157,6 +157,9 @@ After those, the layer was read through for mistakes of the same kind, that go w
   the three busiest guest threads' CPU time a frame and the address each started at: 1c260f0 is the engine's render thread, 1dab9d0 its game thread. Time spent spinning
   while waiting counts as CPU time there.
 - `ARKHAM_TRACE_SLEEP=1`: who in the game sleeps, how often and how long, every 5 s.
+- `ARKHAM_FXAA=1`: FXAA on the finished 3D picture, after the engine's last full-screen pass into the back buffer and before the interface, so text stays sharp; alone or
+  with MSAA. About 0.5 ms of GPU at 2560x1600. On the capsule route 4x gives 158 FPS, 4x with FXAA 152, and 2x with FXAA (`ARKHAM_MTL_SAMPLES=2`, or 2x in the game's
+  options) 190.
 - `tools/build.py --define ARKHAM_PLAIN_MEMORY` builds the translated code with unordered memory into objects of its own, only to measure what x86 ordering costs.
 
 On the capsule route with multisampling off and one-color pixels, the game gives 238 FPS and stops at 240, with the render thread polling Feral's wait for the GPU

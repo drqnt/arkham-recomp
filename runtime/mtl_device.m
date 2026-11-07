@@ -1707,7 +1707,128 @@ static void bind_streams(void) {
         }
     }
 }
+// ---------- FXAA ----------
+// ARKHAM_FXAA=1: fast approximate anti-aliasing on the finished 3D picture, alone or on top of the game's MSAA, which it smooths further and can stand in for
+// at fewer samples. The engine draws its last full-screen pass, tone mapping and the rest of post-processing, into the back buffer with no depth surface, and the
+// interface after that with one: FXAA goes between, so text stays sharp. Only in frames with a 3D scene, more than 300 draws before that point.
+// This is the usual FXAA scheme: an edge found from luma contrast, followed both ways to its ends, and the pixel sampled again shifted across it by how near the
+// nearer end is, or by how much it stands out from its neighbours when that's more.
+static const char *fxaa_src_text =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct V { float4 pos [[position]]; float2 uv; };\n"
+    "vertex V fxaa_vs(uint id [[vertex_id]]) {\n"
+    "    float2 q = float2((id << 1) & 2, id & 2);\n"
+    "    V v; v.pos = float4(q.x * 2 - 1, 1 - q.y * 2, 0, 1); v.uv = q; return v;\n"
+    "}\n"
+    "static float luma(float4 c) { return dot(c.rgb, float3(0.299, 0.587, 0.114)); }\n"
+    "fragment float4 fxaa_fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], constant float2 &px [[buffer(0)]]) {\n"
+    "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+    "    float2 uv = in.uv;\n"
+    "    float4 m = t.sample(s, uv);\n"
+    "    float lm = luma(m);\n"
+    "    float ln = luma(t.sample(s, uv, int2(0, -1))), ls = luma(t.sample(s, uv, int2(0, 1)));\n"
+    "    float lw = luma(t.sample(s, uv, int2(-1, 0))), le = luma(t.sample(s, uv, int2(1, 0)));\n"
+    "    float hi = max(max(max(ln, ls), max(lw, le)), lm), lo = min(min(min(ln, ls), min(lw, le)), lm);\n"
+    "    float range = hi - lo;\n"
+    "    if (range < max(0.0312, hi * 0.125)) return m;\n"
+    "    float lnw = luma(t.sample(s, uv, int2(-1, -1))), lne = luma(t.sample(s, uv, int2(1, -1)));\n"
+    "    float lsw = luma(t.sample(s, uv, int2(-1, 1))), lse = luma(t.sample(s, uv, int2(1, 1)));\n"
+    "    float sub = saturate(abs((2.0 * (ln + ls + lw + le) + lnw + lne + lsw + lse) / 12.0 - lm) / range);\n"
+    "    sub = smoothstep(0.0, 1.0, sub);\n"
+    "    sub = sub * sub * 0.75;\n"
+    "    float eh = abs(lnw + lne - 2.0 * ln) + 2.0 * abs(lw + le - 2.0 * lm) + abs(lsw + lse - 2.0 * ls);\n"
+    "    float ev = abs(lnw + lsw - 2.0 * lw) + 2.0 * abs(ln + ls - 2.0 * lm) + abs(lne + lse - 2.0 * le);\n"
+    "    bool horz = eh >= ev;\n"
+    "    float l1 = horz ? ln : lw, l2 = horz ? ls : le;\n"
+    "    float g1 = abs(l1 - lm), g2 = abs(l2 - lm);\n"
+    "    float across = horz ? px.y : px.x;\n"
+    "    float edge_luma, grad;\n"
+    "    if (g1 >= g2) { across = -across; edge_luma = 0.5 * (l1 + lm); grad = g1; } else { edge_luma = 0.5 * (l2 + lm); grad = g2; }\n"
+    "    float2 c = uv;\n"
+    "    if (horz) c.y += across * 0.5; else c.x += across * 0.5;\n"
+    "    float2 along = horz ? float2(px.x, 0) : float2(0, px.y);\n"
+    "    float2 u1 = c - along, u2 = c + along;\n"
+    "    float e1 = luma(t.sample(s, u1)) - edge_luma, e2 = luma(t.sample(s, u2)) - edge_luma;\n"
+    "    float stop = grad * 0.25;\n"
+    "    bool d1 = abs(e1) >= stop, d2 = abs(e2) >= stop;\n"
+    "    const float steps[10] = {1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0, 8.0};\n"
+    "    for (int i = 0; i < 10 && !(d1 && d2); i++) {\n"
+    "        if (!d1) { u1 -= along * steps[i]; e1 = luma(t.sample(s, u1)) - edge_luma; d1 = abs(e1) >= stop; }\n"
+    "        if (!d2) { u2 += along * steps[i]; e2 = luma(t.sample(s, u2)) - edge_luma; d2 = abs(e2) >= stop; }\n"
+    "    }\n"
+    "    float dist1 = horz ? uv.x - u1.x : uv.y - u1.y, dist2 = horz ? u2.x - uv.x : u2.y - uv.y;\n"
+    "    bool nearer1 = dist1 < dist2;\n"
+    "    float off = 0.5 - min(dist1, dist2) / (dist1 + dist2);\n"
+    "    bool right_side = ((nearer1 ? e1 : e2) < 0.0) != (lm < edge_luma);\n"
+    "    off = max(right_side ? off : 0.0, sub);\n"
+    "    float2 f = uv;\n"
+    "    if (horz) f.y += off * across; else f.x += off * across;\n"
+    "    return float4(t.sample(s, f).rgb, m.a);\n"
+    "}\n";
+static int fxaa_done;  // this frame
+static int fxaa_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("ARKHAM_FXAA");
+        on = v && atoi(v) > 0;
+    }
+    return on;
+}
+static void apply_fxaa(void) {
+    static id<MTLRenderPipelineState> pipe;
+    static MTLPixelFormat pipe_format;
+    static id<MTLTexture> copy;
+    id<MTLTexture> bb = back_buffer->tex;
+    if (!pipe || pipe_format != bb.pixelFormat) {
+        static id<MTLLibrary> lib;
+        if (!lib) lib = compile_msl(fxaa_src_text);
+        MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor new] autorelease];
+        d.vertexFunction = [[lib newFunctionWithName:@"fxaa_vs"] autorelease];
+        d.fragmentFunction = [[lib newFunctionWithName:@"fxaa_fs"] autorelease];
+        d.colorAttachments[0].pixelFormat = bb.pixelFormat;
+        NSError *err = nil;
+        [pipe release];
+        pipe = [dev newRenderPipelineStateWithDescriptor:d error:&err];
+        pipe_format = bb.pixelFormat;
+        if (!pipe) {
+            fprintf(stderr, "[mtl] FXAA pipeline: %s\n", err.localizedDescription.UTF8String);
+            return;
+        }
+    }
+    if (!copy || copy.width != bb.width || copy.height != bb.height || copy.pixelFormat != bb.pixelFormat) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:bb.pixelFormat width:bb.width height:bb.height mipmapped:NO];
+        d.storageMode = MTLStorageModePrivate;
+        d.usage = MTLTextureUsageShaderRead;
+        [copy release];
+        copy = [dev newTextureWithDescriptor:d];
+    }
+    end_pass();
+    ensure_cb();
+    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    [b copyFromTexture:bb toTexture:copy];
+    [b endEncoding];
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = bb;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> r = [cb renderCommandEncoderWithDescriptor:rp];
+    if (__builtin_expect(labels_on(), 0)) r.label = @"FXAA";
+    [r setRenderPipelineState:pipe];
+    float px[2] = {1.0f / (float)bb.width, 1.0f / (float)bb.height};
+    [r setFragmentBytes:px length:sizeof px atIndex:0];
+    [r setFragmentTexture:copy atIndex:0];
+    [r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [r endEncoding];
+}
 static u64 n_draws;
+// After each draw: FXAA once the engine's last full-screen pass of a 3D frame is in the back buffer.
+static inline void after_draw(void) {
+    if (__builtin_expect(fxaa_on(), 0) && !fxaa_done && rt_surface == back_buffer && !ds_surface && n_draws > 300) {
+        fxaa_done = 1;
+        apply_fxaa();
+    }
+}
 static void m_DrawPrimitive(CPU *c) {  // this, type, start, primitives
     u32 st[3] = {streams[0].stride, streams[1].stride, streams[2].stride};
     if (!prepare_draw(st, 0)) {
@@ -1718,6 +1839,7 @@ static void m_DrawPrimitive(CPU *c) {  // this, type, start, primitives
     [enc drawPrimitives:prim_type(ARG(1)) vertexStart:ARG(2) vertexCount:prim_verts(ARG(1), ARG(3))];
     n_draws++;
     if (__builtin_expect(fmap_on, 0)) trace_draw(ARG(1), ARG(3));
+    after_draw();
     RET(0);
 }
 static void m_DrawIndexedPrimitive(CPU *c) {  // this, type, base vertex, min index, vertices, start index, primitives
@@ -1734,6 +1856,7 @@ static void m_DrawIndexedPrimitive(CPU *c) {  // this, type, base vertex, min in
     [enc drawIndexedPrimitives:prim_type(ARG(1)) indexCount:prim_verts(ARG(1), ARG(6)) indexType:wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16 indexBuffer:cur_ib->buffer indexBufferOffset:ARG(5) * (wide ? 4u : 2u) instanceCount:n baseVertex:(NSInteger)(int)ARG(2) baseInstance:0];
     n_draws++;
     if (__builtin_expect(fmap_on, 0)) trace_draw(ARG(1), ARG(6));
+    after_draw();
     RET(0);
 }
 static void m_DrawPrimitiveUP(CPU *c) {  // this, type, primitives, data, stride
@@ -1752,6 +1875,7 @@ static void m_DrawPrimitiveUP(CPU *c) {  // this, type, primitives, data, stride
     [enc drawPrimitives:prim_type(ARG(1)) vertexStart:0 vertexCount:verts];
     n_draws++;
     if (__builtin_expect(fmap_on, 0)) trace_draw(ARG(1), ARG(2));
+    after_draw();
     RET(0);
 }
 static void m_DrawIndexedPrimitiveUP(CPU *c) {  // this, type, min index, vertices, primitives, indices, format, data, stride
@@ -1774,6 +1898,7 @@ static void m_DrawIndexedPrimitiveUP(CPU *c) {  // this, type, min index, vertic
     [enc drawIndexedPrimitives:prim_type(ARG(1)) indexCount:count indexType:wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16 indexBuffer:ib indexBufferOffset:iat];
     n_draws++;
     if (__builtin_expect(fmap_on, 0)) trace_draw(ARG(1), ARG(4));
+    after_draw();
     RET(0);
 }
 
@@ -2726,6 +2851,7 @@ static void m_Present(CPU *c) {
     frame_no++;
     note_frame(n_draws);
     n_draws = 0;
+    fxaa_done = 0;
     {
         u64 t0 = mach_absolute_time();
         dispatch_semaphore_wait(frames_in_flight, DISPATCH_TIME_FOREVER);
