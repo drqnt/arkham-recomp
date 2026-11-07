@@ -64,6 +64,130 @@ static OSStatus ring_render(Ring *r, UInt32 frames, AudioBufferList *io) {
     return noErr;
 }
 
+#if TARGET_OS_IPHONE
+// ---------- the phone's one output ----------
+// On a Mac FMOD and each of the Bink library's channels have an output unit of their own, and the system mixes them. On the phone they share one
+// RemoteIO and are mixed here: with a RemoteIO for each, a cutscene's sound coming and going left the game silent afterwards. Sources at another rate
+// than the output's are resampled, linearly.
+#define MIX_RATE 48000.0
+#define MIX_SOURCES 16
+typedef struct {
+    Ring *_Atomic ring;
+    double step, pos;  // source frames per output frame, and where between two of them the output is
+    float a[2], b[2];  // the two source frames around that place
+    int primed;
+} MixSource;
+static MixSource mix_src[MIX_SOURCES];
+static _Atomic u32 mix_passes;  // render calls so far: a source is safe to change once this has moved on twice
+static AudioComponentInstance mix_unit;
+static pthread_mutex_t mix_mu = PTHREAD_MUTEX_INITIALIZER;
+// One frame of a source, as stereo, with its gains; zero when there is none, which counts as a gap.
+static int mix_take(Ring *r, float out[2]) {
+    if (atomic_load(&r->paused) || !ring_fill(r)) {
+        out[0] = out[1] = 0;
+        if (!atomic_load(&r->paused)) atomic_fetch_add(&r->silent, 1);
+        return 0;
+    }
+    u32 rd = atomic_load(&r->rd);
+    const float *s = r->buf + (size_t)(rd & (r->cap - 1)) * r->channels;
+    float l = s[0], rt = r->channels > 1 ? s[1] : s[0];
+    out[0] = l * atomic_load(&r->gain_l);
+    out[1] = rt * atomic_load(&r->gain_r);
+    atomic_store(&r->rd, rd + 1);
+    return 1;
+}
+static OSStatus mix_render(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
+    (void)ctx, (void)flags, (void)ts, (void)bus;
+    float *out = io->mBuffers[0].mData;
+    memset(out, 0, (size_t)frames * 2 * sizeof(float));
+    for (int k = 0; k < MIX_SOURCES; k++) {
+        MixSource *m = &mix_src[k];
+        Ring *r = atomic_load(&m->ring);
+        if (!r || !r->buf) continue;
+        if (m->step == 1.0) {
+            for (UInt32 i = 0; i < frames; i++) {
+                float f[2];
+                mix_take(r, f);
+                out[i * 2] += f[0];
+                out[i * 2 + 1] += f[1];
+            }
+        } else {
+            if (!m->primed) {
+                mix_take(r, m->a);
+                mix_take(r, m->b);
+                m->pos = 0;
+                m->primed = 1;
+            }
+            for (UInt32 i = 0; i < frames; i++) {
+                float w = (float)m->pos;
+                out[i * 2] += m->a[0] + (m->b[0] - m->a[0]) * w;
+                out[i * 2 + 1] += m->a[1] + (m->b[1] - m->a[1]) * w;
+                for (m->pos += m->step; m->pos >= 1.0; m->pos -= 1.0) {
+                    m->a[0] = m->b[0], m->a[1] = m->b[1];
+                    mix_take(r, m->b);
+                }
+            }
+        }
+        dispatch_semaphore_signal(r->space);
+    }
+    atomic_fetch_add(&mix_passes, 1);
+    return noErr;
+}
+static void mix_wait_pass(void) {
+    u32 p = atomic_load(&mix_passes);
+    for (int i = 0; i < 200 && atomic_load(&mix_passes) - p < 2; i++) usleep(1000);  // at most 0.2 s, if the output isn't running
+}
+static void mix_start(void) {
+    if (mix_unit) return;
+    AudioComponentDescription d = {kAudioUnitType_Output, kAudioUnitSubType_RemoteIO, kAudioUnitManufacturer_Apple, 0, 0};
+    AudioComponent comp = AudioComponentFindNext(NULL, &d);
+    if (!comp || AudioComponentInstanceNew(comp, &mix_unit)) {
+        fprintf(stderr, "[audio] no RemoteIO for the phone's output\n");
+        mix_unit = NULL;
+        return;
+    }
+    AudioStreamBasicDescription f = {0};
+    f.mSampleRate = MIX_RATE;
+    f.mFormatID = kAudioFormatLinearPCM;
+    f.mFormatFlags = kAudioFormatFlagsNativeFloatPacked;
+    f.mBytesPerPacket = f.mBytesPerFrame = 8;
+    f.mFramesPerPacket = 1;
+    f.mChannelsPerFrame = 2;
+    f.mBitsPerChannel = 32;
+    AudioUnitSetProperty(mix_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f);
+    AURenderCallbackStruct cb = {mix_render, NULL};
+    AudioUnitSetProperty(mix_unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb);
+    AudioUnitInitialize(mix_unit);
+    OSStatus r = AudioOutputUnitStart(mix_unit);
+    fprintf(stderr, "[audio] the phone's output: %.0f Hz stereo, one RemoteIO for everything: %d\n", MIX_RATE, (int)r);
+}
+static void mix_add(Ring *r, double rate) {
+    pthread_mutex_lock(&mix_mu);
+    mix_start();
+    for (int k = 0; k < MIX_SOURCES; k++) {
+        if (atomic_load(&mix_src[k].ring)) continue;
+        double step = rate > 0 ? rate / MIX_RATE : 1.0;
+        mix_src[k].step = step > 0.999 && step < 1.001 ? 1.0 : step;  // within a tenth of a percent nobody hears the difference
+        mix_src[k].primed = 0;
+        atomic_store(&mix_src[k].ring, r);
+        break;
+    }
+    pthread_mutex_unlock(&mix_mu);
+}
+// Off the output; the ring may be freed when this returns.
+static void mix_remove(Ring *r) {
+    pthread_mutex_lock(&mix_mu);
+    int found = 0;
+    for (int k = 0; k < MIX_SOURCES; k++)
+        if (atomic_load(&mix_src[k].ring) == r) {
+            atomic_store(&mix_src[k].ring, NULL);
+            found = 1;
+        }
+    pthread_mutex_unlock(&mix_mu);
+    if (found) mix_wait_pass();
+}
+#endif
+
 #define FOURCC(a, b, c, d) (((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(c) << 8) | (u32)(d))
 #define PROP_UID FOURCC('u', 'i', 'd', ' ')
 #define PROP_NAME FOURCC('n', 'a', 'm', 'e')
@@ -304,6 +428,8 @@ typedef struct {
     pthread_t pump;
     _Atomic int running;
     int pump_started;
+    double rate;  // the phone: what FMOD said it plays at
+    int mixed;    // the phone: its ring is a source of the one output
 } GOut;
 
 static OSStatus out_render(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
@@ -372,6 +498,23 @@ SHIM(AudioComponentFindNext) {
     if (audio_trace > 0) fprintf(stderr, "[audio] component %p\n", (void *)found);
     RET(found ? rt_handle_new((void *)found) : 0);
 }
+#if TARGET_OS_IPHONE
+// FMOD's output unit on the phone has no RemoteIO of its own: it keeps what FMOD sets, and its sound goes to the phone's one output above.
+SHIM(AudioComponentInstanceNew) {
+    GOut *o = calloc(1, sizeof *o);
+    G32(ARG(1)) = rt_handle_new(o);
+    RET(0);
+}
+SHIM(AudioComponentInstanceDispose) {
+    GOut *o = rt_handle_get(ARG(0));
+    if (!o) {
+        RET((u32)kAudio_ParamError);
+        return;
+    }
+    rt_handle_free(ARG(0));
+    RET(0);
+}
+#else
 SHIM(AudioComponentInstanceNew) {
     AudioComponentInstance unit = NULL;
     OSStatus r = AudioComponentInstanceNew(rt_handle_get(ARG(0)), &unit);
@@ -390,6 +533,7 @@ SHIM(AudioComponentInstanceDispose) {
     }
     RET((i32)AudioComponentInstanceDispose(o->unit));
 }
+#endif
 SHIM(AudioUnitSetProperty) {
     GOut *o = rt_handle_get(ARG(0));
     if (!o) {
@@ -397,24 +541,30 @@ SHIM(AudioUnitSetProperty) {
         return;
     }
     u32 id = ARG(1), scope = ARG(2), elem = ARG(3), data = ARG(4), size = ARG(5);
-#if TARGET_OS_IPHONE
-    if (id == 2000) {  // kAudioOutputUnitProperty_CurrentDevice: RemoteIO has no devices to choose from
-        RET(0);
-        return;
-    }
-#endif
     if (id == PROP_RENDER_CALLBACK) {
         o->proc = G32(data);
         o->refcon = G32(data + 4);
+#if TARGET_OS_IPHONE
+        RET(0);
+#else
         AURenderCallbackStruct cb = {out_render, o};
         RET((i32)AudioUnitSetProperty(o->unit, id, scope, elem, &cb, sizeof cb));
+#endif
         return;
     }
     if (id == PROP_STREAM_FORMAT && scope == SCOPE_INPUT) {
         const AudioStreamBasicDescription *f = (const AudioStreamBasicDescription *)GP(data);
         o->channels = f->mChannelsPerFrame;
+#if TARGET_OS_IPHONE
+        o->rate = f->mSampleRate > 0 ? f->mSampleRate : MIX_RATE;
+#endif
         fprintf(stderr, "[audio] output %.0f Hz, %u channels, flags %#x, %u bits\n", f->mSampleRate, f->mChannelsPerFrame, f->mFormatFlags, f->mBitsPerChannel);
     }
+#if TARGET_OS_IPHONE
+    if (audio_trace > 0) fprintf(stderr, "[audio] unit set prop %u scope %u elem %u size %u, kept\n", id, scope, elem, size);
+    RET(0);
+    return;
+#endif
     OSStatus r = AudioUnitSetProperty(o->unit, id, scope, elem, data ? GP(data) : NULL, size);
     if (audio_trace > 0 || r) fprintf(stderr, "[audio] unit set prop %u scope %u elem %u size %u -> %d\n", id, scope, elem, size, (int)r);
     RET((i32)r);
@@ -426,9 +576,42 @@ SHIM(AudioUnitGetProperty) {
         return;
     }
     UInt32 sz = G32(ARG(5));
+#if TARGET_OS_IPHONE
+    // What the phone's output plays, for a stream format; anything else is told what it was set to, or zeros.
+    void *out = GP(ARG(4));
+    memset(out, 0, sz);
+    if (ARG(1) == PROP_STREAM_FORMAT && sz >= sizeof(AudioStreamBasicDescription)) {
+        AudioStreamBasicDescription f = {0};
+        f.mSampleRate = MIX_RATE;
+        f.mFormatID = kAudioFormatLinearPCM;
+        f.mFormatFlags = kAudioFormatFlagsNativeFloatPacked;
+        f.mBytesPerPacket = f.mBytesPerFrame = 8;
+        f.mFramesPerPacket = 1;
+        f.mChannelsPerFrame = 2;
+        f.mBitsPerChannel = 32;
+        memcpy(out, &f, sizeof f);
+        sz = sizeof f;
+    } else if (ARG(1) == 14 && sz >= 4) {  // kAudioUnitProperty_MaximumFramesPerSlice
+        G32(ARG(4)) = 4096;
+    } else {
+        static u32 told[32];
+        int seen = 0;
+        for (int i = 0; i < 32 && !seen; i++) {
+            if (told[i] == ARG(1)) seen = 1;
+            else if (!told[i]) {
+                told[i] = ARG(1);
+                fprintf(stderr, "[audio] FMOD asks property %u of its output, answered with zeros\n", ARG(1));
+                break;
+            }
+        }
+    }
+    G32(ARG(5)) = sz;
+    RET(0);
+#else
     OSStatus r = AudioUnitGetProperty(o->unit, ARG(1), ARG(2), ARG(3), GP(ARG(4)), &sz);
     G32(ARG(5)) = sz;
     RET((i32)r);
+#endif
 }
 SHIM(AudioUnitInitialize) {
     GOut *o = rt_handle_get(ARG(0));
@@ -436,7 +619,11 @@ SHIM(AudioUnitInitialize) {
         RET((u32)kAudio_ParamError);
         return;
     }
+#if TARGET_OS_IPHONE
+    RET(0);
+#else
     RET((i32)AudioUnitInitialize(o->unit));
+#endif
 }
 SHIM(AudioUnitUninitialize) {
     GOut *o = rt_handle_get(ARG(0));
@@ -444,7 +631,11 @@ SHIM(AudioUnitUninitialize) {
         RET((u32)kAudio_ParamError);
         return;
     }
+#if TARGET_OS_IPHONE
+    RET(0);
+#else
     RET((i32)AudioUnitUninitialize(o->unit));
+#endif
 }
 SHIM(AudioOutputUnitStart) {
     GOut *o = rt_handle_get(ARG(0));
@@ -458,7 +649,15 @@ SHIM(AudioOutputUnitStart) {
         atomic_store(&o->running, 1);
         pthread_create(&o->pump, NULL, out_pump, o);
     }
+#if TARGET_OS_IPHONE
+    if (o->pump_started && !o->mixed) {
+        mix_add(&o->ring, o->rate);
+        o->mixed = 1;
+    }
+    OSStatus r = 0;
+#else
     OSStatus r = AudioOutputUnitStart(o->unit);
+#endif
     fprintf(stderr, "[audio] output unit started: %d\n", (int)r);
     RET((i32)r);
 }
@@ -468,7 +667,15 @@ SHIM(AudioOutputUnitStop) {
         RET((u32)kAudio_ParamError);
         return;
     }
+#if TARGET_OS_IPHONE
+    OSStatus r = 0;
+    if (o->mixed) {
+        mix_remove(&o->ring);
+        o->mixed = 0;
+    }
+#else
     OSStatus r = AudioOutputUnitStop(o->unit);
+#endif
     if (o->pump_started) {
         atomic_store(&o->running, 0);
         // The pump may be waiting for the gate to finish its last callback.
@@ -507,6 +714,7 @@ typedef struct {
     AudioComponentInstance unit;
     u32 rate, channels;
     int swap_known, swap;
+    int mixed;  // the phone: its ring is a source of the one output
 } SndChan;
 
 static OSStatus snd_render(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
@@ -516,12 +724,20 @@ static OSStatus snd_render(void *ctx, AudioUnitRenderActionFlags *flags, const A
     return ring_render(&((SndChan *)ctx)->ring, frames, io);
 }
 static void snd_open_output(SndChan *s, u32 rate, u32 channels) {
+#if TARGET_OS_IPHONE
+    if (s->mixed) {
+        if (s->rate == rate && s->channels == channels) return;
+        mix_remove(&s->ring);
+        s->mixed = 0;
+    }
+#else
     if (s->unit) {
         if (s->rate == rate && s->channels == channels) return;
         AudioOutputUnitStop(s->unit);
         AudioComponentInstanceDispose(s->unit);
         s->unit = NULL;
     }
+#endif
     float gl = 1, gr = 1;
     if (s->ring.buf) {
         gl = atomic_load(&s->ring.gain_l);
@@ -538,10 +754,11 @@ static void snd_open_output(SndChan *s, u32 rate, u32 channels) {
     s->rate = rate;
     s->channels = channels;
 #if TARGET_OS_IPHONE
-    AudioComponentDescription d = {kAudioUnitType_Output, kAudioUnitSubType_RemoteIO, kAudioUnitManufacturer_Apple, 0, 0};
+    mix_add(&s->ring, rate);
+    s->mixed = 1;
+    fprintf(stderr, "[audio] video sound %u Hz, %u channels, into the phone's output\n", rate, channels);
 #else
     AudioComponentDescription d = {kAudioUnitType_Output, kAudioUnitSubType_DefaultOutput, kAudioUnitManufacturer_Apple, 0, 0};
-#endif
     AudioComponent comp = AudioComponentFindNext(NULL, &d);
     if (!comp || AudioComponentInstanceNew(comp, &s->unit)) {
         fprintf(stderr, "[audio] no default output for video sound\n");
@@ -562,6 +779,7 @@ static void snd_open_output(SndChan *s, u32 rate, u32 channels) {
     AudioUnitInitialize(s->unit);
     OSStatus r = AudioOutputUnitStart(s->unit);
     fprintf(stderr, "[audio] video sound %u Hz, %u channels: %d\n", rate, channels, (int)r);
+#endif
 }
 // An extended sound header holds 16-bit samples, big-endian by the old convention. Check the data rather than assume:
 // the wrong byte order makes neighbouring samples jump far apart.
@@ -669,6 +887,10 @@ SHIM(SndDisposeChannel) {
     rt_gate_release();
     pthread_join(s->thread, NULL);
     rt_gate_acquire();
+#if TARGET_OS_IPHONE
+    if (s->mixed) mix_remove(&s->ring);
+    s->mixed = 0;
+#endif
     if (s->unit) {
         AudioOutputUnitStop(s->unit);
         AudioComponentInstanceDispose(s->unit);

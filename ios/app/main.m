@@ -130,10 +130,51 @@ static void start_game(void) {
     [super viewDidLayoutSubviews];
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    for (CALayer *l in self.view.layer.sublayers) l.frame = self.view.bounds;
+    for (CALayer *l in self.view.layer.sublayers)
+        if ([l isKindOfClass:CAMetalLayer.class]) l.frame = self.view.bounds;
     [CATransaction commit];
 }
 @end
+
+// ---------- ARKHAM_FPS=1: a line over the game ----------
+// The frame rate, the GPU's time a frame, how many frames reach the screen, and how warm the phone is: iOS tells apps a thermal state, not degrees.
+static UILabel *overlay;
+static NSString *thermal_name(NSProcessInfoThermalState s) {
+    switch (s) {
+        case NSProcessInfoThermalStateNominal: return @"норма";
+        case NSProcessInfoThermalStateFair: return @"тёплый";
+        case NSProcessInfoThermalStateSerious: return @"горячий";
+        case NSProcessInfoThermalStateCritical: return @"критический";
+    }
+    return @"?";
+}
+void rt_ios_overlay(double fps, double gpu_ms, double shown_a_second) {
+    static int on = -1;
+    if (on < 0) on = getenv("ARKHAM_FPS") && *getenv("ARKHAM_FPS") == '1';
+    if (!on) return;
+    NSString *text = [NSString stringWithFormat:@"%.0f FPS · GPU %.1f мс · на экране %.0f/с · нагрев: %@", fps, gpu_ms, shown_a_second,
+                                                thermal_name(NSProcessInfo.processInfo.thermalState)];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!overlay) {
+            UIView *v = rt_ios_game_view;
+            if (!v) return;
+            overlay = [UILabel new];
+            overlay.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightMedium];
+            overlay.textColor = UIColor.whiteColor;
+            overlay.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
+            overlay.layer.cornerRadius = 6;
+            overlay.clipsToBounds = YES;
+            overlay.textAlignment = NSTextAlignmentCenter;
+            [v addSubview:overlay];
+        }
+        overlay.text = text;
+        [overlay sizeToFit];
+        UIEdgeInsets safe = overlay.superview.safeAreaInsets;
+        CGRect b = overlay.superview.bounds;
+        overlay.frame = CGRectMake((b.size.width - overlay.bounds.size.width - 16) / 2, b.size.height - safe.bottom - overlay.bounds.size.height - 10,
+                                   overlay.bounds.size.width + 16, overlay.bounds.size.height + 6);
+    });
+}
 
 static void show_text(UIViewController *vc, NSString *text) {
     UILabel *l = [[UILabel alloc] initWithFrame:CGRectInset(vc.view.bounds, 40, 30)];
@@ -183,6 +224,11 @@ static void show_text(UIViewController *vc, NSString *text) {
     AVAudioSession *audio = AVAudioSession.sharedInstance;
     if (![audio setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:&err] || ![audio setActive:YES error:&err])
         fprintf(stderr, "[ios] sound session: %s\n", err.localizedDescription.UTF8String);
+    // How warm the phone gets, in the log as it changes.
+    [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+        fprintf(stderr, "[ios] thermal state: %s\n", thermal_name(NSProcessInfo.processInfo.thermalState).UTF8String);
+    }];
+    fprintf(stderr, "[ios] thermal state: %s\n", thermal_name(NSProcessInfo.processInfo.thermalState).UTF8String);
     start_game();
 }
 @end

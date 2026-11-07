@@ -2345,7 +2345,7 @@ static void make_layer_on_main(void) {
         if (@available(iOS 16.0, *)) l.developerHUDProperties = @{@"mode": @"default", @"logging": @"default"};
         fprintf(stderr, "[mtl] Metal HUD on\n");
     }
-    [content.layer addSublayer:l];
+    [content.layer insertSublayer:l atIndex:0];  // under the app shell's own views: the frame rate line, and controls drawn over the game
     layer = [l retain];
     fprintf(stderr, "[mtl] drawing into a layer on the app's view, %.0f x %.0f points at %.0fx\n", content.bounds.size.width, content.bounds.size.height, l.contentsScale);
     atomic_store(&layer_ready, 1);
@@ -2748,13 +2748,18 @@ static void note_frame(u64 draws) {
         char threads[96];
         void rt_thread_cpu_report(char *out, size_t cap, double frames);
         rt_thread_cpu_report(threads, sizeof threads, (double)fps_frames);
+        double gpu_ms = (double)atomic_exchange(&gpu_ns, 0) / 1e6 / (double)fps_frames;
         fprintf(stderr, "[fps] %.1f, worst frame %.1f ms, %llu draws, %llu passes; ms a frame: thread busy %.1f, gpu %.1f, drawable %.2f, waiting for gpu %.2f, engine waiting for queries %.1f; %llu quad clears, %llu not needed, %llu resolves in pass; %llu of %llu shaders compiled in %.0f ms, %llu not from the cache, %u pipelines in %.0f ms; on screen %.1f a second, %llu dropped, longest gap %.1f ms, %.1f ms from present; guest threads, CPU ms a frame: %s\n",
-                fps, (double)fps_worst / 1e6, draws_seen, n_passes / fps_frames, (double)rt_d3dq_busy_ticks * per_frame, (double)atomic_exchange(&gpu_ns, 0) / 1e6 / (double)fps_frames, (double)ticks_drawable * per_frame,
+                fps, (double)fps_worst / 1e6, draws_seen, n_passes / fps_frames, (double)rt_d3dq_busy_ticks * per_frame, gpu_ms, (double)ticks_drawable * per_frame,
                 (double)ticks_inflight * per_frame, (double)ticks_query_wait * per_frame, n_quad_clears / fps_frames, n_skipped_clears / fps_frames, n_resolves_in_pass / fps_frames, n_compiled, n_created, (double)compile_ticks * 125.0 / 3.0 / 1e6, n_uncached, n_pipes, (double)pipe_ticks * 125.0 / 3.0 / 1e6,
                 (double)shown / secs, atomic_exchange(&n_not_shown, 0), (double)atomic_exchange(&shown_worst_us, 0) / 1e3, shown ? (double)atomic_exchange(&shown_wait_us, 0) / 1e3 / (double)shown : 0.0, threads);
         rt_d3dq_busy_ticks = ticks_drawable = ticks_inflight = ticks_query_wait = 0;
         n_passes = n_quad_clears = n_skipped_clears = n_resolves_in_pass = 0;
         rt_fps_overlay(fps, (double)fps_worst / 1e6);
+#if TARGET_OS_IPHONE
+        void rt_ios_overlay(double fps, double gpu_ms, double shown_a_second);  // the app shell's line over the game (ios/app/main.m)
+        rt_ios_overlay(fps, gpu_ms, (double)shown / secs);
+#endif
         fps_start = now;
         fps_frames = 0;
         fps_worst = 0;
