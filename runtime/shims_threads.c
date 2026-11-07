@@ -582,13 +582,30 @@ static int is_main_queue(u32 q) {
 typedef struct MainWork { DCtx *d; dispatch_semaphore_t done; struct MainWork *next; } MainWork;
 static MainWork *main_head, **main_tail = &main_head;
 static pthread_mutex_t main_mu = PTHREAD_MUTEX_INITIALIZER;
+// The queue is a source of that thread's run loop, so that work sent wakes the loop and runs at once. A bare wake-up isn't enough: a loop with nothing
+// of its own to do sleeps again until its time is up, and the game thread, which hops to the main one several times a frame, waited out up to 2 ms
+// each time (the phone's frame rate stopped at about 65).
+void rt_run_guest_main_queue(void);
+static CFRunLoopSourceRef main_source;
+static void main_source_perform(void *info) {
+    (void)info;
+    rt_run_guest_main_queue();
+}
 static void to_guest_main(DCtx *d, dispatch_semaphore_t done) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        CFRunLoopSourceContext ctx = {0};
+        ctx.perform = main_source_perform;
+        main_source = CFRunLoopSourceCreate(NULL, 0, &ctx);
+        CFRunLoopAddSource(rt_guest_main_loop(), main_source, kCFRunLoopCommonModes);
+    });
     MainWork *w = malloc(sizeof *w);
     *w = (MainWork){d, done, NULL};
     pthread_mutex_lock(&main_mu);
     *main_tail = w;
     main_tail = &w->next;
     pthread_mutex_unlock(&main_mu);
+    CFRunLoopSourceSignal(main_source);
     CFRunLoopWakeUp(rt_guest_main_loop());
 }
 // On the game's main thread: everything sent so far, in order.
