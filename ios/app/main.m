@@ -52,6 +52,15 @@ static void settings(void) {
     rt_ios_hud_at_launch = [d objectForKey:@"metalHUD"] ? [d doubleForKey:@"metalHUD"] > 0 : env_hud && *env_hud == '1';
     [d setBool:rt_ios_hud_at_launch forKey:@"MetalForceHudEnabled"];
     if (rt_ios_hud_at_launch) setenv("MTL_HUD_ENABLED", "1", 1);
+    // The first launch of each new build samples every thread through the startup (hitch.c), so that its log shows where the black seconds go
+    // without a launch from the Mac. A build is known by its executable's time.
+    NSDate *built = [NSFileManager.defaultManager attributesOfItemAtPath:NSBundle.mainBundle.executablePath error:nil].fileModificationDate;
+    if (built && [d doubleForKey:@"profiledBuild"] != built.timeIntervalSince1970 && !getenv("ARKHAM_TRACE_PROFILE")) {
+        [d setDouble:built.timeIntervalSince1970 forKey:@"profiledBuild"];
+        setenv("ARKHAM_TRACE_PROFILE", "0.5", 1);
+        setenv("ARKHAM_TRACE_PROFILE_FOR", "10", 1);
+        fprintf(stderr, "[ios] the first launch of this build: where every thread is, every half second for the first 10 s\n");
+    }
 }
 
 // ---------- the log ----------
