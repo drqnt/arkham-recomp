@@ -143,3 +143,35 @@ app goes to the background.
   sleeping run loop run anything, so each hop waited out the loop's timeout. The queue is now a run loop source. The menu went from 65 to 150-210 FPS,
   with up to 117 frames a second on the 120 Hz screen.
 - Shaders built ahead: `tools/build_ios_shaders.py` (about 40 minutes for the 32,010 different texts, 16 libraries); `tools/ios_install.sh` copies them.
+
+## Controls v3: outside play, the phone upright, the outer screen, 2026-11-07
+
+- **Outside play** (menus, the map, cutscenes) the pad hides, but for a back button at the top left (the pad's ○ or B, which closes the map, backs
+  out of menus and skips cutscenes). The test is the cursor: in play the game warps it back every frame. A game that has stopped warping while its
+  frames go on (`rt_frames_presented`, 20 frames and 0.3 s) is in a menu; one that has stopped both is only busy and stays in play. A tap is a click
+  at the same share of the game's picture, so it lands right wherever the picture is. After it the cursor goes to the window's bottom right corner,
+  where the game draws it off the screen. A drag is the left stick, the other way from the finger, so the map moves with it. The settings can turn
+  the hiding off.
+- **Taps in the pause menu** did nothing because `[NSApp run]` nested in Feral's event pump returned before handing out the events queued for it.
+  It now hands out what's queued, waiting up to 2 ms for more.
+- **The camera** is linear: the right stick's push is the swipe's speed, 3000 points a second for the full push at speed 1. The camera then turns by
+  how far the thumb moves, however fast. To turn far enough, `BmInput.ini` is read with every right-stick axis 10 times faster and with no dead zone:
+  `aTurn`, `aLookup`, and the game's raw `aRawRHJoyRight` and `aRawRHJoyUp`. A real controller's stick gets the dead zone back and a tenth of its push
+  in play, so it turns as before. In menus its push is left as it is, since there the game reads it directly as its gamepad mouse
+  (`[GFxUI.GamepadMouse]`). The PlayStation pad's 255 stick steps would swallow a slow swipe, so the remainder carries to the next frame.
+- **Gadgets**: one button where the cross was. Hold it and the wheel opens; slide to a side and let go to press the pad's cross that way for 0.12 s.
+  The game's bindings for those are `bGadgetSelect*`. Let go without sliding and the wheel stays open for a tap on a side.
+- **Upright** the game takes the top of the screen in its own proportions (`rt_ios_game_rect`, main.m), and the controls get the space below, with a
+  layout of their own. The game's resolution and window don't change.
+- **The layout** is kept per orientation (`layout.landscape`, `layout.portrait`). A moved button is a share of the controls' space and its size is
+  in proportion to that space's height. The same layout therefore comes out in the same places on the foldable's outer and inner screens, only
+  scaled. The first version's layout (offsets from corners) was moved over the first time the phone was held sideways, and was kept as `layout.v2`.
+  On another screen the game's picture keeps its proportions instead of stretching.
+- **The editor** can hide a button (hidden ones show faintly there), reset one button, and reset all, but only after a confirmation. Layout and
+  settings are written through at once.
+- **Name and icon**: the app is "Batman Arkham Asylum" on the home screen. Its icon is the Steam version's own (`GameIcon_STM.icns` in the game's
+  Mac app): `tools/ios_icon.py` fades its Mac frame to black and writes `build/ios/Assets.xcassets`, and `ios/app/run.sh` runs it before each build.
+  Like everything taken from the game, it stays out of the repository.
+- **Shaders built ahead**: with the entry renamed in the text instead of by `-D`, every compile has the same options and one module cache, 19 MB.
+  Before, it was 483 GB in a day. All 32,010 compiled and the 16 libraries (263 MB) are on the phone. The first launch with them took every shader
+  from them (`86 of 86 ... built ahead`), and the title menu ran at about 345 FPS.
