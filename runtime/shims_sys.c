@@ -529,7 +529,7 @@ int rt_scripted_direct_look(double dx, double dy) {
 // on the Mac), and a keyboard's walking, which goes to the same aBaseY, doesn't. Each frame the stick's position goes in, from the input loop's
 // reading of the pointer as the touch camera does, through the stick's bindings (aStrafe and aBaseY with a dead zone of 0.3, and the raw axes), so
 // the walking keeps its analog speed. rt_touch_move gives the position, up and right positive; ARKHAM_MOVE_DIRECT=0 on the phone goes back to the
-// pad's stick; on the Mac it's on with =1, and a scripted run's "move:x:y" steps set it.
+// pad's stick; on the Mac it's on with =1, and a scripted run's "walk:x:y" steps set it.
 static _Atomic float move_x, move_y;
 static _Atomic int move_owned;  // in play: walking goes this way and the pad's stick stays in the middle; in menus the pad's stick pans and points
 int rt_move_direct(void) {

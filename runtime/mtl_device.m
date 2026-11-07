@@ -1955,7 +1955,35 @@ static void apply_fxaa(void) {
     [r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [r endEncoding];
 }
-static u64 n_draws;
+static u64 n_draws, prev_frame_draws;
+// ARKHAM_FIND_CURSOR=frame: from that frame on, each of 24 frames leaves out one draw, counting back from the last one of the frame before, saves its
+// picture (cur-NN, the snapshots' folder) and logs what that draw was. For finding the draw of the menus' mouse cursor, which the game's interface
+// draws into the frame itself.
+void rt_request_snapshot(const char *name);
+static const char *skip_draw_kind;  // which draw call, for the log
+static u32 skip_draw_args[9];
+static int skip_draw_now(void) {
+    static long first = -1;
+    if (first < 0) first = getenv("ARKHAM_FIND_CURSOR") ? atol(getenv("ARKHAM_FIND_CURSOR")) : 0;
+    if (!first) return 0;
+    unsigned rt_frames_presented(void);
+    unsigned f = rt_frames_presented();
+    if (f < (unsigned long)first || f >= (unsigned long)first + 80) return 0;
+    u64 k = f - (unsigned long)first;
+    if (prev_frame_draws < k + 1 || n_draws != prev_frame_draws - 1 - k) return 0;
+    Obj *t = cur_tex[0];
+    fprintf(stderr, "[cursor] frame %u leaves out draw %llu of %llu: texture 0 %s %ux%u format %#x guest %08x, texture 1 %ux%u, vs %08x ps %08x\n", f, n_draws,
+            prev_frame_draws, t ? "is" : "none", t ? t->width : 0, t ? t->height : 0, t ? t->format : 0, t ? t->guest : 0, cur_tex[1] ? cur_tex[1]->width : 0,
+            cur_tex[1] ? cur_tex[1]->height : 0, cur_vs ? cur_vs->guest : 0, cur_ps ? cur_ps->guest : 0);
+    fprintf(stderr, "[cursor]   %s args %u %u %u %u %u %u %u %u, stream 0 stride %u, VS c0-c3:", skip_draw_kind ? skip_draw_kind : "?", skip_draw_args[1], skip_draw_args[2],
+            skip_draw_args[3], skip_draw_args[4], skip_draw_args[5], skip_draw_args[6], skip_draw_args[7], skip_draw_args[8], streams[0].stride);
+    for (int r = 0; r < 4; r++) fprintf(stderr, " (%.3g %.3g %.3g %.3g)", vs_const[r][0], vs_const[r][1], vs_const[r][2], vs_const[r][3]);
+    fprintf(stderr, "\n");
+    char name[32];
+    snprintf(name, sizeof name, "cur-%02llu", k);
+    rt_request_snapshot(name);
+    return 1;
+}
 // After each draw: FXAA once the engine's last full-screen pass of a 3D frame is in the back buffer.
 static inline void after_draw(void) {
     if (__builtin_expect(fxaa_on(), 0) && !fxaa_done && rt_surface == back_buffer && !ds_surface && n_draws > 300) {
@@ -1964,6 +1992,13 @@ static inline void after_draw(void) {
     }
 }
 static void m_DrawPrimitive(CPU *c) {  // this, type, start, primitives
+    skip_draw_kind = "DrawPrimitive";
+    for (int a_ = 1; a_ < 4; a_++) skip_draw_args[a_] = ARG(a_);
+    if (__builtin_expect(skip_draw_now(), 0)) {
+        n_draws++;
+        RET(0);
+        return;
+    }
     u32 st[3] = {streams[0].stride, streams[1].stride, streams[2].stride};
     if (!prepare_draw(st, 0)) {
         RET(0);
@@ -1977,6 +2012,13 @@ static void m_DrawPrimitive(CPU *c) {  // this, type, start, primitives
     RET(0);
 }
 static void m_DrawIndexedPrimitive(CPU *c) {  // this, type, base vertex, min index, vertices, start index, primitives
+    skip_draw_kind = "DrawIndexedPrimitive";
+    for (int a_ = 1; a_ < 7; a_++) skip_draw_args[a_] = ARG(a_);
+    if (__builtin_expect(skip_draw_now(), 0)) {
+        n_draws++;
+        RET(0);
+        return;
+    }
     u32 st[3] = {streams[0].stride, streams[1].stride, streams[2].stride};
     int instanced = instancing();
     if (!cur_ib || !prepare_draw(st, instanced)) {
@@ -1994,6 +2036,13 @@ static void m_DrawIndexedPrimitive(CPU *c) {  // this, type, base vertex, min in
     RET(0);
 }
 static void m_DrawPrimitiveUP(CPU *c) {  // this, type, primitives, data, stride
+    skip_draw_kind = "DrawPrimitiveUP";
+    for (int a_ = 1; a_ < 5; a_++) skip_draw_args[a_] = ARG(a_);
+    if (__builtin_expect(skip_draw_now(), 0)) {
+        n_draws++;
+        RET(0);
+        return;
+    }
     u32 stride = ARG(4), verts = prim_verts(ARG(1), ARG(2));
     u32 st[3] = {stride, streams[1].stride, streams[2].stride};
     if (!prepare_draw(st, 0)) {
@@ -2012,7 +2061,44 @@ static void m_DrawPrimitiveUP(CPU *c) {  // this, type, primitives, data, stride
     after_draw();
     RET(0);
 }
+// The menus' mouse cursor, drawn by the game's interface (Scaleform) into the frame as its last two draws: the arrow's white fill (12 vertices,
+// 10 triangles) and its black outline (16, 24), from user memory with 8-byte vertices, with the interface's 1024 x 1024 shape cache as texture 0. Found on the Mac by
+// leaving out one draw a frame (ARKHAM_FIND_CURSOR) and looking at the pictures. On the phone draws like these are left out when the frame before
+// ended with them, as only the cursor does, so the pointer still goes where a tap puts it and clicks there, and nothing draws it; the menus warp the
+// cursor as play does, so that can't tell them apart. ARKHAM_SHOW_CURSOR=1 draws it again; on the Mac, whose own cursor shows, ARKHAM_HIDE_CURSOR=1
+// hides it.
+static u64 cursor_fill_at = ~0ull, cursor_outline_at = ~0ull;  // where this frame drew them
+static int cursor_ended_last_frame;
+static int hide_cursor_on(void) {
+    static int on = -1;
+#if TARGET_OS_IPHONE
+    if (on < 0) on = !getenv("ARKHAM_SHOW_CURSOR");
+#else
+    if (on < 0) on = getenv("ARKHAM_HIDE_CURSOR") != NULL;
+#endif
+    return on;
+}
+static int is_cursor_draw(CPU *c) {
+    if (ARG(1) != 4 || ARG(2) != 0 || ARG(8) != 8 || !((ARG(3) == 16 && ARG(4) == 24) || (ARG(3) == 12 && ARG(4) == 10))) return 0;
+    Obj *t = cur_tex[0];
+    if (!t || t->width != 1024 || t->height != 1024 || t->format != 0x32) return 0;
+    if (ARG(3) == 12) cursor_fill_at = n_draws;
+    else cursor_outline_at = n_draws;
+    return hide_cursor_on() && cursor_ended_last_frame;
+}
 static void m_DrawIndexedPrimitiveUP(CPU *c) {  // this, type, min index, vertices, primitives, indices, format, data, stride
+    if (is_cursor_draw(c)) {
+        n_draws++;
+        RET(0);
+        return;
+    }
+    skip_draw_kind = "DrawIndexedPrimitiveUP";
+    for (int a_ = 1; a_ < 9; a_++) skip_draw_args[a_] = ARG(a_);
+    if (__builtin_expect(skip_draw_now(), 0)) {
+        n_draws++;
+        RET(0);
+        return;
+    }
     u32 stride = ARG(8), verts = ARG(2) + ARG(3), count = prim_verts(ARG(1), ARG(4));
     int wide = ARG(6) == 102;
     u32 st[3] = {stride, streams[1].stride, streams[2].stride};
@@ -3163,6 +3249,9 @@ static void m_Present(CPU *c) {
     frame_wait_ns = 0;
 #endif
     note_frame(n_draws);
+    prev_frame_draws = n_draws;
+    cursor_ended_last_frame = n_draws >= 2 && cursor_fill_at == n_draws - 2 && cursor_outline_at == n_draws - 1;
+    cursor_fill_at = cursor_outline_at = ~0ull;
     n_draws = 0;
     fxaa_done = 0;
     {

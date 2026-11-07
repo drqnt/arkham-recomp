@@ -317,7 +317,7 @@ static void tick(void) {
     for (int i = 0; i < want->n && i < 64; i++) {
         Control *k = &want->controls[i];
         vals[i] = fake_pad ? k->fake : touching ? read_touch(want, k) : read_control(want, g, k);
-        if (fake_pad && (k->what == LX || k->what == LY) && !rt_move_owned()) {  // a scripted "move" off play, as the phone's touch stick
+        if (fake_pad && (k->what == LX || k->what == LY) && !rt_move_owned()) {  // a scripted "walk" off play, as the phone's touch stick
             float mx, my;
             rt_touch_move_get(&mx, &my);
             if (mx != 0 || my != 0) vals[i] = stick(want, k->what == LX ? mx : -my);
