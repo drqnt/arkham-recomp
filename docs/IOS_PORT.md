@@ -328,3 +328,24 @@ app goes to the background.
 - **What's left of the black screen** (v7 log): engine start to sound 4.2 s (Mac 2.6 s); the back buffer to the first frame 2.6 s (Mac 0.3 s);
   then about 3.8 s of black frames before the logo film, the same on the Mac. `ARKHAM_TRACE_PROFILE=0.5 ARKHAM_TRACE_PROFILE_FOR=13` samples
   every thread for only the first 13 s.
+
+## Controls v9: the vertical, the menu cursor, camera assist; where the rest of the startup goes, 2026-11-07
+
+- **v8 on the phone:** up and down came out inverted; the save menu showed the mouse cursor; running, the camera didn't turn at all, though the
+  log showed the swipes reaching the engine (623 frames with motion).
+- **The vertical:** F_0048c10 gives MouseY as the centre minus the pointer, so up is positive; v8 passed the pointer's own direction. Fixed in
+  `touch_mouse_to_engine`.
+- **The cursor:** v7's hook, which marks the input loop's own MouseX/MouseY calls as from a pad, had kept the menus with the pad, so they never
+  showed their cursor after a tap moved the pointer. v8 had turned it off on the phone; it's on again (`ARKHAM_MOUSE_NOT_PAD=1` turns it off).
+  The pointer still moves and clicks where the finger taps; it just isn't drawn. The user wants exactly that.
+- **Running:** the game's camera assist (`EnableCameraAssist` in `[BmGame.R3rdPersonCamera]`, BmCamera.ini, True by default) turns the camera
+  behind Batman as he runs when a pad is in use. With the touch camera reaching the engine as a pad, it won over the swipe. The camera settings
+  are now rewritten on read like the input ones. A new switch, "Помощь камеры" (off by default, from the next launch), sets it through
+  `ARKHAM_CAMERA_ASSIST`. Not confirmed yet that this was all of it.
+- **"Заметность"** is now "Прозрачность кнопок".
+- **The startup** in this version: sound at 4.7 s, the first frame at 7.3 s, the logo film at 11.2 s (v6: 15.6, 18.7 and about 22 s). Path
+  lookups now take 29 ms in all.
+  - A startup profile (`ARKHAM_TRACE_PROFILE=0.5 ARKHAM_TRACE_PROFILE_FOR=14`, through `devicectl ... launch -e`) put the game thread from
+    5.4 s to 7.2 s almost entirely in throwing: Unreal throws a string from StaticLoadObject for each object it doesn't find and catches it
+    itself. The runtime then looks for the handler's native frame with libunwind, and the phone spent its time inside libunwind.
+  - The first throw took 8 ms for 4 steps. `[eh]` lines give the running totals (throws, time, steps) at a throw at most every 5 s.
