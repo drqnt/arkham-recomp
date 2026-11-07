@@ -22,6 +22,7 @@ out=${TMPDIR:-/tmp}/arkham-app-build
 app="$out/Build/Products/Release-iphoneos/Arkham.app"
 
 python3 "$root/tools/build.py" --ios | tail -1 || exit 1
+python3 -I "$root/tools/ios_icon.py" || exit 1  # the icon, from the game's own on this Mac, into build/ios
 rm -rf "$app"
 xcodebuild -project Arkham.xcodeproj -scheme Arkham -configuration Release -destination "id=$id" -derivedDataPath "$out" -allowProvisioningUpdates \
   -allowProvisioningDeviceRegistration DEVELOPMENT_TEAM="$team" build 2>&1 | grep -E "error:|BUILD (SUCCEEDED|FAILED)" | cut -c1-200

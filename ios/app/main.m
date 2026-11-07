@@ -1,6 +1,9 @@
-// The iPhone app around the game: a full-screen landscape view that the Metal layer draws into (rt_ios_game_view), sound set up the way a
-// game wants it, and the game itself started on a thread with a large stack (rt_main), since translated code mirrors the game's calls on
-// the native stack and iOS gives the main thread 1 MB. Everything else is the runtime in build/ios/libarkham.a, built by tools/build.py --ios.
+// The iPhone app around the game: a full-screen view that the Metal layer draws into (rt_ios_game_view), sound set up the way a game wants it,
+// and the game itself started on a thread with a large stack (rt_main), since translated code mirrors the game's calls on the native stack and
+// iOS gives the main thread 1 MB. Everything else is the runtime in build/ios/libarkham.a, built by tools/build.py --ios.
+//
+// Held sideways the game fills the screen; held upright, it takes the top in its own proportions and the touch controls the rest
+// (TouchControls.m). On a screen of other proportions than the one the game started on, such as a foldable's outer one, it keeps its own.
 //
 // What the game needs in the app's Documents folder, put there by tools/ios_install.sh (docs/IOS_PORT.md):
 //   Batman Arkham Asylum GOTY/   the Steam folder of the game, as on the Mac
@@ -112,27 +115,54 @@ static void start_game(void) {
 }
 
 // ---------- the screen ----------
+static UIView *root_view;
+// Where the game's picture is, in the view's points: across the top under the camera when the phone is upright, otherwise the middle of the screen,
+// always in the proportions of the screen the game started on (what it was told its display is: rt_ios_screen_w and _h).
+CGRect rt_ios_game_rect(void) {
+    UIView *v = root_view;
+    if (!v) return CGRectZero;
+    CGSize s = v.bounds.size;
+    double aspect = rt_ios_screen_h > 0 ? rt_ios_screen_w / rt_ios_screen_h : 1.42;
+    if (s.height > s.width) return CGRectMake(0, v.safeAreaInsets.top, s.width, round(s.width / aspect));
+    CGFloat w = s.width, h = round(s.width / aspect);
+    if (h > s.height) {
+        h = s.height;
+        w = round(h * aspect);
+    }
+    return CGRectMake(round((s.width - w) / 2), round((s.height - h) / 2), w, h);
+}
+
 @interface GameViewController : UIViewController
 @end
-@implementation GameViewController
+@implementation GameViewController {
+    CGSize laid_out;
+}
 - (void)loadView {
     UIView *v = [UIView new];
     v.backgroundColor = UIColor.blackColor;
     v.multipleTouchEnabled = YES;
-    self.view = v;
+    self.view = root_view = v;
 }
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
-// The Metal layer (mtl_device.m) is a sublayer of this view's: it follows the view when the phone turns from one landscape side to the other.
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAllButUpsideDown; }
+// The Metal layer (mtl_device.m) is a sublayer of this view's: it goes where the picture goes whenever the view changes, as the phone turns or folds.
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
+    CGRect g = rt_ios_game_rect();
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     for (CALayer *l in self.view.layer.sublayers)
-        if ([l isKindOfClass:CAMetalLayer.class]) l.frame = self.view.bounds;
+        if ([l isKindOfClass:CAMetalLayer.class]) l.frame = g;
     [CATransaction commit];
+    CGSize s = self.view.bounds.size;
+    if (!CGSizeEqualToSize(s, laid_out)) {
+        laid_out = s;
+        UIEdgeInsets in = self.view.safeAreaInsets;
+        fprintf(stderr, "[ios] the view is %.0f x %.0f points (safe area insets top %.0f left %.0f bottom %.0f right %.0f), the game's picture %.0f x %.0f at %.0f,%.0f\n",
+                s.width, s.height, in.top, in.left, in.bottom, in.right, g.size.width, g.size.height, g.origin.x, g.origin.y);
+    }
 }
 @end
 
