@@ -597,7 +597,10 @@ static int language_file(const char *path) {
     const char *lang = getenv("ARKHAM_LANGUAGE");
     size_t n = strlen(path), t = sizeof tail - 1;
     if (!lang || !*lang || n < t || strcmp(path + n - t, tail)) return -1;
-    char tmp[] = "/tmp/arkham-language-XXXXXX";
+    // The process's own temporary folder: an iOS app may not write to /tmp.
+    const char *dir = getenv("TMPDIR");
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s/arkham-language-XXXXXX", dir && *dir ? dir : "/tmp");
     int fd = mkstemp(tmp);
     if (fd < 0) return -1;
     unlink(tmp);
