@@ -36,11 +36,15 @@ libraries and caches. A phone's screen and its render targets are smaller, so th
 7. **Frame rate and heat.** 60 FPS by default with a 120 option later, as the user wants; 2x MSAA with FXAA, a lower internal resolution, and MetalFX upscaling.
 8. **Touch controls**, after the game runs with a controller.
 
-## Decisions for the user
+## Decisions
 
-- **Steam.** I won't make the game believe Steam said yes when it didn't. What I'd build instead: the phone asks the real Steam running on the user's Mac, over the local
-  network, through a small helper on the Mac that uses Valve's own library, and the helper can carry save files both ways too. The Mac with Steam then has to be on the
-  same network while playing.
-- **Apple developer account.** With the free Personal Team the app has to be installed again every 7 days and can't have the larger memory limit; the paid account
-  ($99 a year) installs for a year and allows it.
-- **Metal Toolchain**, for building shader libraries on the Mac: a download through Xcode.
+- **Apple developer account:** the free Personal Team (user's decision, 2026-11-07). The app is installed again from Xcode every 7 days, and it has to stay within the
+  memory an app gets without the larger-limit entitlement, 3.2 to 3.5 GB on this phone.
+- **Metal Toolchain:** downloaded (user's decision).
+- **Steam:** open. The user would rather the phone skip the ownership check, since the game is theirs; I won't write code that tells the game Steam said yes when it
+  didn't. What I proposed instead, built so it stays out of the way:
+  - The game's Steam calls on the phone go over Wi-Fi to a small helper on the Mac, which asks the real Steam client through Valve's own library. No cable.
+  - The check happens when the game starts. After that the Mac can be switched off; achievements, stats and saves the game hands Steam later are kept on the phone.
+  - The phone remembers the real answer for a while, the way Steam's own offline mode lets a bought game start without a connection, so day to day the Mac doesn't
+    need to be on at all.
+  - When the Mac is reachable, the helper can also carry saves to and from Steam Cloud.
