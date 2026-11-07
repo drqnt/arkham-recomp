@@ -150,12 +150,25 @@ static int hat(GCControllerDirectionPad *d) {
     if (left) return 6;
     return 8;
 }
+// On the phone the game reads its right stick 10 times faster and with no dead zone (BmInput.ini, as shims_libc.c gives it), for the touch controls'
+// swipes. A real controller's stick gets the game's own dead zone back and a tenth of its push, which turns the camera as before. Not in menus, where
+// the game takes the stick as it comes, as its gamepad mouse (DefaultInput.ini, [GFxUI.GamepadMouse]): there it's left as it is.
+int rt_game_holds_cursor(void);  // shims_sys.c: in play
+static float right_stick(float v) {
+#if TARGET_OS_IPHONE
+    if (!rt_game_holds_cursor()) return v;
+    if (fabsf(v) < 0.2f) return 0;
+    return v / 10.0f;
+#else
+    return v;
+#endif
+}
 static int read_control(const Profile *f, GCExtendedGamepad *g, const Control *k) {
     switch (k->what) {
         case LX: return stick(f, g.leftThumbstick.xAxis.value);
         case LY: return stick(f, -g.leftThumbstick.yAxis.value);
-        case RX: return stick(f, g.rightThumbstick.xAxis.value);
-        case RY: return stick(f, -g.rightThumbstick.yAxis.value);
+        case RX: return stick(f, right_stick(g.rightThumbstick.xAxis.value));
+        case RY: return stick(f, -right_stick(g.rightThumbstick.yAxis.value));
         case LT: return clamp((int)(g.leftTrigger.value * 255.0f + 0.5f), 0, 255);
         case RT: return clamp((int)(g.rightTrigger.value * 255.0f + 0.5f), 0, 255);
         case HAT: return hat(g.dpad);

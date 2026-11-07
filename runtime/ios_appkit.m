@@ -640,7 +640,14 @@ void rt_run_guest_main_queue(void);  // shims_threads.c: what the game sent to i
 - (void)run {
     if (_running) {
         rt_run_guest_main_queue();
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.002, true);  // a short wait, as above; on a Mac it is the event's handling that takes the time
+        // AppKit's run hands each event it takes to sendEvent: itself, and the game's pump in play and in its pause menu is stop: then run: taps
+        // reach the game here or not at all.
+        NSEvent *e = [self takeEventMatching:~0ull];
+        if (!e) {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.002, true);  // a short wait, as above; on a Mac it is the event's handling that takes the time
+            e = [self takeEventMatching:~0ull];
+        }
+        for (; e; e = [self takeEventMatching:~0ull]) [self sendEvent:e];
         rt_run_guest_main_queue();
         atomic_store(&_stopped, 0);
         return;
@@ -970,27 +977,40 @@ Class rt_ios_class(const char *name) {
     return objc_getClass(name);
 }
 
-// A tap on the phone's screen as a click of the left button there, for the game's menus (ios/app/TouchControls.m), in the window's points from its
-// top left. The cursor goes there first, and the button comes up a little later, as a finger would let go.
+// A tap on the phone's screen as a click of the left button there, for the game's menus (ios/app/TouchControls.m). Where it lands is given as a
+// share of the game's picture, from its top left, since the picture needn't fill the screen (upright, or on the outer screen); the window's own
+// points come from that here. The cursor goes there first, the button comes up a little later, as a finger would let go, and then the cursor goes
+// into the bottom right corner, where the game draws it off the screen: a phone has no cursor to show.
 void rt_touch_cursor(double x, double y);  // shims_sys.c
-void rt_ios_click(double x, double y) {
+static void move_cursor(NSWindow *w, double x, double y) {
+    rt_touch_cursor(x, y);
+    NSEvent *moved = [NSEvent mouseEventWithType:5 location:CGPointMake(x, w->_frame.size.height - y) modifierFlags:0 timestamp:CFAbsoluteTimeGetCurrent()
+                                    windowNumber:1 context:nil eventNumber:0 clickCount:0 pressure:0];
+    moved->_window = w;
+    [[NSApplication sharedApplication] postEvent:moved atStart:NO];
+}
+void rt_ios_park_cursor(void) {
+    NSWindow *w = [[NSApplication sharedApplication] keyWindow];
+    if (w) move_cursor(w, w->_frame.size.width - 1, w->_frame.size.height - 1);
+}
+void rt_ios_click(double share_x, double share_y) {
     NSApplication *app = [NSApplication sharedApplication];
     NSWindow *w = [app keyWindow];
     if (!w) return;
-    rt_touch_cursor(x, y);
+    double x = share_x * w->_frame.size.width, y = share_y * w->_frame.size.height;
+    move_cursor(w, x, y);
     CGPoint at = CGPointMake(x, w->_frame.size.height - y);
-    double now = CFAbsoluteTimeGetCurrent();
-    NSEvent *moved = [NSEvent mouseEventWithType:5 location:at modifierFlags:0 timestamp:now windowNumber:1 context:nil eventNumber:0 clickCount:0 pressure:0];
-    NSEvent *down = [NSEvent mouseEventWithType:1 location:at modifierFlags:0 timestamp:now windowNumber:1 context:nil eventNumber:1 clickCount:1 pressure:1];
-    moved->_window = down->_window = w;
-    [app postEvent:moved atStart:NO];
+    NSEvent *down = [NSEvent mouseEventWithType:1 location:at modifierFlags:0 timestamp:CFAbsoluteTimeGetCurrent() windowNumber:1 context:nil eventNumber:1 clickCount:1 pressure:1];
+    down->_window = w;
     [app postEvent:down atStart:NO];
-    [[w retain] autorelease];
     NSWindow *kept = [w retain];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         NSEvent *up = [NSEvent mouseEventWithType:2 location:at modifierFlags:0 timestamp:CFAbsoluteTimeGetCurrent() windowNumber:1 context:nil eventNumber:2 clickCount:1 pressure:0];
         up->_window = kept;
         [app postEvent:up atStart:NO];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 160 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        move_cursor(kept, kept->_frame.size.width - 1, kept->_frame.size.height - 1);
         [kept release];
     });
 }

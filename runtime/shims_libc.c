@@ -662,7 +662,85 @@ static int trace_fs_early(void) { return getenv("ARKHAM_TRACE_FS") != NULL; }
 // - bSmoothFrameRate, the engine's own frame limit at MaxSmoothedFrameRate (62), off unless ARKHAM_FRAME_LIMIT=1 (rt_no_frame_limit); a first start
 //   on a new machine writes it on. ARKHAM_FPS_CAP is the runtime's own limit.
 extern int rt_no_frame_limit;
+#if TARGET_OS_IPHONE
+// BmInput.ini on the phone: everything the right stick feeds (aTurn and aLookup, which turn the camera, and the game's own raw aRawRHJoyRight and
+// aRawRHJoyUp, which it may turn it with instead) made RIGHT_STICK_SPEED times faster and without the game's dead zone, so that swipes, which reach the
+// game as that stick (ios/app/TouchControls.m), can turn the camera as far as a thumb moves. A real controller's right stick is given back its dead
+// zone and scaled down as much in shims_hid.m, so it turns as it always did.
+#define RIGHT_STICK_SPEED 10.0
+static const char *right_stick_axis(const char *q, const char *end) {
+    static const char *const names[] = {"Axis aTurn ", "Axis aLookup ", "Axis aRawRHJoyRight ", "Axis aRawRHJoyUp "};
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+        size_t n = strlen(names[i]);
+        if ((size_t)(end - q) > n && !strncmp(q, names[i], n)) return q;
+    }
+    return NULL;
+}
+static char *right_stick_line(const char *line, size_t len) {
+    if (!memmem(line, len, "XboxTypeS_RightX", 16) && !memmem(line, len, "XboxTypeS_RightY", 16)) return NULL;
+    char *out = malloc(len * 2 + 64), *o = out;
+    const char *p = line, *end = line + len;
+    while (p < end) {
+        const char *axis = NULL;
+        for (const char *q = p; q + 11 < end && !axis; q++) axis = right_stick_axis(q, end);
+        if (!axis) {
+            memcpy(o, p, (size_t)(end - p));
+            o += end - p;
+            break;
+        }
+        memcpy(o, p, (size_t)(axis - p));
+        o += axis - p;
+        const char *name_end = strchr(axis + 5, ' ');
+        double speed = 1.0;
+        const char *sp = strstr(axis, "Speed="), *bar = strchr(axis, '|');
+        if (sp && (!bar || sp < bar)) speed = atof(sp + 6);
+        o += sprintf(o, "%.*s Speed=%.2f DeadZone=0.0", (int)(name_end - axis), axis, speed * RIGHT_STICK_SPEED);
+        // the rest of this axis's settings, up to the next command
+        const char *next = bar ? bar : end;
+        const char *close = memchr(axis, '"', (size_t)(end - axis));
+        if (close && close < next) next = close;
+        p = next;
+    }
+    *o = 0;
+    return out;
+}
+#endif
 static FILE *language_ini(const char *path, const char *mode) {
+#if TARGET_OS_IPHONE
+    static const char input_tail[] = "/BmInput.ini";
+    size_t pn = strlen(path), it = sizeof input_tail - 1;
+    if (mode[0] == 'r' && pn >= it && !strcmp(path + pn - it, input_tail)) {
+        FILE *in = fopen(path, "rb");
+        if (!in) return NULL;
+        fseek(in, 0, SEEK_END);
+        long size = ftell(in);
+        fseek(in, 0, SEEK_SET);
+        char *text = malloc((size_t)size + 1), *out = malloc((size_t)size * 2 + 1024);
+        size_t got = fread(text, 1, (size_t)size, in), o = 0;
+        fclose(in);
+        text[got] = 0;
+        int changed = 0;
+        for (char *line = text; *line;) {
+            char *end = strchr(line, '\n');
+            size_t len = end ? (size_t)(end - line + 1) : strlen(line);
+            char *fixed = right_stick_line(line, len);
+            if (fixed) {
+                size_t fl = strlen(fixed);
+                memcpy(out + o, fixed, fl);
+                o += fl;
+                free(fixed);
+                changed++;
+            } else {
+                memcpy(out + o, line, len);
+                o += len;
+            }
+            line += len;
+        }
+        free(text);
+        fprintf(stderr, "[input] the engine reads BmInput.ini with %d right stick lines %gx faster and without a dead zone\n", changed, RIGHT_STICK_SPEED);
+        return fmemopen(out, o, "r");
+    }
+#endif
     static const char *const codes[][2] = {{"en", "int"}, {"fr", "fra"}, {"de", "deu"}, {"it", "ita"}, {"es", "esn"}, {"pl", "pol"}, {"ru", "rus"}};
     static const char tail[] = "/BmEngine.ini";
     const char *lang = getenv("ARKHAM_LANGUAGE"), *ue = NULL;

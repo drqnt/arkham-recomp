@@ -2391,7 +2391,8 @@ static void make_layer_on_main(void) {
     l.framebufferOnly = NO;
     l.opaque = YES;
     l.maximumDrawableCount = 3;
-    l.frame = content.bounds;
+    CGRect rt_ios_game_rect(void);  // ios/app/main.m: the whole screen held sideways, its top held upright; the app moves the layer as that changes
+    l.frame = rt_ios_game_rect();
     UIScreen *screen = content.window.windowScene.screen;
     l.contentsScale = screen ? screen.nativeScale : 3.0;
     // ARKHAM_METAL_HUD=1: Apple's Metal performance HUD on the game's layer, as config.local's switch does on the Mac; or the phone's settings.
@@ -2804,8 +2805,13 @@ void rt_set_metal_hud(int on) {
     });
 #endif
 }
+// Frames the game has finished, for the phone's touch controls (ios/app/TouchControls.m): a game that has stopped warping the cursor while frames
+// go on is in a menu, while one that has stopped both is only busy.
+static _Atomic unsigned frames_total;
+unsigned rt_frames_presented(void) { return atomic_load(&frames_total); }
 static void note_frame(u64 draws) {
     static u64 fps_start, fps_frames, fps_worst, fps_prev, draws_seen;
+    atomic_fetch_add(&frames_total, 1);
     u64 now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (!fps_start) fps_start = now;
     if (fps_prev && now - fps_prev > fps_worst) fps_worst = now - fps_prev;
