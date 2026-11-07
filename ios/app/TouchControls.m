@@ -23,6 +23,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
+#include "BatIcons.h"
 
 void rt_touch_pad(float lx, float ly, float rx, float ry, float lt, float rt, unsigned buttons);
 void rt_touch_mouse(double dx, double dy);  // shims_sys.c: the pointer's motion in pixels, which the game reads as its mouse's
@@ -167,31 +168,26 @@ static UIBezierPath *ps_shape(int shape, CGPoint c, CGFloat s) {
 // The bat: a batarang for the gadgets, and on R2 while aiming, where the game throws one. Wings with three scallops below each, ears, a pointed tail;
 // s is half its width.
 static UIBezierPath *bat_shape(CGPoint c, CGFloat s) {
-    static const CGFloat right[][2] = {{0.06, -0.14}, {0.10, -0.40}, {0.15, -0.12}, {0.32, -0.12}};
-    UIBezierPath *p = [UIBezierPath bezierPath];
-    CGPoint (^at)(CGFloat, CGFloat) = ^CGPoint(CGFloat x, CGFloat y) { return CGPointMake(c.x + x * s, c.y + y * s); };
-    for (int side = 1; side >= -1; side -= 2) {
-        if (side == 1) [p moveToPoint:at(0, -0.14)];
-        if (side == 1) {
-            for (int i = 0; i < 4; i++) [p addLineToPoint:at(right[i][0], right[i][1])];
-            [p addQuadCurveToPoint:at(1.0, -0.36) controlPoint:at(0.62, -0.16)];
-            [p addLineToPoint:at(0.86, 0.04)];
-            [p addQuadCurveToPoint:at(0.66, 0.02) controlPoint:at(0.74, -0.08)];
-            [p addQuadCurveToPoint:at(0.46, 0.18) controlPoint:at(0.52, 0.02)];
-            [p addQuadCurveToPoint:at(0.22, 0.24) controlPoint:at(0.30, 0.10)];
-            [p addLineToPoint:at(0, 0.44)];
-        } else {
-            [p addLineToPoint:at(-0.22, 0.24)];
-            [p addQuadCurveToPoint:at(-0.46, 0.18) controlPoint:at(-0.30, 0.10)];
-            [p addQuadCurveToPoint:at(-0.66, 0.02) controlPoint:at(-0.52, 0.02)];
-            [p addQuadCurveToPoint:at(-0.86, 0.04) controlPoint:at(-0.74, -0.08)];
-            [p addLineToPoint:at(-1.0, -0.36)];
-            [p addQuadCurveToPoint:at(-0.32, -0.12) controlPoint:at(-0.62, -0.16)];
-            for (int i = 3; i >= 0; i--) [p addLineToPoint:at(-right[i][0], right[i][1])];
-        }
-    }
-    [p closePath];
-    return p;
+    CGMutablePathRef p = CGPathCreateMutable();
+    bat_path_add(p, c.x, c.y, s);
+    UIBezierPath *b = [UIBezierPath bezierPathWithCGPath:p];
+    CGPathRelease(p);
+    return b;
+}
+// A button's own icon (BatIcons.h), white on clear, w points across; nil for a button without one. Kept, since a size comes back on every restyle.
+static UIImage *bat_icon(const char *ident, CGFloat w) {
+    static NSCache *made;
+    if (!made) made = [NSCache new];
+    NSString *key = [NSString stringWithFormat:@"%s@%.1f", ident, w];
+    UIImage *img = [made objectForKey:key];
+    if (img) return img;
+    __block int drawn = 0;
+    img = [[[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(w, w)] imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        drawn = bat_icon_draw(ctx.CGContext, ident, w);
+    }];
+    if (!drawn) return nil;
+    [made setObject:img forKey:key];
+    return img;
 }
 static UIImage *symbol(NSString *name, CGFloat size, UIColor *color) {
     UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:size weight:UIImageSymbolWeightSemibold];
@@ -513,10 +509,10 @@ static void open_settings(void);
         // An icon of what the button does, with the PlayStation symbol or name it is in a corner, to match the game's prompts. The icon's shape is
         // a mask over a layer of the button's colour, so that changing that colour is cheap.
         b.kind = KIND_ICON;
-        UIImage *img = symbol(@(d->icon), r * 0.85, UIColor.whiteColor);
+        CGFloat w = r * 1.15;
+        UIImage *img = bat_icon(d->ident, w) ?: symbol(@(d->icon), r * 0.85, UIColor.whiteColor);
         if (img) {
             b.icon.hidden = NO;
-            CGFloat w = r * 1.15;
             b.icon.frame = CGRectMake(c.x - w / 2, c.y - w / 2, w, w);
             b.icon_mask.frame = b.icon.bounds;
             b.icon_mask.contents = (__bridge id)img.CGImage;
