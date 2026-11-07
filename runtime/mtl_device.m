@@ -2463,6 +2463,66 @@ static void *drawable_main(void *unused) {
     }
     return NULL;
 }
+static id<CAMetalDrawable> take_drawable(void);
+static void watch_shown(id<CAMetalDrawable> dr);
+// Copying into a drawable makes the GPU wait until the display has let that drawable go. In the one queue everything runs in order, so the next frames waited too: the game
+// stopped at 240 FPS, two frames a refresh of a 120 Hz display, and its render thread polled for the GPU in the meantime. So the frame is copied to a texture of our own in
+// the main queue, and a queue of its own waits for that and for the display, copies and presents. ARKHAM_MTL_ONE_QUEUE=1 brings the old way back.
+#define PRESENT_SLOTS 3
+static id<MTLCommandQueue> present_queue;
+static id<MTLEvent> present_event;
+static u64 present_value;
+static id<MTLTexture> present_copy[PRESENT_SLOTS];
+static _Atomic int present_busy[PRESENT_SLOTS];
+static void present_on_its_own_queue(void) {
+    if (!present_queue) {
+        present_queue = [dev newCommandQueue];
+        present_event = [dev newEvent];
+    }
+    int slot = -1;
+    for (int i = 0; i < PRESENT_SLOTS; i++)
+        if (!atomic_load(&present_busy[i])) {
+            slot = i;
+            break;
+        }
+    if (slot < 0) return;  // the display is behind: this frame isn't shown
+    id<CAMetalDrawable> dr = take_drawable();
+    if (!dr) return;
+    id<MTLTexture> bb = back_buffer->tex;
+    // One made before a change of resolution has the old size. Letting it go makes the next one the right size.
+    if (dr.texture.width != bb.width || dr.texture.height != bb.height) {
+        [dr release];
+        return;
+    }
+    id<MTLTexture> copy = present_copy[slot];
+    if (!copy || copy.width != bb.width || copy.height != bb.height || copy.pixelFormat != bb.pixelFormat) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:bb.pixelFormat width:bb.width height:bb.height mipmapped:NO];
+        d.storageMode = MTLStorageModePrivate;
+        d.usage = 0;
+        [copy release];
+        copy = present_copy[slot] = [dev newTextureWithDescriptor:d];
+    }
+    atomic_store(&present_busy[slot], 1);
+    ensure_cb();
+    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    [b copyFromTexture:bb toTexture:copy];
+    [b endEncoding];
+    u64 v = ++present_value;
+    [cb encodeSignalEvent:present_event value:v];
+    id<MTLCommandBuffer> p = [present_queue commandBuffer];
+    [p encodeWaitForEvent:present_event value:v];
+    b = [p blitCommandEncoder];
+    [b copyFromTexture:copy toTexture:dr.texture];
+    [b endEncoding];
+    watch_shown(dr);
+    [p presentDrawable:dr];
+    [p addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        atomic_store(&present_busy[slot], 0);
+    }];
+    [p commit];
+    [dr release];
+}
 // Returns a retained drawable, or nil when this frame isn't going on screen.
 static id<CAMetalDrawable> take_drawable(void) {
     static int vsync = -1;
@@ -2638,7 +2698,9 @@ static void m_Present(CPU *c) {
     }
     static int no_present = -1;
     if (no_present < 0) no_present = getenv("ARKHAM_MTL_NOPRESENT") != NULL;
-    if (atomic_load(&layer_ready) && back_buffer && !no_present) {
+    static int one_queue = -1;
+    if (one_queue < 0) one_queue = getenv("ARKHAM_MTL_ONE_QUEUE") != NULL;
+    if (atomic_load(&layer_ready) && back_buffer && !no_present && one_queue) {
         id<CAMetalDrawable> dr = take_drawable();
         // One made before a change of resolution has the old size. Letting it go makes the next one the right size.
         if (dr && dr.texture.width == back_buffer->width && dr.texture.height == back_buffer->height) {
@@ -2652,6 +2714,8 @@ static void m_Present(CPU *c) {
             [cb presentDrawable:dr];
         }
         [dr release];
+    } else if (atomic_load(&layer_ready) && back_buffer && !no_present) {
+        present_on_its_own_queue();
     }
     dispatch_semaphore_t sem = frames_in_flight;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {

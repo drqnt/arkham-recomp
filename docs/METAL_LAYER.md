@@ -161,8 +161,11 @@ After those, the layer was read through for mistakes of the same kind, that go w
 
 On the capsule route with multisampling off and one-color pixels, the game gives 238 FPS and stops at 240, with the render thread polling Feral's wait for the GPU
 (F_040a930, usleep(10) about 26,000 times a second). With `ARKHAM_MTL_NOPRESENT=1` the same run gives 283 FPS, peaks of 338 and no polling: the cap comes from presenting.
-The likely cause: the copy into a drawable waits on the GPU until the display lets the drawable go, and the queue runs in order, so everything after it waits too. Without
-anything presented, the render thread is the limit, about 3.5 ms of CPU a frame. Unordered memory changed nothing measurable in that test.
+The cause: the copy into a drawable waits on the GPU until the display lets the drawable go, and the queue runs in order, so everything after it waited too. Now the frame
+is copied to a texture of the layer's own in the main queue, and a queue of its own waits for that and for the display, copies and presents (`ARKHAM_MTL_ONE_QUEUE=1` is the
+old way). The same light run then gives 276 FPS with peaks of 320, still 120 a second on screen and the same 21 ms from present, and the polling is gone. At 4x nothing
+changes, 158 against 159, because there the GPU is the limit at about 6.5 ms a frame. Without anything presented, the render thread is the limit, about 3.5 ms of CPU a
+frame. Unordered memory changed nothing measurable in a test that turned out to be held by the GPU, so that's not settled.
 - `ARKHAM_FPS_CAP=n`: a frame limit, as on OpenGL.
 - `ARKHAM_MTLSNAP=dir`: the back buffer at frames 30, 120 and every 600th. It stalls those frames.
 - `MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_ERROR_MODE=nslog MTL_DEBUG_LAYER_WARNING_MODE=ignore`: Metal's own checking. Clean so far.
