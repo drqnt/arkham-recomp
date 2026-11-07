@@ -5,7 +5,9 @@
 #include "shim_reg.h"
 
 #include <AudioToolbox/AudioToolbox.h>
+#if !TARGET_OS_IPHONE
 #include <CoreAudio/CoreAudio.h>
+#endif
 #include <dispatch/dispatch.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -62,15 +64,113 @@ static OSStatus ring_render(Ring *r, UInt32 frames, AudioBufferList *io) {
     return noErr;
 }
 
+#define FOURCC(a, b, c, d) (((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(c) << 8) | (u32)(d))
+#define PROP_UID FOURCC('u', 'i', 'd', ' ')
+#define PROP_NAME FOURCC('n', 'a', 'm', 'e')
+#define PROP_STREAM_CONFIG FOURCC('s', 'l', 'a', 'y')
+#if TARGET_OS_IPHONE
+// ---------- the Mac's audio hardware calls, on the phone ----------
+// iOS has no audio hardware objects. FMOD only asks which devices there are, which one is the default, and what each can play: one stereo output device
+// at 48 kHz answers that, and its sound goes out through RemoteIO below.
+static int audio_trace = -1;
+#define FAKE_DEVICE 1u
+#define PROP_DEVICES FOURCC('d', 'e', 'v', '#')
+#define PROP_DEFAULT_OUT FOURCC('d', 'O', 'u', 't')
+#define PROP_DEFAULT_IN FOURCC('d', 'I', 'n', ' ')
+#define PROP_LAYOUT FOURCC('s', 'r', 'n', 'd')
+#define PROP_RATE FOURCC('n', 's', 'r', 't')
+#define UNKNOWN_PROPERTY FOURCC('w', 'h', 'o', '?')
+static int fake_device_size(u32 id, u32 input, u32 *size) {
+    switch (id) {
+        case PROP_STREAM_CONFIG: *size = input ? 4 : 16; return 1;  // no buffers for input; one with two channels for output
+        case PROP_LAYOUT: *size = 12 + 2 * 20; return 1;  // AudioChannelLayout with two channel descriptions
+        case PROP_RATE: *size = 8; return 1;
+        case PROP_UID: *size = 4; return 1;
+        case PROP_NAME: *size = 256; return 1;
+    }
+    return 0;
+}
+static void note_unknown(const char *what, u32 id) {
+    static int told;
+    if (told++ < 20) fprintf(stderr, "[audio] the phone's stand-in device doesn't answer %s '%c%c%c%c'\n", what, (char)(id >> 24), (char)(id >> 16), (char)(id >> 8), (char)id);
+}
+SHIM(AudioHardwareGetProperty) {  // id, size, out
+    u32 id = ARG(0);
+    if (id != PROP_DEVICES && id != PROP_DEFAULT_OUT && id != PROP_DEFAULT_IN) {
+        note_unknown("hardware property", id);
+        RET(UNKNOWN_PROPERTY);
+        return;
+    }
+    G32(ARG(2)) = id == PROP_DEFAULT_IN ? 0 : FAKE_DEVICE;
+    G32(ARG(1)) = 4;
+    RET(0);
+}
+SHIM(AudioHardwareGetPropertyInfo) {  // id, size, writable
+    u32 id = ARG(0);
+    int known = id == PROP_DEVICES || id == PROP_DEFAULT_OUT || id == PROP_DEFAULT_IN;
+    if (ARG(1)) G32(ARG(1)) = known ? 4 : 0;
+    if (ARG(2)) G8(ARG(2)) = 0;
+    if (!known) note_unknown("hardware property", id);
+    RET(known ? 0 : UNKNOWN_PROPERTY);
+}
+SHIM(AudioDeviceGetProperty) {  // device, channel, is input, id, size, out
+    u32 id = ARG(3), input = ARG(2) & 0xFF, gsize = ARG(4), gout = ARG(5);
+    switch (id) {
+        case PROP_UID:
+            G32(gout) = cf_wrap(CFStringCreateWithCString(NULL, "iPhone", kCFStringEncodingUTF8));
+            G32(gsize) = 4;
+            break;
+        case PROP_NAME:
+            if (G32(gsize)) {
+                snprintf((char *)GP(gout), G32(gsize), "iPhone");
+                G32(gsize) = 7;
+            }
+            break;
+        case PROP_STREAM_CONFIG:
+            if (input) {
+                G32(gout) = 0;
+                G32(gsize) = 4;
+            } else {
+                G32(gout) = 1;
+                G32(gout + 4) = 2;
+                G32(gout + 8) = 512 * 2 * 4;
+                G32(gout + 12) = 0;
+                G32(gsize) = 16;
+            }
+            break;
+        case PROP_LAYOUT:
+            memset(GP(gout), 0, 52);
+            G32(gout + 8) = 2;    // mNumberChannelDescriptions, after a tag of 0 (use the descriptions) and an empty bitmap
+            G32(gout + 12) = 1;   // left
+            G32(gout + 32) = 2;   // right
+            G32(gsize) = 52;
+            break;
+        case PROP_RATE:
+            *(f64a *)GP(gout) = 48000.0;
+            G32(gsize) = 8;
+            break;
+        default:
+            note_unknown("device property", id);
+            RET(UNKNOWN_PROPERTY);
+            return;
+    }
+    RET(0);
+}
+SHIM(AudioDeviceGetPropertyInfo) {  // device, channel, is input, id, size, writable
+    u32 sz = 0;
+    int known = fake_device_size(ARG(3), ARG(2) & 0xFF, &sz);
+    if (ARG(4)) G32(ARG(4)) = sz;
+    if (ARG(5)) G8(ARG(5)) = 0;
+    if (!known) note_unknown("device property", ARG(3));
+    RET(known ? 0 : UNKNOWN_PROPERTY);
+}
+SHIM(AudioDeviceSetProperty) { RET(0); }
+#else
 // ---------- CoreAudio properties: the old calls the game makes, answered through the current object API ----------
 static AudioObjectPropertyAddress dev_addr(u32 chan, u32 is_input, u32 id) {
     AudioObjectPropertyAddress a = {id, is_input ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput, chan};
     return a;
 }
-#define FOURCC(a, b, c, d) (((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(c) << 8) | (u32)(d))
-#define PROP_UID FOURCC('u', 'i', 'd', ' ')
-#define PROP_NAME FOURCC('n', 'a', 'm', 'e')
-#define PROP_STREAM_CONFIG FOURCC('s', 'l', 'a', 'y')
 
 static int audio_trace = -1;
 static void trace_prop(const char *what, u32 obj, u32 id, u32 chan, u32 input, int r, u32 size) {
@@ -187,6 +287,8 @@ SHIM(AudioDeviceSetProperty) {
     RET((i32)AudioObjectSetPropertyData(ARG(0), &a, 0, NULL, ARG(5), GP(ARG(6))));
 }
 
+#endif
+
 // ---------- output units for FMOD ----------
 #define PROP_STREAM_FORMAT 8
 #define PROP_RENDER_CALLBACK 23
@@ -259,7 +361,14 @@ static void *out_pump(void *p) {
 
 SHIM(AudioComponentFindNext) {
     AudioComponent prev = ARG(0) ? rt_handle_get(ARG(0)) : NULL;
-    AudioComponent found = AudioComponentFindNext(prev, (const AudioComponentDescription *)GP(ARG(1)));
+    AudioComponentDescription d = *(const AudioComponentDescription *)GP(ARG(1));
+#if TARGET_OS_IPHONE
+    // The Mac's output units, the hardware one and the default one, are RemoteIO on the phone.
+    if (d.componentType == kAudioUnitType_Output && (d.componentSubType == FOURCC('a', 'h', 'a', 'l') || d.componentSubType == FOURCC('d', 'e', 'f', ' ') ||
+                                                     d.componentSubType == FOURCC('s', 'y', 's', ' ')))
+        d.componentSubType = kAudioUnitSubType_RemoteIO;
+#endif
+    AudioComponent found = AudioComponentFindNext(prev, &d);
     if (audio_trace > 0) fprintf(stderr, "[audio] component %p\n", (void *)found);
     RET(found ? rt_handle_new((void *)found) : 0);
 }
@@ -288,6 +397,12 @@ SHIM(AudioUnitSetProperty) {
         return;
     }
     u32 id = ARG(1), scope = ARG(2), elem = ARG(3), data = ARG(4), size = ARG(5);
+#if TARGET_OS_IPHONE
+    if (id == 2000) {  // kAudioOutputUnitProperty_CurrentDevice: RemoteIO has no devices to choose from
+        RET(0);
+        return;
+    }
+#endif
     if (id == PROP_RENDER_CALLBACK) {
         o->proc = G32(data);
         o->refcon = G32(data + 4);
@@ -422,7 +537,11 @@ static void snd_open_output(SndChan *s, u32 rate, u32 channels) {
     atomic_store(&s->ring.paused, paused);
     s->rate = rate;
     s->channels = channels;
+#if TARGET_OS_IPHONE
+    AudioComponentDescription d = {kAudioUnitType_Output, kAudioUnitSubType_RemoteIO, kAudioUnitManufacturer_Apple, 0, 0};
+#else
     AudioComponentDescription d = {kAudioUnitType_Output, kAudioUnitSubType_DefaultOutput, kAudioUnitManufacturer_Apple, 0, 0};
+#endif
     AudioComponent comp = AudioComponentFindNext(NULL, &d);
     if (!comp || AudioComponentInstanceNew(comp, &s->unit)) {
         fprintf(stderr, "[audio] no default output for video sound\n");

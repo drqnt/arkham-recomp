@@ -4,7 +4,12 @@
 #include "shim.h"
 #include "shim_reg.h"
 
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <CoreGraphics/CoreGraphics.h>
+#else
 #include <ApplicationServices/ApplicationServices.h>
+#endif
 #include <CoreText/CoreText.h>
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,6 +1,7 @@
 // Host implementations of the imports the game calls, plus helpers for guest argument access.
 #pragma once
 #include "rt.h"
+#include <TargetConditionals.h>  // TARGET_OS_IPHONE: the phone build, tools/build.py --ios
 
 #define RT_HOST_RETURN 0xEEFFFFF0u
 
@@ -9,6 +10,7 @@ CPU *rt_new_cpu(u32 stack_size);
 void rt_bind_cpu(CPU *c);
 u32 rt_call_guest(CPU *c, u32 addr, int nargs, const u32 *args);
 int rt_import_index(const char *name);
+const char *rt_game_root(void);
 u32 rt_import_addr(const char *name);
 void rt_gate_acquire(void);
 void rt_gate_acquire_now(void);

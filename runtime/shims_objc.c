@@ -755,7 +755,7 @@ static id ns_str(const char *z) {
 static const char *game_bundle_path(void) {
     static char path[1200];
     if (!path[0])
-        snprintf(path, sizeof path, "%s/Library/Application Support/Steam/steamapps/common/Batman Arkham Asylum GOTY/Batman Arkham Asylum GOTY.app", getenv("HOME"));
+        snprintf(path, sizeof path, "%s/Batman Arkham Asylum GOTY.app", rt_game_root());
     return path;
 }
 static id game_bundle(void) {
@@ -1136,6 +1136,7 @@ static void script_key_event(int code, unsigned long type) {
 }
 // Pressing Cmd by itself: the game answers by watching for key-ups, which the system doesn't deliver while Cmd is down.
 static void script_command_flag(void) {
+#if !TARGET_OS_IPHONE  // scripted runs are a Mac thing
     CGEventRef cg = CGEventCreateKeyboardEvent(NULL, 55, true);
     CGEventSetType(cg, kCGEventFlagsChanged);
     CGEventSetFlags(cg, kCGEventFlagMaskCommand | 0x8);
@@ -1143,6 +1144,7 @@ static void script_command_flag(void) {
     CFRelease(cg);
     id w = script_window();
     if (w) ((void (*)(id, SEL, id))objc_msgSend)(w, SELR("sendEvent:"), ev);
+#endif
 }
 // Cmd+Q through the application's event queue, the way the real key arrives: AppKit routes it to the menu.
 static void script_command_q(unsigned long type) {

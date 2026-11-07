@@ -815,10 +815,8 @@ SHIM(_NSGetExecutablePath) {
     const char *path = getenv("ARKHAM_BINARY");
     char buf[1200];
     if (!path) {
-        snprintf(buf, sizeof buf,
-                 "%s/Library/Application Support/Steam/steamapps/common/Batman Arkham Asylum GOTY/"
-                 "Batman Arkham Asylum GOTY.app/Contents/MacOS/Batman Arkham Asylum GOTY",
-                 getenv("HOME"));
+
+        snprintf(buf, sizeof buf, "%s/Batman Arkham Asylum GOTY.app/Contents/MacOS/Batman Arkham Asylum GOTY", rt_game_root());
         path = buf;
     }
     size_t n = strlen(path) + 1;

@@ -707,14 +707,25 @@ static void load_image(const char *path) {
 
 void rt_register_shims(shim_fn *table);
 
+// The game's folder: Steam's on the Mac, and on the phone the copy in the app's Documents (docs/IOS_PORT.md). ARKHAM_GAME_ROOT names another.
+const char *rt_game_root(void) {
+    static char buf[1024];
+    if (!buf[0]) {
+        const char *env = getenv("ARKHAM_GAME_ROOT");
+        if (env) snprintf(buf, sizeof buf, "%s", env);
+#if TARGET_OS_IPHONE
+        else snprintf(buf, sizeof buf, "%s/Documents/Batman Arkham Asylum GOTY", getenv("HOME"));
+#else
+        else snprintf(buf, sizeof buf, "%s/Library/Application Support/Steam/steamapps/common/Batman Arkham Asylum GOTY", getenv("HOME"));
+#endif
+    }
+    return buf;
+}
 static const char *binary_path(void) {
     const char *env = getenv("ARKHAM_BINARY");
     if (env) return env;
-    static char buf[1024];
-    snprintf(buf, sizeof buf,
-             "%s/Library/Application Support/Steam/steamapps/common/Batman Arkham Asylum GOTY/"
-             "Batman Arkham Asylum GOTY.app/Contents/MacOS/Batman Arkham Asylum GOTY",
-             getenv("HOME"));
+    static char buf[1200];
+    snprintf(buf, sizeof buf, "%s/Batman Arkham Asylum GOTY.app/Contents/MacOS/Batman Arkham Asylum GOTY", rt_game_root());
     return buf;
 }
 

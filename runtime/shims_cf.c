@@ -4,7 +4,13 @@
 #include "shim_reg.h"
 
 #include <CoreFoundation/CoreFoundation.h>
+#if TARGET_OS_IPHONE
+#include <CFNetwork/CFNetwork.h>
+#include <os/lock.h>
+#include <sys/stat.h>
+#else
 #include <CoreServices/CoreServices.h>
+#endif
 #include <dirent.h>
 #include <mach/mach_time.h>
 #include <dlfcn.h>
@@ -196,6 +202,7 @@ SHIM(CFURLGetFileSystemRepresentation) { RET(CFURLGetFileSystemRepresentation(U(
 SHIM(CFURLCreateCopyAppendingPathComponent) { RET(cf_wrap(CFURLCreateCopyAppendingPathComponent(NULL, U(1), S(2), (Boolean)ARG(3)))); }
 SHIM(CFURLCreateCopyDeletingLastPathComponent) { RET(cf_wrap(CFURLCreateCopyDeletingLastPathComponent(NULL, U(1)))); }
 SHIM(CFURLCreateCopyDeletingPathExtension) { RET(cf_wrap(CFURLCreateCopyDeletingPathExtension(NULL, U(1)))); }
+#if !TARGET_OS_IPHONE
 SHIM(CFURLCreateFromFSRef) {
     FSRef ref;
     memcpy(&ref, GP(ARG(1)), sizeof ref);
@@ -213,10 +220,12 @@ SHIM(FSFindFolder) {
     if (!e) memcpy(GP(ARG(3)), &ref, sizeof ref);
     RET((i32)e);
 }
+#endif
 SHIM(CFURLCreateStringByAddingPercentEscapes) {
     RET(cf_wrap(CFURLCreateStringByAddingPercentEscapes(NULL, S(1), S(2), S(3), ARG(4))));
 }
 SHIM(CFURLCreateStringByReplacingPercentEscapes) { RET(cf_wrap(CFURLCreateStringByReplacingPercentEscapes(NULL, S(1), S(2)))); }
+#if !TARGET_OS_IPHONE
 SHIM(FSResolveAliasFile) {
     FSRef ref;
     Boolean isdir = 0, was = 0;
@@ -285,31 +294,30 @@ SHIM(FSIsAliasFile) {
     if (ARG(2)) G8(ARG(2)) = f;
     RET((i32)e);
 }
+#endif
 SHIM(UpTime) { UInt64 t = mach_absolute_time(); RET64(t); }
 SHIM(AbsoluteToDuration) { RET((u32)(ARGQ(0) / 1000000ull)); }
 SHIM(SecRandomCopyBytes) { arc4random_buf(GP(ARG(2)), ARG(1)); RET(0); }
 
 // Classic process APIs answer as if this process were the game's bundle.
 SHIM(GetCurrentProcess) { G32(ARG(0)) = 0; G32(ARG(0) + 4) = 2; RET(0); }
+#if !TARGET_OS_IPHONE
 SHIM(GetProcessBundleLocation) {
     char path[1200];
-    snprintf(path, sizeof path,
-             "%s/Library/Application Support/Steam/steamapps/common/Batman Arkham Asylum GOTY/Batman Arkham Asylum GOTY.app",
-             getenv("HOME"));
+    snprintf(path, sizeof path, "%s/Batman Arkham Asylum GOTY.app", rt_game_root());
     FSRef ref;
     OSStatus e = FSPathMakeRef((const UInt8 *)path, &ref, NULL);
     if (!e) memcpy(GP(ARG(1)), &ref, sizeof ref);
     RET(e);
 }
 
+#endif
 // ---------- the game's bundle ----------
 static CFBundleRef main_bundle(void) {
     static CFBundleRef b;
     if (!b) {
         char path[1200];
-        snprintf(path, sizeof path,
-                 "%s/Library/Application Support/Steam/steamapps/common/Batman Arkham Asylum GOTY/Batman Arkham Asylum GOTY.app",
-                 getenv("HOME"));
+        snprintf(path, sizeof path, "%s/Batman Arkham Asylum GOTY.app", rt_game_root());
         CFURLRef u = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, (CFIndex)strlen(path), true);
         b = CFBundleCreate(NULL, u);
         CFRelease(u);
@@ -520,6 +528,7 @@ SHIM(CFGregorianDateGetAbsoluteTime) {
     g.second = ARGD(2);
     RETF(CFGregorianDateGetAbsoluteTime(g, (CFTimeZoneRef)O(4)));
 }
+#if !TARGET_OS_IPHONE
 SHIM(UCConvertCFAbsoluteTimeToLongDateTime) {
     LongDateTime v = 0;
     OSStatus e = UCConvertCFAbsoluteTimeToLongDateTime(ARGD(0), &v);
@@ -532,6 +541,190 @@ SHIM(UCConvertLongDateTimeToCFAbsoluteTime) {
     *(f64a *)GP(ARG(2)) = v;
     RET(e);
 }
+#else
+// ---------- Carbon's file manager, on the phone ----------
+// iOS has none of it, and Feral's code still finds folders and looks at files through it. An FSRef is 80 bytes the caller can't look into: here they hold a
+// mark and the number of a path in a table, and every call works on that path. FSCatalogInfo is filled from stat in the guest's 32-bit layout, where the
+// permissions are 16 bytes instead of 20, so every field after them sits 4 bytes lower than in the host's.
+enum { FSREF_MARK = 0x46535246u, MAX_REF_PATHS = 4096 };
+enum { noErr_ = 0, fnfErr_ = -43, paramErr_ = -50, nsvErr_ = -35 };
+static char *ref_paths[MAX_REF_PATHS];
+static u32 n_ref_paths;
+static os_unfair_lock ref_lock = OS_UNFAIR_LOCK_INIT;
+static void ref_put(u32 g, const char *path) {
+    os_unfair_lock_lock(&ref_lock);
+    u32 i;
+    for (i = 0; i < n_ref_paths; i++)
+        if (!strcmp(ref_paths[i], path)) break;
+    if (i == n_ref_paths && n_ref_paths < MAX_REF_PATHS) ref_paths[n_ref_paths++] = strdup(path);
+    os_unfair_lock_unlock(&ref_lock);
+    memset(GP(g), 0, 80);
+    G32(g) = FSREF_MARK;
+    G32(g + 4) = i;
+}
+static const char *ref_path(u32 g) {
+    if (!g || G32(g) != FSREF_MARK) return NULL;
+    os_unfair_lock_lock(&ref_lock);
+    u32 i = G32(g + 4);
+    const char *p = i < n_ref_paths ? ref_paths[i] : NULL;
+    os_unfair_lock_unlock(&ref_lock);
+    return p;
+}
+// Seconds since 1904, Carbon's epoch, from a time in Unix's.
+static void put_utc_date(u32 g, time_t t) {
+    u64 secs = (u64)t + 2082844800u;
+    *(u16a *)GP(g) = (u16)(secs >> 32);
+    *(u32a *)GP(g + 2) = (u32)secs;
+    *(u16a *)GP(g + 6) = 0;
+}
+SHIM(CFURLCreateFromFSRef) {
+    const char *path = ref_path(ARG(1));
+    struct stat st;
+    if (!path) {
+        RET(0);
+        return;
+    }
+    RET(cf_wrap(CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, (CFIndex)strlen(path), stat(path, &st) == 0 && S_ISDIR(st.st_mode))));
+}
+SHIM(CFURLGetFSRef) {
+    char path[1200];
+    struct stat st;
+    if (!CFURLGetFileSystemRepresentation(U(0), true, (UInt8 *)path, sizeof path) || stat(path, &st) != 0) {
+        RET(0);
+        return;
+    }
+    ref_put(ARG(1), path);
+    RET(1);
+}
+// The folder types Feral asks for, inside the app's own home.
+SHIM(FSFindFolder) {  // volume, type, create, out
+    const char *sub = NULL;
+    switch (ARG(1)) {
+        case 0x61737570: sub = "Library/Application Support"; break;  // 'asup'
+        case 0x70726566: sub = "Library/Preferences"; break;          // 'pref'
+        case 0x63616368: sub = "Library/Caches"; break;               // 'cach'
+        case 0x74656d70: sub = "tmp"; break;                          // 'temp'
+        case 0x646f6373: sub = "Documents"; break;                    // 'docs'
+    }
+    if (!sub) {
+        fprintf(stderr, "[cf] FSFindFolder for a folder type the phone has no place for: %.4s\n", (const char *)&(u32){__builtin_bswap32(ARG(1))});
+        RET((u32)fnfErr_);
+        return;
+    }
+    char path[1200];
+    snprintf(path, sizeof path, "%s/%s", getenv("HOME"), sub);
+    if (ARG(2)) mkdir(path, 0755);
+    ref_put(ARG(3), path);
+    RET(noErr_);
+}
+SHIM(FSPathMakeRef) {  // path, ref, is directory
+    struct stat st;
+    const char *path = (const char *)GP(ARG(0));
+    if (stat(path, &st) != 0) {
+        RET((u32)fnfErr_);
+        return;
+    }
+    if (ARG(1)) ref_put(ARG(1), path);
+    if (ARG(2)) G8(ARG(2)) = S_ISDIR(st.st_mode);
+    RET(noErr_);
+}
+SHIM(FSResolveAliasFile) {  // ref, resolve chains, is folder, was aliased
+    struct stat st;
+    const char *path = ref_path(ARG(0));
+    if (!path || stat(path, &st) != 0) {
+        RET((u32)fnfErr_);
+        return;
+    }
+    if (ARG(2)) G8(ARG(2)) = S_ISDIR(st.st_mode);
+    if (ARG(3)) G8(ARG(3)) = 0;
+    RET(noErr_);
+}
+SHIM(FSIsAliasFile) {  // ref, is alias, is folder
+    struct stat st;
+    const char *path = ref_path(ARG(0));
+    if (!path || stat(path, &st) != 0) {
+        RET((u32)fnfErr_);
+        return;
+    }
+    if (ARG(1)) G8(ARG(1)) = 0;
+    if (ARG(2)) G8(ARG(2)) = S_ISDIR(st.st_mode);
+    RET(noErr_);
+}
+SHIM(FSCompareFSRefs) {
+    const char *a = ref_path(ARG(0)), *b = ref_path(ARG(1));
+    RET(a && b && !strcmp(a, b) ? noErr_ : (u32)paramErr_);
+}
+SHIM(FSGetCatalogInfo) {  // ref, which, info, name, spec, parent
+    const char *path = ref_path(ARG(0));
+    struct stat st;
+    if (!path || stat(path, &st) != 0) {
+        RET((u32)fnfErr_);
+        return;
+    }
+    u32 g = ARG(2);
+    if (g) {
+        memset(GP(g), 0, 144);
+        int dir = S_ISDIR(st.st_mode);
+        *(u16a *)GP(g) = dir ? 0x10 : 0;  // nodeFlags: kFSNodeIsDirectoryMask
+        put_utc_date(g + 16, st.st_birthtimespec.tv_sec);
+        put_utc_date(g + 24, st.st_mtimespec.tv_sec);
+        put_utc_date(g + 32, st.st_ctimespec.tv_sec);
+        put_utc_date(g + 40, st.st_atimespec.tv_sec);
+        if (!dir) {
+            *(u64a *)GP(g + 104) = (u64)st.st_size;
+            *(u64a *)GP(g + 112) = (u64)st.st_blocks * 512u;
+        } else {
+            u32 n = 0;
+            DIR *d = opendir(path);
+            if (d) {
+                struct dirent *de;
+                while ((de = readdir(d)))
+                    if (strcmp(de->d_name, ".") && strcmp(de->d_name, "..")) n++;
+                closedir(d);
+            }
+            G32(g + 136) = n;  // valence
+        }
+    }
+    if (ARG(3)) {  // HFSUniStr255: a length, then UTF-16 units
+        const char *leaf = strrchr(path, '/');
+        leaf = leaf ? leaf + 1 : path;
+        CFStringRef name = CFStringCreateWithCString(NULL, leaf, kCFStringEncodingUTF8);
+        CFIndex n = name ? CFStringGetLength(name) : 0;
+        if (n > 255) n = 255;
+        if (name) CFStringGetCharacters(name, CFRangeMake(0, n), (UniChar *)GP(ARG(3) + 2));
+        *(u16a *)GP(ARG(3)) = (u16)n;
+        if (name) CFRelease(name);
+    }
+    if (ARG(5)) {
+        char parent[1200];
+        snprintf(parent, sizeof parent, "%s", path);
+        char *slash = strrchr(parent, '/');
+        if (slash && slash != parent) *slash = 0;
+        ref_put(ARG(5), parent);
+    }
+    RET(noErr_);
+}
+SHIM(FSGetVolumeInfo) {
+    static int told;
+    if (!told++) fprintf(stderr, "[cf] FSGetVolumeInfo asked, which the phone doesn't answer\n");
+    RET((u32)nsvErr_);
+}
+SHIM(GetProcessBundleLocation) {  // process, out
+    char path[1200];
+    snprintf(path, sizeof path, "%s/Batman Arkham Asylum GOTY.app", rt_game_root());
+    ref_put(ARG(1), path);
+    RET(noErr_);
+}
+// A LongDateTime counts seconds from 1904, a CFAbsoluteTime from 2001: 3,061,152,000 seconds apart.
+SHIM(UCConvertCFAbsoluteTimeToLongDateTime) {
+    *(u64a *)GP(ARG(2)) = (u64)(i64)(ARGD(0) + 3061152000.0);
+    RET(0);
+}
+SHIM(UCConvertLongDateTimeToCFAbsoluteTime) {
+    *(f64a *)GP(ARG(2)) = (double)(i64)ARGQ(0) - 3061152000.0;
+    RET(0);
+}
+#endif
 SHIM(CFPropertyListCreateFromXMLData) {
     CFStringRef err = NULL;
     CFPropertyListRef pl = CFPropertyListCreateFromXMLData(NULL, (CFDataRef)O(1), ARG(2), &err);
@@ -547,7 +740,13 @@ SHIM(CFTimeZoneGetSecondsFromGMT) { RETF(CFTimeZoneGetSecondsFromGMT((CFTimeZone
 SHIM(CFTimeZoneIsDaylightSavingTime) { RET(CFTimeZoneIsDaylightSavingTime((CFTimeZoneRef)O(0), ARGD(1))); }
 SHIM(LSCopyDisplayNameForURL) {
     CFStringRef out = NULL;
+#if TARGET_OS_IPHONE
+    // No Launch Services on the phone: a file's display name is its last path component.
+    out = CFURLCopyLastPathComponent(U(0));
+    OSStatus e = out ? 0 : -43;
+#else
     OSStatus e = LSCopyDisplayNameForURL(U(0), &out);
+#endif
     if (!e && ARG(1)) G32(ARG(1)) = cf_wrap(out);
     RET(e);
 }

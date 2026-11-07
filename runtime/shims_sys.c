@@ -2,8 +2,13 @@
 #include "shim.h"
 #include "shim_reg.h"
 
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <CoreGraphics/CoreGraphics.h>
+#else
 #include <ApplicationServices/ApplicationServices.h>
 #include <Carbon/Carbon.h>
+#endif
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -164,6 +169,11 @@ static int cap_active, cap_ready;
 static double cap_x, cap_y, cap_dx, cap_dy;
 static u64 cap_last_warp;
 static inline u64 now_ms(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000; }
+#if TARGET_OS_IPHONE
+// The phone has no pointer: the camera comes from a controller there, through shims_hid.m, and later from touch.
+void rt_input_release(void) {}
+static void cap_setup(void) { cap_ready = 1; }
+#else
 static void cap_release(void) {
     pthread_mutex_lock(&cap_mu);
     if (cap_active) {
@@ -202,6 +212,7 @@ static void cap_setup(void) {
         dispatch_resume(t);
     });
 }
+#endif
 
 // ---------- mouse and keyboard state ----------
 // A scripted test run answers with its own position instead of the player's cursor.
@@ -231,6 +242,7 @@ SHIM(HIGetMousePosition) {
         }
         pthread_mutex_unlock(&cap_mu);
     }
+#if !TARGET_OS_IPHONE
     if (!scripted_mouse && !captured) {
         CGEventRef e = CGEventCreate(NULL);
         if (e) {
@@ -238,6 +250,9 @@ SHIM(HIGetMousePosition) {
             CFRelease(e);
         }
     }
+#else
+    (void)captured;
+#endif
     if (out) {
         *(f32a *)GP(out) = (float)p.x;
         *(f32a *)GP(out + 4) = (float)p.y;
@@ -264,9 +279,11 @@ SHIM(CGWarpMouseCursorPosition) {
     if (starting) {
         cap_active = 1;
         cap_dx = cap_dy = 0;
+#if !TARGET_OS_IPHONE
         CGWarpMouseCursorPosition(CGPointMake(x, y));
         CGAssociateMouseAndMouseCursorPosition(0);
         CGDisplayHideCursor(kCGDirectMainDisplay);
+#endif
         fprintf(stderr, "[input] camera capture started\n");
     }
     pthread_mutex_unlock(&cap_mu);
@@ -279,9 +296,22 @@ SHIM(CGAssociateMouseAndMouseCursorPosition) {
         fprintf(stderr, "[input] game sets cursor association to %d, called from %08x\n", last, G32(c->esp));
     }
     // Camera capture decides this while it is on.
+#if !TARGET_OS_IPHONE
     if (!scripted_mouse && !cap_active) RET(CGAssociateMouseAndMouseCursorPosition((boolean_t)(ARG(0) & 0xFF)));
     else RET(0);
+#else
+    RET(0);
+#endif
 }
+#if TARGET_OS_IPHONE
+// No pointer, keyboard layouts or keyboard state to ask on the phone: no characters, and no key down.
+SHIM(CGSetLocalEventsSuppressionInterval) { RET(0); }
+SHIM(UCKeyTranslate) {
+    if (ARG(8)) G32(ARG(8)) = 0;
+    RET(0);
+}
+SHIM(CGEventSourceKeyState) { RET(0); }
+#else
 SHIM(CGSetLocalEventsSuppressionInterval) { RET(CGSetLocalEventsSuppressionInterval(ARGD(0))); }
 // The layout data was copied into guest memory by CFDataGetBytePtr, and its format holds offsets only.
 SHIM(UCKeyTranslate) {
@@ -294,6 +324,7 @@ SHIM(UCKeyTranslate) {
     RET((i32)r);
 }
 SHIM(CGEventSourceKeyState) { RET(CGEventSourceKeyState((CGEventSourceStateID)(i32)ARG(0), (CGKeyCode)(ARG(1) & 0xFFFF))); }
+#endif
 
 const ShimReg rt_shims_sys[] = {
     R(CFUUIDCreate) R(CFUUIDGetUUIDBytes) R(CFUUIDCreateString) R(CSCopyMachineName)

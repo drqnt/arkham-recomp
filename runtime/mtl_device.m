@@ -3,7 +3,12 @@
 // The engine calls COM methods through the vtables d3d_queue.c patches. A method with an implementation here runs on the Direct3D thread instead of Feral's code. Objects are small guest
 // allocations holding the vtable the engine calls through, and the index of a host object. For now Feral's device is still created, which makes an OpenGL context that nothing draws to,
 // and methods with nothing to do with resources or drawing still go to it.
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#import <UIKit/UIKit.h>
+#else
 #import <AppKit/AppKit.h>
+#endif
 #import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CABase.h>
@@ -2312,6 +2317,30 @@ static void m_QueryGetData(CPU *c) {  // this, data, size, flags
 
 // ---------- presenting ----------
 static _Atomic int layer_asked;
+#if TARGET_OS_IPHONE
+// The app shell's view the game draws into (ios/app), set before the game starts.
+UIView *rt_ios_game_view;
+static void make_layer_on_main(void) {
+    UIView *content = rt_ios_game_view;
+    if (!content) {
+        atomic_store(&layer_asked, 0);  // the shell isn't up yet: the next frame asks again
+        return;
+    }
+    CAMetalLayer *l = [CAMetalLayer layer];
+    l.device = dev;
+    l.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    l.framebufferOnly = NO;
+    l.opaque = YES;
+    l.maximumDrawableCount = 3;
+    l.frame = content.bounds;
+    UIScreen *screen = content.window.windowScene.screen;
+    l.contentsScale = screen ? screen.nativeScale : 3.0;
+    [content.layer addSublayer:l];
+    layer = [l retain];
+    fprintf(stderr, "[mtl] drawing into a layer on the app's view, %.0f x %.0f points at %.0fx\n", content.bounds.size.width, content.bounds.size.height, l.contentsScale);
+    atomic_store(&layer_ready, 1);
+}
+#else
 static void log_views(NSView *v, int depth) {
     fprintf(stderr, "[mtl] view %*s%s at %.0f,%.0f size %.0f x %.0f\n", depth * 2, "", object_getClassName(v), v.frame.origin.x, v.frame.origin.y, v.frame.size.width, v.frame.size.height);
     for (NSView *s in v.subviews) log_views(s, depth + 1);
@@ -2346,6 +2375,7 @@ static void make_layer_on_main(void) {
     fprintf(stderr, "[mtl] drawing into a layer on %s, %.0f x %.0f\n", object_getClassName(w), content.bounds.size.width, content.bounds.size.height);
     atomic_store(&layer_ready, 1);
 }
+#endif
 static void write_png(u8 *px, u32 w, u32 h, const char *path);
 static void save_png(id<MTLTexture> src, const char *path) {
     u32 w = (u32)src.width, h = (u32)src.height;
@@ -2807,7 +2837,11 @@ static void m_Present(CPU *c) {
         static int key_on = -1, key_was;
         if (key_on < 0) key_on = getenv("ARKHAM_TRACE_KEY") != NULL;
         if (key_on) {
+#if TARGET_OS_IPHONE
+            int down = 0;  // no keyboard to watch on the phone
+#else
             int down = CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, 0x18);
+#endif
             if (down && !key_was) busy_now = 1;
             key_was = down;
         }

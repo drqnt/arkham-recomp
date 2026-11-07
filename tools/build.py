@@ -19,6 +19,7 @@ FRAMEWORKS = ["CoreFoundation", "CoreServices", "Foundation", "AppKit", "OpenGL"
 
 
 EXTRA: list[str] = []
+IOS_LEAVES_OUT = {"gl_queue.c", "pipelines.c", "shims_gl.c"}
 
 
 def stale(src: str, obj: str, deps: list[str]) -> bool:
@@ -42,9 +43,14 @@ def main() -> int:
     ap.add_argument("--only", default="", help="compile only shards matching this glob and stop")
     ap.add_argument("--serial", action="store_true", help="for ARKHAM_SERIAL=1 debugging: objects and binary in build/serial")
     ap.add_argument("--define", action="append", default=[], help="an experiment's macro, as -D: its objects go in a folder of their own, so the usual build isn't redone")
+    ap.add_argument("--ios", action="store_true", help="for the iPhone: everything into build/ios/libarkham.a, which the app in ios/app links")
     args = ap.parse_args()
+    if args.ios:
+        sdk = subprocess.run(["xcrun", "--sdk", "iphoneos", "--show-sdk-path"], env=ENV, capture_output=True, text=True).stdout.strip()
+        COMMON[:] = [f for f in COMMON if f not in ("-mcpu=apple-m1", "-arch", "arm64", "-mmacosx-version-min=14.0")]
+        COMMON.extend(["-target", "arm64-apple-ios18.0", "-isysroot", sdk, "-mcpu=apple-a14"])
     opt = f"-O{args.opt}"
-    objdir = os.path.join(ROOT, "build", "serial" if args.serial else f"obj{args.opt}" + "".join("-" + d.split("=")[0].lower() for d in args.define))
+    objdir = os.path.join(ROOT, "build", "serial" if args.serial else ("ios-obj" if args.ios else "obj") + args.opt + "".join("-" + d.split("=")[0].lower() for d in args.define))
     EXTRA.extend(f"-D{d}" for d in args.define)
     if args.serial:
         EXTRA.append("-DARKHAM_POLL")
@@ -60,6 +66,10 @@ def main() -> int:
             jobs.append((src, obj, opt))
     if not args.only:
         for src in sorted(glob.glob(f"{ROOT}/runtime/*.c") + glob.glob(f"{ROOT}/runtime/*.m")):
+            name = os.path.basename(src)
+            # Feral's OpenGL path has no place on the phone: ios_gl.c stands in for these three there, and only there.
+            if args.ios and name in IOS_LEAVES_OUT or not args.ios and name.startswith("ios_"):
+                continue
             obj = os.path.join(objdir, "rt_" + os.path.basename(src)[:-2] + ".o")
             objs.append(obj)
             if stale(src, obj, headers):
@@ -81,6 +91,21 @@ def main() -> int:
     if failed:
         return 1
     if args.only:
+        return 0
+    if args.ios:
+        lib = os.path.join(ROOT, "build", "ios", "libarkham.a")
+        os.makedirs(os.path.dirname(lib), exist_ok=True)
+        t1 = time.time()
+        rsp = os.path.join(ROOT, "build", "ios", "objs.rsp")
+        with open(rsp, "w") as fh:
+            fh.write("\n".join(objs))
+        if os.path.exists(lib):
+            os.remove(lib)
+        r = subprocess.run(["xcrun", "libtool", "-static", "-no_warning_for_no_symbols", "-o", lib, "-filelist", rsp], env=ENV, capture_output=True, text=True)
+        if r.returncode:
+            print(r.stderr[:4000], file=sys.stderr)
+            return 1
+        print(f"archived {lib} {os.path.getsize(lib) / 1e6:.0f} MB in {time.time() - t1:.0f}s")
         return 0
     t1 = time.time()
     rsp = os.path.join(ROOT, "build", "link.rsp")
