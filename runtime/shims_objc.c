@@ -1367,7 +1367,7 @@ static void input_schedule(void) {
         if (sscanf(item, "%lf:%15[a-z]:%lf:%lf", &secs, kind, &x, &y) < 3) continue;
         int is_key = !strcmp(kind, "key"), is_click = !strcmp(kind, "click");
         int is_down = !strcmp(kind, "down"), is_up = !strcmp(kind, "up"), is_look = !strcmp(kind, "look"), is_quit = !strcmp(kind, "quit"), is_press = !strcmp(kind, "press"), is_cmdq = !strcmp(kind, "cmdq");
-        int is_shot = !strcmp(kind, "shot"), is_pad = !strcmp(kind, "pad"), is_jit = !strcmp(kind, "jit");
+        int is_shot = !strcmp(kind, "shot"), is_pad = !strcmp(kind, "pad"), is_jit = !strcmp(kind, "jit"), is_move = !strcmp(kind, "move");
         int is_mscan = !strcmp(kind, "mbase") || !strcmp(kind, "mstable") || !strcmp(kind, "mchange") || !strcmp(kind, "mback") || !strcmp(kind, "mpeek"), is_mpoke = !strcmp(kind, "mpoke");
         int is_mdump = !strcmp(kind, "mdump");
         char *kind_copy = is_mscan ? strdup(kind) : NULL;  // the block can't take an array
@@ -1383,6 +1383,10 @@ static void input_schedule(void) {
             } else if (is_mpoke) {
                 G32((u32)x) += (u32)(i32)y;
                 fprintf(stderr, "[mscan] poked %08x by %d: now %d\n", (u32)x, (int)y, (i32)G32((u32)x));
+            } else if (is_move) {
+                void rt_touch_move(float x, float y, int in_play);
+                rt_touch_move((float)x, (float)y, 1);
+                fprintf(stderr, "[input] move %.2f %.2f\n", x, y);
             } else if (is_jit) {
                 rt_fake_pad_jitter((int)x);
             } else if (is_pad) {

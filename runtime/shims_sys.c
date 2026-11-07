@@ -307,19 +307,45 @@ guest_fn rt_guest_fn(u32 addr);           // rt.c: the translated function at a 
 void rt_ht_add(u32 addr, guest_fn fn);  // rt.c: a host function in front of it for calls through the dispatcher
 static guest_fn input_axis_orig;
 static u32 input_axis_at;
-static void input_axis_as_pad(CPU *c) {
-    u32 ret = G32(c->esp);
-    if (ret == 0x19df2eau || ret == 0x19df353u) G32(c->esp + 0x20) = 1;
-    c->jt = input_axis_at;
-    input_axis_orig(c);
-}
+#include <stdatomic.h>
+// The name table numbers of XboxTypeS_RightX, _RightY, _LeftX, _LeftY, StrafeRight, MoveForward, TurnRight and TurnLeft; 0 until found.
+static _Atomic u32 stick_idx[8];
 static int mouse_as_pad(void) {
     static int on = -1;
     if (on < 0) on = getenv("ARKHAM_MOUSE_AS_PAD") != NULL;
     return on;
 }
+// Walking with a pad's left stick is what makes the game damp the camera's turning: measured on the Mac with the same route walked with the W key,
+// where a turn of the mouse came out whole, whether or not marked as a pad's, and with the pad's stick, where it came out at a fifth (docs/IOS_PORT.md,
+// controls v13). So the left stick's axes reach the engine marked as not a pad's (bGamepad 0), by name (XboxTypeS_LeftX and _LeftY, found in the
+// engine's name table as the right stick's are), and the walking keeps the stick's own bindings and its analog speed. On the phone unless
+// ARKHAM_MOVE_NOT_PAD=0; on the Mac with =1.
+// Measured: it didn't help (the turning was damped as before), so it's only on asking, ARKHAM_MOVE_NOT_PAD=1; walking goes past the pad instead
+// (move_to_engine, below).
+int rt_move_not_pad(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("ARKHAM_MOVE_NOT_PAD");
+        on = v && *v == '1';
+    }
+    return on;
+}
+static void input_axis_as_pad(CPU *c) {
+    u32 ret = G32(c->esp);
+    if (mouse_as_pad() && (ret == 0x19df2eau || ret == 0x19df353u)) G32(c->esp + 0x20) = 1;
+    if (rt_move_not_pad()) {
+        u32 key = G32(c->esp + 0x10), lx = atomic_load(&stick_idx[2]), ly = atomic_load(&stick_idx[3]);
+        if (key && (key == lx || key == ly) && G32(c->esp + 0x20)) {
+            G32(c->esp + 0x20) = 0;
+            static int told;
+            if (!told++) fprintf(stderr, "[pad] the left stick's walking reaches the engine as not a pad's\n");
+        }
+    }
+    c->jt = input_axis_at;
+    input_axis_orig(c);
+}
 static void install_mouse_as_pad(u32 bp2) {
-    if (input_axis_orig || !mouse_as_pad() || bp2 < 0x1000) return;
+    if (input_axis_orig || !(mouse_as_pad() || rt_move_not_pad()) || bp2 < 0x1000) return;
     u32 client = G32(bp2 - 0xc0);
     u32 vtable = client ? G32(client) : 0;
     u32 fn = vtable ? G32(vtable + 0x10) : 0;
@@ -341,7 +367,6 @@ static void install_mouse_as_pad(u32 bp2) {
 // a few bytes before its characters, laid out as MouseX's entry shows, whose number F_19deea0's globals give.
 #include <mach/mach.h>
 #include <stdatomic.h>
-static _Atomic u32 stick_idx[2];  // the name table numbers of XboxTypeS_RightX and XboxTypeS_RightY, 0 until found
 // Only on asking (ARKHAM_TOUCH_STICK=1): measured on the Mac, swipes sent this way were damped while walking just as the mouse's were, and standing they
 // didn't turn the camera at all, since the game smooths and speeds up a stick's turning, made for a thumb that holds it.
 static int stick_on(void) {
@@ -400,8 +425,9 @@ static void *find_stick_names(void *arg) {
         fprintf(stderr, "[mouse] the right stick's key names weren't found (MouseX is %u): the touch camera stays the mouse\n", mouse_idx);
         return NULL;
     }
-    static const char *const names[2] = {"XboxTypeS_RightX", "XboxTypeS_RightY"};
-    for (int k = 0; k < 2; k++) {
+    static const char *const names[8] = {"XboxTypeS_RightX", "XboxTypeS_RightY", "XboxTypeS_LeftX", "XboxTypeS_LeftY",
+                                         "StrafeRight",      "MoveForward",      "TurnRight",       "TurnLeft"};
+    for (int k = 0; k < 8; k++) {
         __block u32 idx = 0;
         scan_guest_text(names[k], width, ^int(u32 g) {
             u32 v = G32(g - (u32)at) >> shift;
@@ -410,14 +436,17 @@ static void *find_stick_names(void *arg) {
         });
         atomic_store(&stick_idx[k], idx);
     }
-    fprintf(stderr, "[mouse] the right stick's keys are names %u and %u (MouseX %u, %d-byte characters, the number %d bytes before them%s), found in %.0f ms\n",
-            atomic_load(&stick_idx[0]), atomic_load(&stick_idx[1]), mouse_idx, width, at, shift ? ", doubled" : "",
+    fprintf(stderr, "[mouse] key names: right stick %u %u, left stick %u %u, walking %u %u, raw left stick %u %u (MouseX %u, %d-byte characters, the number %d bytes before them%s), found in %.0f ms\n",
+            atomic_load(&stick_idx[0]), atomic_load(&stick_idx[1]), atomic_load(&stick_idx[2]), atomic_load(&stick_idx[3]), atomic_load(&stick_idx[4]),
+            atomic_load(&stick_idx[5]), atomic_load(&stick_idx[6]), atomic_load(&stick_idx[7]), mouse_idx, width, at, shift ? ", doubled" : "",
             (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6);
     return NULL;
 }
+int rt_move_not_pad(void);
+int rt_move_direct(void);
 static void start_stick_names(u32 bp2) {
     static int started;
-    if (started || !stick_on()) return;
+    if (started || !(stick_on() || rt_move_not_pad() || rt_move_direct())) return;
     u32 base = G32(bp2 - 0xbc), mouse_name = base == 0x19deeb1u ? G32(base + 0x1aaf027u) : 0;
     if (!mouse_name) return;
     started = 1;
@@ -494,6 +523,59 @@ int rt_scripted_direct_look(double dx, double dy) {
     direct_dy += dy;
     pthread_mutex_unlock(&cap_mu);
     return 1;
+}
+// Walking from the touch stick, straight to the engine as the left stick's axes, while the pad the game sees keeps its stick in the middle: the game
+// damps the camera's turning while the pad's own stick is held, whatever the axis events say (marking them as not a pad's changed nothing, measured
+// on the Mac), and a keyboard's walking, which goes to the same aBaseY, doesn't. Each frame the stick's position goes in, from the input loop's
+// reading of the pointer as the touch camera does, through the stick's bindings (aStrafe and aBaseY with a dead zone of 0.3, and the raw axes), so
+// the walking keeps its analog speed. rt_touch_move gives the position, up and right positive; ARKHAM_MOVE_DIRECT=0 on the phone goes back to the
+// pad's stick; on the Mac it's on with =1, and a scripted run's "move:x:y" steps set it.
+static _Atomic float move_x, move_y;
+static _Atomic int move_owned;  // in play: walking goes this way and the pad's stick stays in the middle; in menus the pad's stick pans and points
+int rt_move_direct(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("ARKHAM_MOVE_DIRECT");
+#if TARGET_OS_IPHONE
+        on = !(v && *v == '0');
+#else
+        on = v && *v == '1';
+#endif
+    }
+    return on;
+}
+void rt_touch_move(float x, float y, int in_play) {
+    atomic_store(&move_x, in_play ? x : 0);
+    atomic_store(&move_y, in_play ? y : 0);
+    atomic_store(&move_owned, in_play);
+}
+int rt_move_owned(void) { return rt_move_direct() && atomic_load(&move_owned); }
+static void move_to_engine(CPU *c, u32 bp2) {
+    static float sent_x, sent_y;
+    // Not as the left stick's own keys (XboxTypeS_LeftX and _LeftY): sent that way, from a pad or not, the game damped the camera while Batman walked.
+    // As the keyboard's movement names instead, StrafeRight and MoveForward, which are bound to the same aStrafe and aBaseY with no dead zone; and the
+    // stick's raw axes, which the keyboard's W, A, S and D feed too, through TurnRight and TurnLeft, rebound to them on the phone (shims_libc.c), as
+    // nothing uses those: the D-pad they were on chooses gadgets. Measured on the Mac with the same route: walking this way, a swipe turned the camera
+    // all the way, as walking with the W key did, against a fifth with the stick.
+    u32 lx = atomic_load(&stick_idx[4]), ly = atomic_load(&stick_idx[5]), rx = atomic_load(&stick_idx[6]), ry = atomic_load(&stick_idx[7]);
+    if (!rt_move_direct() || !lx || !ly) return;
+    float x = atomic_load(&move_x), y = atomic_load(&move_y);
+    if (x == 0 && y == 0 && sent_x == 0 && sent_y == 0) return;  // at rest, and the last frame's zero already sent
+    u32 client = G32(bp2 - 0xc0), window = G32(bp2 - 0xc8);
+    u32 vtable = client ? G32(client) : 0, fn = vtable ? G32(vtable + 0x10) : 0;
+    if (!fn) return;
+    const u32 keys[4] = {lx, ly, rx, ry};
+    const float v[4] = {x, y, x, y};
+    for (int k = 0; k < 4; k++) {
+        if (!keys[k]) continue;
+        u32 bits;
+        memcpy(&bits, &v[k], 4);
+        u32 args[8] = {client, window ? window + 4 : 0, 0, keys[k], 0, bits, G32(bp2 + 0xc), 1};
+        rt_call_guest(c, fn, 8, args);
+    }
+    static int told;
+    if (!told++) fprintf(stderr, "[pad] walking goes to the engine by the keyboard's movement names, with the pad's own stick left in the middle\n");
+    sent_x = x, sent_y = y;
 }
 SHIM(HIGetMousePosition) {
     u32 out = ARG(2);
@@ -573,9 +655,11 @@ SHIM(HIGetMousePosition) {
         pthread_mutex_unlock(&cap_mu);
         if (touch_dx != 0 || touch_dy != 0) touch_mouse_to_engine(c, bp2, touch_dx, touch_dy);
     }
+    if (bp2 && scripted_mouse) move_to_engine(c, bp2);
 #else
     (void)captured;
     if (bp2 && (touch_dx != 0 || touch_dy != 0)) touch_mouse_to_engine(c, bp2, touch_dx, touch_dy);
+    if (bp2 && captured) move_to_engine(c, bp2);
 #endif
     if (out) {
         *(f32a *)GP(out) = (float)p.x;

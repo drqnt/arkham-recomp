@@ -26,6 +26,7 @@
 
 void rt_touch_pad(float lx, float ly, float rx, float ry, float lt, float rt, unsigned buttons);
 void rt_touch_mouse(double dx, double dy);  // shims_sys.c: the pointer's motion in pixels, which the game reads as its mouse's
+void rt_touch_move(float x, float y, int in_play);  // shims_sys.c: the walking stick's position, up and right positive
 void rt_touch_pad_on(int on);
 void rt_touch_pad_playstation(int ps);
 int rt_controller_connected(void);
@@ -667,6 +668,7 @@ static float ink_for(float luma) {
     if (running) bits |= 1u << B_SOUTH;
     if (pulse_bits && CACurrentMediaTime() < pulse_until) bits |= pulse_bits;
     rt_touch_pad(lx, ly, rx, ry, lt, rt, bits);
+    rt_touch_move(lx, ly, !in_menu);  // in play walking goes straight to the engine (shims_sys.c); in menus the stick pans, through the pad
 }
 
 - (CGFloat)stickRadius { return 62 * [self unit] / 1.15 * ([self portrait] ? 1.2 : 1); }

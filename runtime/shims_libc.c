@@ -909,6 +909,7 @@ static int right_stick_restore(char *line, char *line_end) {
     }
     return changed;
 }
+int rt_move_direct(void);  // shims_sys.c: walking by the keyboard's movement names, with the stick's raw axes through TurnRight and TurnLeft
 int rt_touch_turn(void) {
     static int on = -1;
     if (on < 0) {
@@ -921,6 +922,7 @@ static int input_rewrite(char *text, size_t len) {
     int changed = 0;
     char *end_all = text + len;
     static const char mouse_x[] = "Bindings=(Name=\"MouseX\",Command=\"", mouse_y[] = "Bindings=(Name=\"MouseY\",Command=\"";
+    static const char turn_l[] = "Bindings=(Name=\"TurnLeft\",Command=\"", turn_r[] = "Bindings=(Name=\"TurnRight\",Command=\"";
     static const char sensitivity[] = "MouseSensitivity=", smoothing[] = "bEnableMouseSmoothing=", assist[] = "EnableCameraAssist=";
     const char *assist_on = getenv("ARKHAM_CAMERA_ASSIST");
     for (char *line = text; line < end_all;) {
@@ -932,6 +934,11 @@ static int input_rewrite(char *text, size_t len) {
         else if (n > sizeof assist - 1 && !strncmp(line, assist, sizeof assist - 1))
             changed += set_field(line, line_end, assist, assist_on && *assist_on == '1' ? "1" : "0");
         else if (memmem(line, n, "XboxTypeS_RightX", 16) || memmem(line, n, "XboxTypeS_RightY", 16)) changed += right_stick_restore(line, line_end);
+        else if (rt_move_direct() && ((n > sizeof turn_l - 1 && !strncmp(line, turn_l, sizeof turn_l - 1)) || (n > sizeof turn_r - 1 && !strncmp(line, turn_r, sizeof turn_r - 1)))) {
+            int left = !strncmp(line, turn_l, sizeof turn_l - 1);
+            char *cmd = line + (left ? sizeof turn_l : sizeof turn_r) - 1, *cmd_end = memchr(cmd, '"', (size_t)(line_end - cmd));
+            if (cmd_end) changed += set_command(cmd, cmd_end, left ? "Axis aRawLHJoyUp Speed=1.0" : "Axis aRawLHJoyRight Speed=1.0");
+        }
         else if (rt_touch_turn() && n > sizeof mouse_x - 1 && (!strncmp(line, mouse_x, sizeof mouse_x - 1) || !strncmp(line, mouse_y, sizeof mouse_y - 1))) {
             char *cmd = line + sizeof mouse_x - 1, *cmd_end = memchr(cmd, '"', (size_t)(line_end - cmd));
             if (cmd_end) changed += set_command(cmd, cmd_end, !strncmp(line, mouse_x, sizeof mouse_x - 1) ? "Axis aTurn Speed=1" : "Axis aLookup Speed=1");

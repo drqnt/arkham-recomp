@@ -252,11 +252,12 @@ int rt_controller_connected(void) {
     return 0;
 }
 static void push_control(Control *k, int v);
+int rt_move_owned(void);  // shims_sys.c
 static int read_touch(const Profile *f, const Control *k) {
     u32 b = atomic_load(&touch.buttons);
     switch (k->what) {
-        case LX: return stick(f, atomic_load(&touch.lx));
-        case LY: return stick(f, -atomic_load(&touch.ly));
+        case LX: return stick(f, rt_move_owned() ? 0 : atomic_load(&touch.lx));  // in play walking goes straight to the engine (shims_sys.c)
+        case LY: return stick(f, rt_move_owned() ? 0 : -atomic_load(&touch.ly));
         case RX: return stick(f, atomic_load(&touch.rx));
         case RY: return stick(f, -atomic_load(&touch.ry));
         case LT: return clamp((int)(atomic_load(&touch.lt) * 255.0f + 0.5f), 0, 255);
