@@ -41,6 +41,7 @@ struct Obj {
     id<MTLTexture> tex, srgb, view;  // view: for reading a render target whose format needs channels filled in
     u32 format, width, height, levels, usage;
     int samples, is_depth, has_stencil;
+    u32 asked_samples;  // what the engine asked for, when ARKHAM_MTL_SAMPLES gave it another count
     u32 surfaces[MAX_LEVELS * 6];
     // shadow maps drawn ahead of the scene: the copies, and which is next this frame
 #define MAX_RENAMES 32
@@ -342,13 +343,25 @@ static void m_CreateCubeTexture(CPU *c) {  // this, edge, levels, usage, format,
     G32(ARG(6)) = o->guest;
     RET(0);
 }
+// ARKHAM_MTL_SAMPLES=n: targets the engine asks to be multisampled get n samples instead, while the engine is still told what it asked for. For measuring what multisampling
+// costs the GPU; 1 turns it off.
+static int samples_for(u32 asked) {
+    static int forced = -1;
+    if (forced < 0) {
+        const char *v = getenv("ARKHAM_MTL_SAMPLES");
+        forced = v ? atoi(v) : 0;
+    }
+    if (asked <= 1) return 1;
+    return forced > 0 ? forced : (int)asked;
+}
 static void m_CreateRenderTarget(CPU *c) {  // this, width, height, format, samples, quality, lockable, out, shared
     u32 w = ARG(1), h = ARG(2), fmt = ARG(3), samples = ARG(4);
     Obj *o = obj_new(O_SURFACE, VT_SURFACE);
     o->format = fmt;
     o->width = w;
     o->height = h;
-    o->samples = samples > 1 ? (int)samples : 1;
+    o->samples = samples_for(samples);
+    o->asked_samples = samples > 1 ? samples : 0;
     o->usage = 1;
     o->tex = make_texture(o->samples > 1 ? MTLTextureType2DMultisample : MTLTextureType2D, fmt, w, h, 1, o->samples, 1, NULL);
     G32(ARG(7)) = o->guest;
@@ -361,7 +374,8 @@ static void m_CreateDepthStencilSurface(CPU *c) {  // this, width, height, forma
     o->format = fmt;
     o->width = w;
     o->height = h;
-    o->samples = samples > 1 ? (int)samples : 1;
+    o->samples = samples_for(samples);
+    o->asked_samples = samples > 1 ? samples : 0;
     o->usage = 2;
     o->is_depth = fi.depth;
     o->has_stencil = fi.stencil;
@@ -448,15 +462,14 @@ static id<MTLLibrary> compile_msl(const char *src) {
     if (!lib) fprintf(stderr, "[mtl] a shader doesn't compile: %s\n", err.localizedDescription.UTF8String);
     return lib;
 }
-// build/arkham --prebuild-shaders list-of-files, through tools/prebuild_shaders.sh: compiles shaders into Metal's disk cache ahead of play. Metal keeps entries per executable,
-// so another program with the same bundle identifier fills the same file with entries the game never finds. Only the game's own binary can do this.
-int rt_mtl_prebuild(const char *list) {
+// Compiles every file of a list into Metal's cache, on all cores, and reports how many were there already. Returns how many failed, or -1 when the list can't be read.
+static long prebuild_list(const char *list) {
     void *outer = objc_autoreleasePoolPush();
-    dev = MTLCreateSystemDefaultDevice();
     NSString *text = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:list] encoding:NSUTF8StringEncoding error:nil];
     if (!text) {
         fprintf(stderr, "can't read %s\n", list);
-        return 1;
+        objc_autoreleasePoolPop(outer);
+        return -1;
     }
     NSArray<NSString *> *files = [text componentsSeparatedByString:@"\n"];
     MTLCompileOptions *opt = compile_options();
@@ -481,9 +494,18 @@ int rt_mtl_prebuild(const char *list) {
         [lib release];
         objc_autoreleasePoolPop(pool);
     });
-    printf("%ld shaders, %ld of them already in the cache, %ld failed, %.0f s\n", atomic_load(&fine), atomic_load(&known), atomic_load(&failed), CACurrentMediaTime() - start);
+    printf("%ld shaders, %ld of them already in the cache, %ld failed, %.0f s%s\n", atomic_load(&fine), atomic_load(&known), atomic_load(&failed), CACurrentMediaTime() - start,
+           getenv("MTL_HUD_ENABLED") ? ", for the Metal HUD" : "");
+    fflush(stdout);
     objc_autoreleasePoolPop(outer);
-    return atomic_load(&failed) != 0;
+    return atomic_load(&failed);
+}
+// build/arkham --prebuild-shaders list-of-files, through tools/prebuild_shaders.sh: compiles shaders into Metal's disk cache ahead of play. Metal keeps entries per executable,
+// so another program with the same bundle identifier fills the same file with entries the game never finds. Only the game's own binary can do this.
+int rt_mtl_prebuild(const char *list) {
+    dev = MTLCreateSystemDefaultDevice();
+    long failed = prebuild_list(list);
+    return failed != 0;
 }
 static void create_shader(CPU *c, Kind kind, u32 vtable) {  // this, code, out
     const u32 *code = (const u32 *)GP(ARG(1));
@@ -600,7 +622,7 @@ static void m_SurfaceGetDesc(CPU *c) {  // this, out
     G32(d + 4) = 1;  // surface
     G32(d + 8) = s->usage;
     G32(d + 12) = (s->usage & 3) ? 0 : 1;
-    G32(d + 16) = s->samples > 1 ? (u32)s->samples : 0;
+    G32(d + 16) = s->asked_samples ? s->asked_samples : s->samples > 1 ? (u32)s->samples : 0;
     G32(d + 20) = 0;
     G32(d + 24) = s->width;
     G32(d + 28) = s->height;
@@ -2520,10 +2542,16 @@ static void compile_test(const char *list) {
         cached += ms < 2;
         total += ms;
     }
-    fprintf(stderr, "[compile-test] %d shaders, %d from the cache, %.0f ms in all, Metal HUD %s\n", n, cached, total, getenv("MTL_HUD_ENABLED") ? "on" : "off");
+    fprintf(stderr, "[compile-test] %d shaders, %d from the cache, %.0f ms in all, Metal HUD %s, device %s, queue %s\n", n, cached, total, getenv("MTL_HUD_ENABLED") ? "on" : "off",
+            object_getClassName(dev), object_getClassName(queue));
     _exit(0);
 }
+// ARKHAM_PREBUILD_IN_GAME=list: the same as --prebuild-shaders, but from the running game once its window is up, then quits. With Apple's Metal HUD on, Metal files compiled
+// shaders under another key, so the HUD's side of the cache can only be filled from a game whose HUD is showing. tools/prebuild_shaders.sh does this when config.local has it.
 static void m_Present(CPU *c) {
+    static const char *in_game = (const char *)1;
+    if (in_game == (const char *)1) in_game = getenv("ARKHAM_PREBUILD_IN_GAME");
+    if (__builtin_expect(in_game != NULL, 0) && atomic_load(&layer_ready) && frame_no >= 60) _exit(prebuild_list(in_game) != 0);
     static const char *ctest = (const char *)1;
     if (ctest == (const char *)1) ctest = getenv("ARKHAM_COMPILE_TEST");
     if (__builtin_expect(ctest != NULL, 0) && atomic_load(&layer_ready) && frame_no >= 60) compile_test(ctest);

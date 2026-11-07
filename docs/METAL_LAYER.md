@@ -88,6 +88,12 @@ The three short passes cost 0.5 to 0.7 ms each for 1 to 4 draws: that's loading 
 samples that texture in the next draws, for refraction, so they can't be one pass on a tile-based GPU. What's left to try there is not loading or storing depth in passes
 that don't use it.
 
+With fewer samples, `ARKHAM_MTL_SAMPLES=n` on the same route (the engine is still told 4x): 4x 159 FPS and 6.4 ms of GPU a frame, 2x 168 FPS and 4.55 ms, none 196 FPS and 4.4 ms.
+Without multisampling the GPU could give about 227 FPS but the game stops near 200, because the CPU is the limit too: in Instruments the game thread runs 94% of the time,
+its time spread thinly over translated code with no one hot function. About 7% of it goes to file path calls (`CFURLCreateWithFileSystemPath`, `stat`) from Feral's file layer
+every frame and about 4% to the Objective-C bridge. The render thread spends about 9% waiting for Direct3D calls that return something. The Windows version on a Ryzen 7
+5800X and an RTX 3060 Ti gives about 350 FPS at 2560x1440 4x, native code on both sides.
+
 ## Shader compiling
 
 Text to library takes about 40 ms a shader in the game, and a pipeline about 10 ms, on the Direct3D thread at the first draw that needs them. Metal keeps both on disk, so the second time costs nothing:
@@ -103,9 +109,11 @@ in Metal's cache from earlier play at the same path, so moving the game into `Ar
 Each shader that does compile in play is logged as `[mtl] vs_... compiled in N ms, not from the cache`, and the `[fps]` line counts them.
 
 **Apple's Metal HUD changes the cache's key.** With `MTL_HUD_ENABLED=1` the running game finds none of what the prebuild compiled: 0 of 30 in a test, 38 ms each, against 30 of 30 in
-1 ms in all without it, and 405 compiles in a 3-minute run. The prebuild runs without a window, where the HUD isn't attached, so it can't fill the HUD's side. The HUD's own drawing
-costs about 0.3 ms of GPU a frame besides. `ARKHAM_COMPILE_TEST=list` makes the game compile a list of files once its window is up, log each time and quit, which is how this
-was found.
+1 ms in all without it, and 405 compiles in a 3-minute run. The Metal device is the same class either way, so it's in how Metal compiles, which Apple doesn't document, and the
+HUD's key is the same from run to run. The headless prebuild can't reach that side, so when `config.local` turns the HUD on, `tools/prebuild_shaders.sh` also starts the game
+with `ARKHAM_PREBUILD_IN_GAME`, which compiles the list behind the first logo once the window is up, about 2 minutes, and quits. After that the game with the HUD found 30 of 30.
+The HUD's own drawing costs about 0.3 ms of GPU a frame besides. `ARKHAM_COMPILE_TEST=list` makes the game compile a list of files once its window is up, log each time and
+quit, which is how this was found.
 
 Pipelines depend on state and are only built when first seen, at about 10 ms, and Metal keeps those too. On iOS the libraries will have to be built on the Mac, because a compile on the phone
 costs more and the source has to be there.
