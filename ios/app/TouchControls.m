@@ -604,6 +604,8 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
                                (c.y + r - g.origin.y) / g.size.height);
     return l < 0 ? 0 : (float)l;
 }
+// Whether the buttons follow the picture under them (dark lines over a light picture) or stay white on their dark discs, the default.
+static BOOL ink_follows_picture(void) { return setting(@"buttonColour", "ARKHAM_TOUCH_ADAPTIVE", 0) > 0; }
 static float ink_for(float luma) {
     float t = (luma - 0.42f) / 0.2f;  // light enough to need dark lines from about the middle grey
     t = t < 0 ? 0 : t > 1 ? 1 : t;
@@ -612,16 +614,17 @@ static float ink_for(float luma) {
 // Each frame: every button's colour a little further towards what the picture under it wants, over about a quarter of a second.
 - (void)followPicture:(CFTimeInterval)dt {
     float k = (float)MIN(1.0, dt * 4.5);
+    BOOL follow = ink_follows_picture();
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     for (PadButton *b in [buttons arrayByAddingObject:close_button]) {
         if (!b.shown) continue;
-        float want = ink_for([self lumaAt:b.center radius:b.radius]);
+        float want = follow ? ink_for([self lumaAt:b.center radius:b.radius]) : 0;
         b.ink += (want - b.ink) * k;
         if (fabsf(b.ink - b.ink_shown) > 0.015f) [self colorButton:b];
     }
     if (!stick_base.hidden) {
-        float want = ink_for([self lumaAt:stick_center radius:[self stickRadius]]);
+        float want = follow ? ink_for([self lumaAt:stick_center radius:[self stickRadius]]) : 0;
         float was = stick_ink;
         stick_ink += (want - stick_ink) * k;
         if (fabsf(stick_ink - was) > 0.001f) [self colorStick];
@@ -674,7 +677,7 @@ static float ink_for(float luma) {
     CGFloat R = [self stickRadius], kr = R * 0.42;
     stick_base.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.x - R, c.y - R, R * 2, R * 2)].CGPath;
     stick_knob.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(k.x - kr, k.y - kr, kr * 2, kr * 2)].CGPath;
-    if (stick_base.hidden) stick_ink = ink_for([self lumaAt:c radius:R]);
+    if (stick_base.hidden) stick_ink = ink_follows_picture() ? ink_for([self lumaAt:c radius:R]) : 0;
     stick_base.hidden = stick_knob.hidden = photo;
     [self colorStick];
     [CATransaction commit];
@@ -792,7 +795,7 @@ static UIView *gear_view;
     last_frame = now;
     if (dt <= 0 || dt > 0.1) dt = 1.0 / 60;
     [self updatePlay:now];
-    rt_want_picture_luma(!self.hidden && !photo);
+    rt_want_picture_luma(!self.hidden && !photo && ink_follows_picture());  // the picture's lightness is read back only for buttons that follow it
     [self followPicture:dt];
     rx = ry = 0;
     // Outside play a drag is the left stick, the other way from the finger: the map goes with it, as on a phone's map.
@@ -1259,8 +1262,9 @@ static UIView *gear_view;
     [self toggle:@"Строка FPS и нагрева" on:setting(@"showFPS", "ARKHAM_FPS", 1) > 0 action:@selector(fpsLineChanged:)];
     [self toggle:@"Metal HUD (со следующего запуска)" on:setting(@"metalHUD", "ARKHAM_METAL_HUD", 0) > 0 action:@selector(hudChanged:)];
 
-    [self section:@"Кнопки" footer:@"Кнопки светлеют над тёмной картинкой и темнеют над светлой. Глаз в углу прячет их все для скриншота; вернуть — коснуться экрана."];
+    [self section:@"Кнопки" footer:@"Цвет: белые — на тёмной подложке, видны на любой картинке; под картинку — светлеют над тёмной картинкой и темнеют над светлой. Глаз в углу прячет все кнопки для скриншота; вернуть — коснуться экрана."];
     [self choice:@"Вид" items:@[@"PlayStation", @"Xbox", @"Иконки"] value:(NSInteger)setting(@"buttonStyle", "ARKHAM_TOUCH_STYLE", STYLE_PS) action:@selector(styleChanged:)];
+    [self choice:@"Цвет" items:@[@"Белые", @"Под картинку"] value:ink_follows_picture() ? 1 : 0 action:@selector(colourChanged:)];
     size_value = [self slider:@"Размер" min:0.7 max:1.5 value:setting(@"buttonScale", "ARKHAM_TOUCH_SIZE", 1.0) action:@selector(sizeChanged:)];
     // Shown as transparency, as its name says; kept as the opacity, from 20% to all of it.
     opacity_value = [self slider:@"Прозрачность кнопок" min:0 max:0.8 value:1 - setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.8) action:@selector(opacityChanged:)];
@@ -1298,6 +1302,10 @@ static UIView *gear_view;
 }
 - (void)styleChanged:(UISegmentedControl *)s {
     set_setting(@"buttonStyle", s.selectedSegmentIndex);
+    [controls restyle];
+}
+- (void)colourChanged:(UISegmentedControl *)s {
+    set_setting(@"buttonColour", s.selectedSegmentIndex);
     [controls restyle];
 }
 - (void)sizeChanged:(UISlider *)s {

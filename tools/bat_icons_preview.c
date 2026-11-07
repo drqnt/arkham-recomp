@@ -1,5 +1,5 @@
 // Draws the touch controls' icons (ios/app/BatIcons.h) into a picture, as the app draws its buttons, to look at them on the Mac before they go on a
-// phone: light on a dark picture and dark on a light one, big and at the small buttons' size.
+// phone: white on their dark discs, as by default, and following the picture, as the settings' "Цвет" has them; big and at the small buttons' size.
 // clang -O1 tools/bat_icons_preview.c -framework CoreGraphics -framework ImageIO -framework CoreText -framework CoreFoundation -o /tmp/bat_icons_preview
 // /tmp/bat_icons_preview out.png [bands]
 #include "../ios/app/BatIcons.h"
@@ -93,28 +93,38 @@ static void button(CGContextRef g, int i, CGFloat cx, CGFloat cy, CGFloat r, flo
 }
 int main(int argc, char **argv) {
     const char *out = argc > 1 ? argv[1] : "bat_icons.png";
-    const int passes = argc > 2 ? atoi(argv[2]) : 4;  // how many of the four bands to draw
+    // the bands: the buttons as the settings' "Цвет" draws them, white by default, or following the picture; big, and at the small buttons' size
+    static const struct {
+        int light_picture, dark_ink, tiny;
+        const char *title;
+    } bands[] = {
+        {0, 0, 0, "Белые (по умолчанию), на тёмной картинке"},
+        {1, 0, 0, "Белые (по умолчанию), на светлой картинке"},
+        {1, 1, 0, "«Под картинку», на светлой картинке"},
+        {0, 0, 1, "Маленькие, белые, на тёмной"},
+        {1, 0, 1, "Маленькие, белые, на светлой"},
+        {1, 1, 1, "Маленькие, «под картинку», на светлой"},
+    };
+    const int passes = argc > 2 ? atoi(argv[2]) : (int)(sizeof bands / sizeof bands[0]);  // how many of the bands to draw
     const CGFloat cell = 190, big = 62, small = 30;
     const int rows = (N + COLS - 1) / COLS;
-    // four bands: big on dark, big on light, small on dark, small on light
     CGFloat W = COLS * cell, H = 0;
-    for (int pass = 0; pass < passes; pass++) H += rows * (pass >= 2 ? 110 : cell) + 36;
+    for (int pass = 0; pass < passes; pass++) H += rows * (bands[pass].tiny ? 110 : cell) + 36;
     CGContextRef g = bitmap((int)W, (int)H);
     CGContextTranslateCTM(g, 0, H);
     CGContextScaleCTM(g, 1, -1);
     CGFloat y0 = 0;
     for (int pass = 0; pass < passes; pass++) {
-        int light = pass & 1, tiny = pass >= 2;
+        int light = bands[pass].light_picture, tiny = bands[pass].tiny;
         CGFloat r = tiny ? small : big, h = rows * (tiny ? 110 : cell) + 36;
         // a picture's colours behind them: dark blue-grey like the asylum at night, or a pale stone
         if (light) CGContextSetRGBFillColor(g, 0.80, 0.78, 0.74, 1);
         else CGContextSetRGBFillColor(g, 0.10, 0.12, 0.15, 1);
         CGContextFillRect(g, CGRectMake(0, y0, W, h));
-        text(g, tiny ? (light ? "Маленькие, на светлом" : "Маленькие, на тёмном") : (light ? "Большие, на светлом" : "Большие, на тёмном"), W / 2, y0 + 24, 17,
-             light ? 0.15 : 0.85);
+        text(g, bands[pass].title, W / 2, y0 + 24, 17, light ? 0.15 : 0.85);
         for (unsigned i = 0; i < N; i++) {
             CGFloat cx = (i % COLS + 0.5) * cell, cy = y0 + 36 + (i / COLS) * (tiny ? 110 : cell) + (tiny ? 44 : 78);
-            button(g, (int)i, cx, cy, r, light ? 1 : 0);
+            button(g, (int)i, cx, cy, r, bands[pass].dark_ink);
             text(g, buttons[i].label, cx, cy + r + 24, 14, light ? 0.1 : 0.9);
         }
         y0 += h;
