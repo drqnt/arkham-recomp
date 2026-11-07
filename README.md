@@ -18,8 +18,9 @@ python3 -I tests/difftest.py 400   # instruction semantics against real x86 unde
 
 `ARKHAM_RENDERER=metal` draws through Metal, after `tools/prebuild_shaders.sh` once. `ARKHAM_LANGUAGE=ru` plays in Russian, voice and text: the Mac game has
 all its languages installed, but Steam only offers English for it. The same works for fr, de, it, es and pl. Feral's own windows stay in English for Russian
-and Polish, which they don't come in. Gamepads go through Apple's GameController framework, so DualSense, DualShock, Xbox and other controllers the system
-knows work, shown to the game as the DualShock 4 it has a profile for.
+and Polish, which they don't come in. Gamepads go through Apple's GameController framework. PlayStation controllers are shown to the game as the DualShock 4,
+and Xbox and all other controllers as the wired Xbox 360 controller, both models it has profiles and button pictures for. There's no rumble yet:
+Feral's code drives it through IOKit services and ForceFeedback, which aren't there.
 
 ## Layout
 
