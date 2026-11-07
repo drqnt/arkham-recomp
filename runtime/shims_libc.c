@@ -844,6 +844,10 @@ extern int rt_no_frame_limit;
 //   the engine had written that back into BmInput.ini.
 // - And in the camera's settings (BmCamera.ini and the files it's based on), the game's camera assist as the phone's settings say (ARKHAM_CAMERA_ASSIST,
 //   off unless set): with a pad, and the touch camera is one to the engine, it turns the camera behind Batman as he runs, over what a swipe turns.
+// - The mouse's axes bound to the right stick's (aTurn and aLookup) instead of the mouse's own (aMouseX, aMouseY): the touch camera then turns the
+//   camera as a pad's right stick does, which the game lets turn it while Batman walks, where it all but stops the mouse's turning (controls v11,
+//   docs/IOS_PORT.md). The runtime sends each frame the stick value that turns by exactly the swipe (touch_mouse_to_engine, shims_sys.c). Off with
+//   ARKHAM_TOUCH_TURN=0 on the phone; on the Mac only with ARKHAM_TOUCH_TURN=1.
 // ARKHAM_TOUCH_MOUSE_INI=1 does the same on the Mac, for scripted runs, and then the engine's writes of those files go nowhere, so that the Mac's
 // game keeps its own settings.
 // The text keeps its length, since the engine may take the size from stat(), and values are set, not multiplied, since the engine writes what it read
@@ -907,9 +911,22 @@ static int right_stick_restore(char *line, char *line_end) {
     }
     return changed;
 }
+int rt_touch_turn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("ARKHAM_TOUCH_TURN");
+#if TARGET_OS_IPHONE
+        on = !(v && *v == '0');
+#else
+        on = v && *v == '1';
+#endif
+    }
+    return on;
+}
 static int input_rewrite(char *text, size_t len) {
     int changed = 0;
     char *end_all = text + len;
+    static const char mouse_x[] = "Bindings=(Name=\"MouseX\",Command=\"", mouse_y[] = "Bindings=(Name=\"MouseY\",Command=\"";
     static const char sensitivity[] = "MouseSensitivity=", smoothing[] = "bEnableMouseSmoothing=", assist[] = "EnableCameraAssist=";
     const char *assist_on = getenv("ARKHAM_CAMERA_ASSIST");
     for (char *line = text; line < end_all;) {
@@ -921,6 +938,10 @@ static int input_rewrite(char *text, size_t len) {
         else if (n > sizeof assist - 1 && !strncmp(line, assist, sizeof assist - 1))
             changed += set_field(line, line_end, assist, assist_on && *assist_on == '1' ? "1" : "0");
         else if (memmem(line, n, "XboxTypeS_RightX", 16) || memmem(line, n, "XboxTypeS_RightY", 16)) changed += right_stick_restore(line, line_end);
+        else if (rt_touch_turn() && n > sizeof mouse_x - 1 && (!strncmp(line, mouse_x, sizeof mouse_x - 1) || !strncmp(line, mouse_y, sizeof mouse_y - 1))) {
+            char *cmd = line + sizeof mouse_x - 1, *cmd_end = memchr(cmd, '"', (size_t)(line_end - cmd));
+            if (cmd_end) changed += set_command(cmd, cmd_end, !strncmp(line, mouse_x, sizeof mouse_x - 1) ? "Axis aTurn Speed=1" : "Axis aLookup Speed=1");
+        }
         line = line_end + 1;
     }
     return changed;

@@ -330,6 +330,7 @@ static void install_mouse_as_pad(u32 bp2) {
     rt_ht_add(fn, input_axis_as_pad);
     fprintf(stderr, "[mouse] the pointer's motion reaches the engine as a pad's (its InputAxis at %08x)\n", fn);
 }
+#define TOUCH_TURN_VSIGN 1.0  // the vertical's sign on the stick's axis against the mouse's, measured on the Mac
 // The touch camera's motion to the engine, as Feral's input loop would hand a mouse's, from inside that loop's reading of the pointer. bp2 is the loop's
 // frame: [-0xc0] its viewport client, [-0xc8] its window object (the viewport is 4 bytes in), [+0xc] the frame's time, and [-0xbc] the address its
 // code takes its globals from (0x19deeb1), where the names MouseX and MouseY are at +0x1aaf027 and +0x1aaf02b.
@@ -344,7 +345,18 @@ static void touch_mouse_to_engine(CPU *c, u32 bp2, double dx, double dy) {
         return;
     }
     const u32 names[2] = {G32(base + 0x1aaf027u), G32(base + 0x1aaf02bu)};
-    const double d[2] = {dx, -dy};  // as F_0048c10 gives them: right and up positive, the pointer's y growing downwards
+    double d[2] = {dx, -dy};  // as F_0048c10 gives them: right and up positive, the pointer's y growing downwards
+    // With the mouse's axes on the right stick's (rt_touch_turn, shims_libc.c), the value for this frame that turns by what the mouse would have:
+    // a pixel was 7.5 rotation units (MouseSensitivity 7.5), and the engine turns the stick's axes by value x 100 x the frame's time x
+    // LookRightScale (375) or LookUpScale (-300).
+    int rt_touch_turn(void);
+    float dt;
+    memcpy(&dt, &(u32){G32(bp2 + 0xc)}, 4);
+    if (!(dt > 0.0005f && dt < 0.25f)) dt = 1.0f / 60;
+    if (rt_touch_turn()) {
+        d[0] = d[0] * 7.5 / (100.0 * dt * 375.0);
+        d[1] = d[1] * 7.5 / (100.0 * dt * -300.0) * TOUCH_TURN_VSIGN;
+    }
     for (int k = 0; k < 2; k++) {
         if (d[k] == 0 || !names[k]) continue;
         float f = (float)d[k];
@@ -361,7 +373,7 @@ static void touch_mouse_to_engine(CPU *c, u32 bp2, double dx, double dy) {
     if (trace > 0) {
         trace--;
         unsigned rt_frames_presented(void);
-        fprintf(stderr, "[mouse] to the engine at frame %u: %.1f %.1f\n", rt_frames_presented(), dx, -dy);
+        fprintf(stderr, "[mouse] to the engine at frame %u: %.1f %.1f px as %.4f %.4f, frame time %.4f\n", rt_frames_presented(), dx, -dy, d[0], d[1], dt);
     }
     if (now_ms() - told_ms > 10000 && sent_frames != told_frames) {
         told_ms = now_ms();

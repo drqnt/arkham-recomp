@@ -349,3 +349,26 @@ app goes to the background.
     5.4 s to 7.2 s almost entirely in throwing: Unreal throws a string from StaticLoadObject for each object it doesn't find and catches it
     itself. The runtime then looks for the handler's native frame with libunwind, and the phone spent its time inside libunwind.
   - The first throw took 8 ms for 4 steps. `[eh]` lines give the running totals (throws, time, steps) at a throw at most every 5 s.
+
+## Controls v11: the touch camera through the right stick's axes, 2026-11-08
+
+- **v10 on the phone:** menu taps worked again (the cursor visible). With the DualSense, in the same place, the camera turned normally while
+  Batman walked; the swipe hardly did.
+- **What the Mac runs showed:** every swipe reached the engine while walking (`ARKHAM_TRACE_TOUCH_MOUSE`, 24 hand-overs out of 24). With the
+  stick held a little and wandering but Batman standing, a swipe turned as far as standing (28 points against 29). So the game damps the
+  mouse's turning only while Batman moves, and lets the right stick's through. In v5 and v6 the right stick fed the mouse's axis and was bad
+  while walking too, so it's the axis, not the device.
+- **Now** the mouse's bindings (`MouseX`, `MouseY`, BaseInput.ini and BmInput.ini) are read as `Axis aTurn Speed=1` and `Axis aLookup Speed=1`,
+  the right stick's own axes, with no dead zone. The runtime still calls the engine's InputAxis directly with MouseX/MouseY, from Feral's
+  input loop, but with the value a stick would need this frame to turn by exactly the swipe:
+  - across: pixels x 7.5 / (100 x frame time x 375);
+  - up and down: the same with -300, LookRightScale and LookUpScale.
+  This isn't the stick emulation of v4 to v6: there are no 255 steps, no curve or dead zone of Feral's pad code, and no tick between frames.
+  It's one exact value a frame. `ARKHAM_TOUCH_TURN=0` gives v10's mouse axes back.
+- **Not measured:** Steam wasn't running on the Mac, and the Mac game stops in the Steam API at startup without it, so this went to the phone
+  with the arithmetic from UE3's PlayerInput. If up and down come out inverted, `TOUCH_TURN_VSIGN` in shims_sys.c is the sign to flip.
+- **Mac test tools added for this:**
+  - `ARKHAM_MOUSE_DIRECT=1`: scripted `look` steps take the touch camera's path;
+  - `jit:n`: the fake pad's held sticks wander like a thumb;
+  - `mpeek`: shows the values a memory scan kept;
+  - `ARKHAM_TOUCH_TURN=1` with `ARKHAM_TOUCH_MOUSE_INI=1`: the phone's bindings.
