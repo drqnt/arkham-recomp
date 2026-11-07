@@ -115,7 +115,13 @@ static void sample_all(void) {
             u32 d = 0;
             out[d++] = arm_thread_state64_get_pc(st);
             u64 fp = arm_thread_state64_get_fp(st);
-            while (d < DEPTH && fp >= 0x100000000ull && fp < 0x800000000000ull && !(fp & 7)) {
+            // Only frames inside the thread's own stack, between where it is now and its top: on the phone a frame pointer can lead out of it, into a
+            // guard page, and reading there ended the game.
+            u64 lo = arm_thread_state64_get_sp(st), hi = 0;
+            pthread_t owner = pthread_from_mach_thread_np(t);
+            if (owner) hi = (u64)(uintptr_t)pthread_get_stackaddr_np(owner);
+            if (!hi || hi <= lo) hi = lo;  // unknown: the leaf only
+            while (d < DEPTH && fp >= lo && fp + 16 <= hi && !(fp & 7)) {
                 u64 next = ((u64 *)fp)[0], lr = ((u64 *)fp)[1];
                 if (!lr || next <= fp) break;
                 out[d++] = lr;
