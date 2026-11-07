@@ -30,15 +30,29 @@ def text_name(data: bytes) -> str:
     return "s_%016x" % (h or 1)
 
 
+MODULES = os.path.join(OUT, "modules")
+SRC = os.path.join(OUT, "src")
+
+
 def compile_one(job):
     src, name, entry = job
     out = os.path.join(AIR, name + ".air")
     if os.path.exists(out):
         return name, 0, ""
+    # The entry function is renamed in the text itself. Renaming it with -D, as this did at first, gave every compile options of its own, and the
+    # compiler built and kept Metal's standard library modules again for each: 483 GB of cache in a day. With the same options for all, and the
+    # cache kept here, they are built once.
+    text = open(src, encoding="utf-8").read()
+    renamed = text.replace(f" {entry}(", f" {name}(", 1)
+    if renamed == text:
+        return name, 1, f"no {entry} in {src}"
+    tmp_src = os.path.join(SRC, name + ".metal")
+    open(tmp_src, "w", encoding="utf-8").write(renamed)
     tmp = out + ".part"
     # The runtime compiles with preserveInvariance, so these are compiled the same way.
-    r = subprocess.run(["xcrun", "-sdk", "iphoneos", "metal", "-c", "-fpreserve-invariance", f"-D{entry}={name}", src, "-o", tmp],
+    r = subprocess.run(["xcrun", "-sdk", "iphoneos", "metal", "-c", "-fpreserve-invariance", f"-fmodules-cache-path={MODULES}", tmp_src, "-o", tmp],
                        env=ENV, capture_output=True, text=True)
+    os.remove(tmp_src)
     if r.returncode:
         return name, r.returncode, r.stderr[:500]
     os.replace(tmp, out)
@@ -53,6 +67,8 @@ def main() -> int:
         print("translating the game's shaders with the current translator")
         subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "check_shaders.py"), "translate"], check=True)
     os.makedirs(AIR, exist_ok=True)
+    os.makedirs(SRC, exist_ok=True)
+    os.makedirs(MODULES, exist_ok=True)
     jobs, names = [], {}
     for path in sorted(glob.glob(os.path.join(MSL, "*.metal"))):
         data = open(path, "rb").read()
