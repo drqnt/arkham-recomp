@@ -198,18 +198,22 @@ static void fake_events(Profile *f) {
 // When no controller is connected, what the player's thumbs do on the screen is a pad of its own, shown to the game as the Xbox one so that its prompts
 // name the buttons drawn. Sticks from -1 to 1 with up positive, triggers from 0 to 1, and a bit for each button, set from the app's main thread.
 static struct {
-    _Atomic float lx, ly, lt, rt;
+    _Atomic float lx, ly, rx, ry, lt, rt;
     _Atomic u32 buttons;  // 1 << B_SOUTH and the rest, as in the enum above
-    _Atomic int on;
+    _Atomic int on, playstation;
 } touch;
-void rt_touch_pad(float lx, float ly, float lt, float rt, u32 buttons) {
+void rt_touch_pad(float lx, float ly, float rx, float ry, float lt, float rt, u32 buttons) {
     atomic_store(&touch.lx, lx);
     atomic_store(&touch.ly, ly);
+    atomic_store(&touch.rx, rx);
+    atomic_store(&touch.ry, ry);
     atomic_store(&touch.lt, lt);
     atomic_store(&touch.rt, rt);
     atomic_store(&touch.buttons, buttons);
 }
 void rt_touch_pad_on(int on) { atomic_store(&touch.on, on); }
+// Which controller the touch controls are shown to the game as, so that its prompts match what they draw: 1 for the PlayStation one, 0 for Xbox.
+void rt_touch_pad_playstation(int ps) { atomic_store(&touch.playstation, ps); }
 // Whether a real controller is connected, for the app to hide its controls.
 int rt_controller_connected(void) {
     for (GCController *k in GCController.controllers)
@@ -221,7 +225,8 @@ static int read_touch(const Profile *f, const Control *k) {
     switch (k->what) {
         case LX: return stick(f, atomic_load(&touch.lx));
         case LY: return stick(f, -atomic_load(&touch.ly));
-        case RX: case RY: return stick(f, 0);  // the camera follows swipes as mouse motion instead (rt_touch_look in shims_sys.c)
+        case RX: return stick(f, atomic_load(&touch.rx));  // swipes, as a stick: the game won't take the mouse while a pad moves
+        case RY: return stick(f, -atomic_load(&touch.ry));
         case LT: return clamp((int)(atomic_load(&touch.lt) * 255.0f + 0.5f), 0, 255);
         case RT: return clamp((int)(atomic_load(&touch.rt) * 255.0f + 0.5f), 0, 255);
         case HAT: {
@@ -258,7 +263,7 @@ static void tick(void) {
             pad = nil;
         }
         if (!g && atomic_load(&touch.on)) {
-            want = &profiles[1];
+            want = atomic_load(&touch.playstation) ? &profiles[0] : &profiles[1];
             touching = 1;
         }
     }

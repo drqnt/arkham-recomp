@@ -257,6 +257,70 @@ static void stall_check(u64 frame) {
     }
     n_tracks = 0;
 }
+// ARKHAM_TRACE_PROFILE=s: every s seconds, half a second of samples of every thread, waiting or not, and where each one was most often: in steady play,
+// what a thread waits for is what holds the frame rate.
+static u64 profile_ticks, profile_last;
+static void describe_full(const Track *tr, u32 s, char *out, size_t cap) {
+    size_t len = 0;
+    int shown = 0;
+    for (u32 i = 0; i < tr->depth[s] && shown < 7 && len + 60 < cap; i++) {
+        const char *f = sym_of(tr->stack[s][i]);
+        if (i && !strcmp(f, "?")) continue;
+        len += (size_t)snprintf(out + len, cap - len, "%s%s", shown ? " < " : "", f);
+        shown++;
+    }
+}
+static void profile_check(void) {
+    u64 now = mach_absolute_time();
+    if (now - profile_last < profile_ticks) return;
+    profile_last = now;
+    refresh_threads();
+    for (int i = 0; i < 100; i++) {
+        sample_all();
+        usleep(5000);
+    }
+    fprintf(stderr, "[profile] where each thread was, in 100 samples over half a second:\n");
+    static Line lines[96];
+    for (u32 k = 0; k < n_tracks; k++) {
+        Track *tr = &tracks[k];
+        if (tr->samples < 20) {
+            tr->samples = 0;
+            continue;
+        }
+        u32 used = 0;
+        for (u32 s = 0; s < tr->samples; s++) {
+            char text[260];
+            describe_full(tr, s, text, sizeof text);
+            u32 j = 0;
+            for (; j < used; j++)
+                if (!strcmp(lines[j].text, text)) break;
+            if (j == used && used < 96) {
+                snprintf(lines[j].text, sizeof lines[j].text, "%s", text);
+                lines[j].n = 0;
+                used++;
+            }
+            if (j < 96) lines[j].n++;
+        }
+        // Threads that only ever sleep in the system's thread pool or a run loop say nothing.
+        int quiet = used == 1 && (strstr(lines[0].text, "__workq_kernreturn") || strstr(lines[0].text, "mach_msg2_trap < mach_msg_overwrite < mach_msg <"));
+        if (!quiet) {
+            char name[64] = "";
+            pthread_t pt = pthread_from_mach_thread_np(tr->port);
+            if (pt) pthread_getname_np(pt, name, sizeof name);
+            fprintf(stderr, "[profile]  thread %x %s:\n", tr->port, name);
+            for (int top = 0; top < 4; top++) {
+                u32 best = used;
+                for (u32 j = 0; j < used; j++)
+                    if (lines[j].n && (best == used || lines[j].n > lines[best].n)) best = j;
+                if (best == used) break;
+                fprintf(stderr, "[profile]    %3u  %s\n", lines[best].n, lines[best].text);
+                lines[best].n = 0;
+            }
+        }
+        tr->samples = 0;
+    }
+    n_tracks = 0;
+}
 static void *monitor(void *arg) {
     (void)arg;
     pthread_setname_np("hitch monitor");
@@ -269,6 +333,7 @@ static void *monitor(void *arg) {
         u64 frame = __atomic_load_n(&last_frame, __ATOMIC_RELAXED);
         if (!late && (!known || ++tick % 200 == 0)) refresh_threads();
         if (stall_ticks) stall_check(frame);
+        if (profile_ticks) profile_check();
         if (!frame || !tracks_for_late) continue;
         if (late && frame != seen) {
             report(to_ms(frame - seen));
@@ -294,7 +359,14 @@ void rt_hitch_start(void) {
         stall_ticks = (u64)(atof(stall) * 1e9 * tb.denom / tb.numer);
         started_at = mach_absolute_time();
     }
-    if (!tracks_for_late && !stall_ticks) return;
+    const char *prof = getenv("ARKHAM_TRACE_PROFILE");
+    if (prof && atof(prof) > 0) {
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        profile_ticks = (u64)(atof(prof) * 1e9 * tb.denom / tb.numer);
+        profile_last = mach_absolute_time();
+    }
+    if (!tracks_for_late && !stall_ticks && !profile_ticks) return;
     tracks = calloc(MAX_THREADS, sizeof *tracks);
     pthread_t t;
     pthread_create(&t, NULL, monitor, NULL);

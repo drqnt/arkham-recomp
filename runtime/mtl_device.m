@@ -139,6 +139,7 @@ static id<MTLCommandQueue> queue;
 static id<MTLCommandBuffer> cb;
 static id<MTLRenderCommandEncoder> enc;
 static CAMetalLayer *layer;
+static _Atomic int hud_wanted = -1;  // Apple's Metal HUD: 1 on, 0 off, -1 until ARKHAM_METAL_HUD or the phone's settings say (rt_set_metal_hud)
 static _Atomic int layer_ready;
 static dispatch_semaphore_t frames_in_flight;
 static _Atomic u64 completed_serial;
@@ -2393,9 +2394,12 @@ static void make_layer_on_main(void) {
     l.frame = content.bounds;
     UIScreen *screen = content.window.windowScene.screen;
     l.contentsScale = screen ? screen.nativeScale : 3.0;
-    // ARKHAM_METAL_HUD=1: Apple's Metal performance HUD on the game's layer, as config.local's switch does on the Mac.
-    const char *hud = getenv("ARKHAM_METAL_HUD");
-    if (hud && *hud == '1') {
+    // ARKHAM_METAL_HUD=1: Apple's Metal performance HUD on the game's layer, as config.local's switch does on the Mac; or the phone's settings.
+    if (atomic_load(&hud_wanted) < 0) {
+        const char *hud = getenv("ARKHAM_METAL_HUD");
+        atomic_store(&hud_wanted, hud && *hud == '1');
+    }
+    if (atomic_load(&hud_wanted) > 0) {
         if (@available(iOS 16.0, *)) l.developerHUDProperties = @{@"mode": @"default", @"logging": @"default"};
         fprintf(stderr, "[mtl] Metal HUD on\n");
     }
@@ -2787,6 +2791,19 @@ static void watch_shown(id<CAMetalDrawable> dr) {
 void rt_hitch_tick(void);
 void rt_fps_overlay(double fps, double worst_ms);
 static void *frame_pool;
+static _Atomic double fps_cap = -1;  // frames a second at most; 0 for no limit, -1 until ARKHAM_FPS_CAP has been read
+void rt_set_fps_cap(double n) { atomic_store(&fps_cap, n > 0 ? n : 0); }
+// Apple's Metal HUD on the game's layer, switched as the game runs (the phone's settings) or by ARKHAM_METAL_HUD=1 at start (hud_wanted, above).
+void rt_set_metal_hud(int on) {
+    atomic_store(&hud_wanted, on);
+#if TARGET_OS_IPHONE
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (layer) {
+            if (@available(iOS 16.0, *)) layer.developerHUDProperties = on ? @{@"mode": @"default", @"logging": @"default"} : @{@"mode": @"off"};
+        }
+    });
+#endif
+}
 static void note_frame(u64 draws) {
     static u64 fps_start, fps_frames, fps_worst, fps_prev, draws_seen;
     u64 now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -2960,13 +2977,13 @@ static void m_Present(CPU *c) {
         dispatch_semaphore_wait(frames_in_flight, DISPATCH_TIME_FOREVER);
         ticks_inflight += mach_absolute_time() - t0;
     }
-    // ARKHAM_FPS_CAP=n, the same switch as on OpenGL: no limit unless asked for.
-    static double cap = -1;
+    // ARKHAM_FPS_CAP=n, the same switch as on OpenGL: no limit unless asked for. The phone's settings change it as the game runs (rt_set_fps_cap).
     static u64 next_ns;
-    if (cap < 0) {
+    if (fps_cap < 0) {
         const char *v = getenv("ARKHAM_FPS_CAP");
-        cap = v ? atof(v) : 0.0;
+        fps_cap = v ? atof(v) : 0.0;
     }
+    double cap = fps_cap;
     if (cap > 0) {
         u64 t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), step = (u64)(1e9 / cap);
         if (t < next_ns) {

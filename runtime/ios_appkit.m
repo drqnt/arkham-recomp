@@ -221,6 +221,7 @@ static CGRect screen_rect(void) { return CGRectMake(0, 0, rt_ios_screen_w, rt_io
 }
 @end
 static NSMutableArray *all_windows;
+static NSUInteger event_type(id e);  // after NSEvent, below
 @implementation NSWindow
 + (CGRect)frameRectForContentRect:(CGRect)r styleMask:(NSUInteger)m { return r; }
 + (CGRect)contentRectForFrameRect:(CGRect)r styleMask:(NSUInteger)m { return r; }
@@ -334,7 +335,16 @@ static NSMutableArray *all_windows;
 - (void)disableCursorRects {}
 - (void)enableCursorRects {}
 - (BOOL)validateMenuItem:(id)item { return YES; }
-- (void)sendEvent:(id)e {}
+// AppKit hands a mouse event to the view under it, and up the responder chain to the window; the game's FeralWindow takes them itself.
+- (void)sendEvent:(id)e {
+    switch (event_type(e)) {
+        case 1: [self mouseDown:e]; break;
+        case 2: [self mouseUp:e]; break;
+        case 5: [self mouseMoved:e]; break;
+        case 6: [self mouseDragged:e]; break;
+        default: break;
+    }
+}
 - (void)display {}
 - (void)displayIfNeeded {}
 - (void)update {}
@@ -349,9 +359,27 @@ static NSMutableArray *all_windows;
     NSUInteger _type, _flags;
     CGPoint _location;
     double _time;
+    id _window;
+    NSInteger _clicks, _number;
+    float _pressure;
 }
 @end
 @implementation NSEvent
++ (NSEvent *)mouseEventWithType:(NSUInteger)type location:(CGPoint)loc modifierFlags:(NSUInteger)flags timestamp:(double)t windowNumber:(NSInteger)wn
+                        context:(id)ctx eventNumber:(NSInteger)en clickCount:(NSInteger)clicks pressure:(float)pressure {
+    NSEvent *e = [[NSEvent new] autorelease];
+    e->_type = type;
+    e->_flags = flags;
+    e->_location = loc;
+    e->_time = t;
+    e->_clicks = clicks;
+    e->_number = en;
+    e->_pressure = pressure;
+    return e;
+}
+- (float)pressure { return _pressure; }
+- (NSInteger)eventNumber { return _number; }
+- (NSInteger)windowNumber { return _window ? 1 : 0; }
 + (NSEvent *)otherEventWithType:(NSUInteger)type location:(CGPoint)loc modifierFlags:(NSUInteger)flags timestamp:(double)t windowNumber:(NSInteger)wn context:(id)ctx
                         subtype:(short)sub data1:(NSInteger)d1 data2:(NSInteger)d2 {
     NSEvent *e = [[NSEvent new] autorelease];
@@ -370,15 +398,17 @@ static NSMutableArray *all_windows;
 - (double)timestamp { return _time; }
 - (unsigned short)keyCode { return 0; }
 - (NSInteger)buttonNumber { return 0; }
-- (NSInteger)clickCount { return 0; }
+- (NSInteger)clickCount { return _clicks; }
 - (BOOL)isARepeat { return NO; }
 - (NSString *)characters { return @""; }
 - (NSString *)charactersIgnoringModifiers { return @""; }
-- (id)window { return nil; }
+- (id)window { return _window; }
 - (CGFloat)deltaX { return 0; }
 - (CGFloat)deltaY { return 0; }
 - (short)subtype { return 0; }
 @end
+
+static NSUInteger event_type(id e) { return [e isKindOfClass:[NSEvent class]] ? ((NSEvent *)e)->_type : 0; }
 
 @interface NSMenuItem : NSObject {
 @public
@@ -506,6 +536,8 @@ void rt_run_guest_main_queue(void);  // shims_threads.c: what the game sent to i
     id _delegate, _menu;
     _Atomic int _stopped;
     BOOL _running, _launched;
+@public
+    NSMutableArray *_events;  // posted, for nextEventMatchingMask: to hand out: the phone's taps, as clicks (rt_ios_click)
 }
 @end
 @implementation NSApplication
@@ -551,8 +583,33 @@ void rt_run_guest_main_queue(void);  // shims_threads.c: what the game sent to i
     return nil;
 }
 - (id)mainWindow { return [self keyWindow]; }
-- (void)postEvent:(id)e atStart:(BOOL)s {}
-- (void)sendEvent:(id)e {}
+- (void)postEvent:(id)e atStart:(BOOL)s {
+    if (!e) return;
+    @synchronized(self) {
+        if (!_events) _events = [NSMutableArray new];
+        if (s) [_events insertObject:e atIndex:0];
+        else [_events addObject:e];
+    }
+    extern struct __CFRunLoop *rt_guest_main_loop(void);
+    CFRunLoopWakeUp(rt_guest_main_loop());
+}
+- (NSEvent *)takeEventMatching:(unsigned long long)mask {
+    @synchronized(self) {
+        for (NSUInteger i = 0; i < _events.count; i++) {
+            NSEvent *e = _events[i];
+            if (mask & (1ull << e->_type)) {
+                [[e retain] autorelease];
+                [_events removeObjectAtIndex:i];
+                return e;
+            }
+        }
+    }
+    return nil;
+}
+- (void)sendEvent:(id)e {
+    id w = [(NSEvent *)e window];
+    if (w) [w sendEvent:e];
+}
 - (void)stop:(id)s { atomic_store(&_stopped, 1); }
 - (void)terminate:(id)s { exit(0); }
 - (void)replyToApplicationShouldTerminate:(BOOL)b {}
@@ -571,10 +628,12 @@ void rt_run_guest_main_queue(void);  // shims_threads.c: what the game sent to i
 // Work sent to the game's main queue wakes the wait (shims_threads.c).
 - (id)nextEventMatchingMask:(unsigned long long)mask untilDate:(NSDate *)date inMode:(NSString *)mode dequeue:(BOOL)dequeue {
     rt_run_guest_main_queue();
+    NSEvent *e = [self takeEventMatching:mask];
+    if (e) return e;
     double wait = date ? [date timeIntervalSinceNow] : 0;
     CFRunLoopRunInMode(kCFRunLoopDefaultMode, wait < 0 ? 0 : wait > 0.05 ? 0.05 : wait, true);
     rt_run_guest_main_queue();
-    return nil;
+    return [self takeEventMatching:mask];
 }
 // The first call is NSApplicationMain's: launching, then this thread's run loop until stop:. A run inside it is how Feral's code pumps events
 // once on a Mac (stop:, then run, which handles one event and returns), so here it is one pass: the main queue and the run loop.
@@ -909,4 +968,29 @@ Class rt_ios_class(const char *name) {
             return objc_getClass(b);
         }
     return objc_getClass(name);
+}
+
+// A tap on the phone's screen as a click of the left button there, for the game's menus (ios/app/TouchControls.m), in the window's points from its
+// top left. The cursor goes there first, and the button comes up a little later, as a finger would let go.
+void rt_touch_cursor(double x, double y);  // shims_sys.c
+void rt_ios_click(double x, double y) {
+    NSApplication *app = [NSApplication sharedApplication];
+    NSWindow *w = [app keyWindow];
+    if (!w) return;
+    rt_touch_cursor(x, y);
+    CGPoint at = CGPointMake(x, w->_frame.size.height - y);
+    double now = CFAbsoluteTimeGetCurrent();
+    NSEvent *moved = [NSEvent mouseEventWithType:5 location:at modifierFlags:0 timestamp:now windowNumber:1 context:nil eventNumber:0 clickCount:0 pressure:0];
+    NSEvent *down = [NSEvent mouseEventWithType:1 location:at modifierFlags:0 timestamp:now windowNumber:1 context:nil eventNumber:1 clickCount:1 pressure:1];
+    moved->_window = down->_window = w;
+    [app postEvent:moved atStart:NO];
+    [app postEvent:down atStart:NO];
+    [[w retain] autorelease];
+    NSWindow *kept = [w retain];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        NSEvent *up = [NSEvent mouseEventWithType:2 location:at modifierFlags:0 timestamp:CFAbsoluteTimeGetCurrent() windowNumber:1 context:nil eventNumber:2 clickCount:1 pressure:0];
+        up->_window = kept;
+        [app postEvent:up atStart:NO];
+        [kept release];
+    });
 }

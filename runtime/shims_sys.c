@@ -218,13 +218,21 @@ static void cap_setup(void) {
 }
 #endif
 
-// The phone's swipes to look around (ios/app/TouchControls.m): motion added to what the game reads as the mouse while it holds the camera, in its points.
-void rt_touch_look(double dx, double dy) {
+// The phone's touches (ios/app/TouchControls.m). Whether the game holds the cursor, warping it back each frame as it does in play: then a tap mustn't
+// be a click, which is a strike in play. And where a tap puts the cursor, for menus, which the game reads through HIGetMousePosition below.
+int rt_game_holds_cursor(void) {
     pthread_mutex_lock(&cap_mu);
-    if (cap_active) {
-        cap_dx += dx;
-        cap_dy += dy;
-    }
+    int held = cap_active && now_ms() - cap_last_warp < 300;
+    pthread_mutex_unlock(&cap_mu);
+    return held;
+}
+static int touch_cursor;
+static double touch_x, touch_y;
+void rt_touch_cursor(double x, double y) {
+    pthread_mutex_lock(&cap_mu);
+    touch_cursor = 1;
+    touch_x = x;
+    touch_y = y;
     pthread_mutex_unlock(&cap_mu);
 }
 
@@ -247,6 +255,10 @@ SHIM(HIGetMousePosition) {
     int captured = 0;
     if (!scripted_mouse) {
         pthread_mutex_lock(&cap_mu);
+#if TARGET_OS_IPHONE
+        // No system timer ends the capture on the phone (cap_setup), so it ends here once the game stops warping, as on the Mac after 300 ms.
+        if (cap_active && now_ms() - cap_last_warp > 300) cap_active = 0;
+#endif
         if (cap_active) {
             cap_x += cap_dx;
             cap_y += cap_dy;
@@ -254,6 +266,12 @@ SHIM(HIGetMousePosition) {
             p = CGPointMake(cap_x, cap_y);
             captured = 1;
         }
+#if TARGET_OS_IPHONE
+        else if (touch_cursor) {
+            p = CGPointMake(touch_x, touch_y);
+            captured = 1;
+        }
+#endif
         pthread_mutex_unlock(&cap_mu);
     }
 #if !TARGET_OS_IPHONE

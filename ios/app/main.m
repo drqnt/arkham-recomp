@@ -139,6 +139,13 @@ static void start_game(void) {
 // ---------- ARKHAM_FPS=1: a line over the game ----------
 // The frame rate, the GPU's time a frame, how many frames reach the screen, and how warm the phone is: iOS tells apps a thermal state, not degrees.
 static UILabel *overlay;
+static int overlay_on = -1;  // the settings' switch (TouchControls.m), or ARKHAM_FPS=1 until they say
+void rt_ios_overlay_enable(int on) {
+    overlay_on = on;
+    if (!on) dispatch_async(dispatch_get_main_queue(), ^{
+            overlay.hidden = YES;
+        });
+}
 static NSString *thermal_name(NSProcessInfoThermalState s) {
     switch (s) {
         case NSProcessInfoThermalStateNominal: return @"норма";
@@ -149,9 +156,8 @@ static NSString *thermal_name(NSProcessInfoThermalState s) {
     return @"?";
 }
 void rt_ios_overlay(double fps, double gpu_ms, double shown_a_second) {
-    static int on = -1;
-    if (on < 0) on = getenv("ARKHAM_FPS") && *getenv("ARKHAM_FPS") == '1';
-    if (!on) return;
+    if (overlay_on < 0) overlay_on = getenv("ARKHAM_FPS") && *getenv("ARKHAM_FPS") == '1';
+    if (!overlay_on) return;
     NSString *text = [NSString stringWithFormat:@"%.0f FPS · GPU %.1f мс · на экране %.0f/с · нагрев: %@", fps, gpu_ms, shown_a_second,
                                                 thermal_name(NSProcessInfo.processInfo.thermalState)];
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -167,6 +173,7 @@ void rt_ios_overlay(double fps, double gpu_ms, double shown_a_second) {
             overlay.textAlignment = NSTextAlignmentCenter;
             [v addSubview:overlay];
         }
+        overlay.hidden = NO;
         overlay.text = text;
         [overlay sizeToFit];
         UIEdgeInsets safe = overlay.superview.safeAreaInsets;
@@ -215,7 +222,8 @@ static void show_text(UIViewController *vc, NSString *text) {
         return;
     }
     rt_ios_game_view = vc.view;
-    void rt_ios_touch_controls(UIView *over);  // TouchControls.m
+    void rt_ios_touch_controls(UIView *over), rt_ios_apply_settings(void);  // TouchControls.m
+    rt_ios_apply_settings();
     rt_ios_touch_controls(vc.view);
     // Where Feral's code keeps its settings and caches, as on a Mac; a new app's container may not have them yet.
     NSString *lib = [NSHomeDirectory() stringByAppendingPathComponent:@"Library"];
