@@ -71,6 +71,26 @@ static CGRect screen_rect(void) { return CGRectMake(0, 0, rt_ios_screen_w, rt_io
 - (BOOL)performKeyEquivalent:(id)e { return NO; }
 - (void)interpretKeyEvents:(NSArray *)events {}
 - (void)doCommandBySelector:(SEL)s {}
+// A message none of these knows, sent by system or runtime code rather than through the bridge (which answers those with 0 itself), does nothing and
+// answers nothing, as AppKit's would have for this game's purposes, instead of ending the game. Each such selector is logged once.
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel {
+    NSMethodSignature *s = [super methodSignatureForSelector:sel];
+    if (s) return s;
+    static NSMutableSet *told;
+    @synchronized([ArkhamNSResponder class]) {
+        if (!told) told = [NSMutableSet new];
+        NSString *name = NSStringFromSelector(sel);
+        if (![told containsObject:name]) {
+            [told addObject:name];
+            fprintf(stderr, "[ios] %s has no %s on the phone: nothing done\n", object_getClassName(self), name.UTF8String);
+        }
+    }
+    return [NSMethodSignature signatureWithObjCTypes:"@@:"];
+}
+- (void)forwardInvocation:(NSInvocation *)inv {
+    id nothing = nil;
+    if (inv.methodSignature.methodReturnLength == sizeof(id)) [inv setReturnValue:&nothing];
+}
 @end
 
 @class NSWindow;
@@ -320,6 +340,8 @@ static NSMutableArray *all_windows;
 - (void)update {}
 - (id)graphicsContext { return nil; }
 - (BOOL)isReleasedWhenClosed { return NO; }
+- (void)addChildWindow:(id)w ordered:(NSInteger)place {}
+- (void)removeChildWindow:(id)w {}
 @end
 
 @interface NSEvent : NSObject {

@@ -1101,6 +1101,10 @@ static void snap_now(const char *path) {
 // On-screen frame rate (ARKHAM_FPS=1): a small panel attached above the game's window, updated once a second.
 static id fps_panel, fps_label;
 void rt_fps_overlay(double fps, double worst_ms) {
+#if TARGET_OS_IPHONE
+    (void)fps, (void)worst_ms;
+    return;  // the phone's line over the game is the app shell's (rt_ios_overlay)
+#endif
     static int enabled = -1;
     if (enabled < 0) enabled = getenv("ARKHAM_FPS") != NULL;
     if (!enabled) return;
