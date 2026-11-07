@@ -70,7 +70,7 @@ so 2 may shorten that, and whether it costs smoothness hasn't been measured in t
 Text to library takes about 40 ms a shader in the game, and a pipeline about 10 ms, on the Direct3D thread at the first draw that needs them. Metal keeps both on disk, so the second time costs nothing:
 487 shaders in 13 ms. Without help a new place stalls for up to 2.4 s, 44 shaders and 59 pipelines in the worst case seen.
 
-`tools/prebuild_shaders.sh` fills the cache ahead of play, about 2.5 minutes and 350 MB once. It has to be the game's own binary that does it, `build/arkham --prebuild-shaders list`: entries depend on
+`tools/prebuild_shaders.sh` fills the cache ahead of play, about 2.5 minutes and 350 MB, again whenever the executable's path or its Info.plist changes. It has to be the game's own binary that does it, `build/arkham --prebuild-shaders list`: entries depend on
 the executable, so another program with the same bundle identifier writes to the same file and the game never finds them. Renaming a copy of a program is enough to miss. Rebuilding the game at the same
 path keeps its entries. The first such build found 2009 of the 31,462 shaders already there, which is what the game had compiled itself, and that's the check that the key is the same.
 

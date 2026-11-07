@@ -5,6 +5,8 @@
 # ARKHAM_TRACE_PREFS (preferences read), ARKHAM_TRACE_IMPORTS=prefix (calls to imports with that prefix), ARKHAM_FAKE_PAD="secs:page:usage:value,..." (a pad with no hardware).
 # Settings: ARKHAM_RENDERER=metal, ARKHAM_LANGUAGE=ru (or en, fr, de, it, es, pl).
 cd "$(dirname "$0")/.." || exit 1
+[ -f config.local ] && . ./config.local  # local settings, not tracked: ARKHAM_RENDERER, ARKHAM_LANGUAGE, ARKHAM_METAL_HUD
+[ "$ARKHAM_METAL_HUD" = 1 ] && export MTL_HUD_ENABLED=1  # Apple's Metal performance HUD in the game's window
 export ARKHAM_STUB_ALL=1  # imports without a shim return 0 for now; they are listed on stderr as [stub]
 export ARKHAM_FPS=1       # on-screen frame rate counter
 export ARKHAM_TRACE_HITCH=1  # logs what each thread was doing when a frame comes late; costs nothing otherwise
@@ -19,4 +21,4 @@ if [ -s "$built" ] && [ -f "$engine_ini" ]; then
   samples=$(sed -n 's/^MaxMultisamples=\([0-9]*\).*/\1/p' "$engine_ini" | head -1)
   [ "${samples:-0}" = "$(cat "$built")" ] || echo "Shaders were built for another anti-aliasing level, so new places will stall. tools/build_shader_cache.sh rebuilds them."
 fi
-exec build/arkham "$@" 2> logs/run.err
+exec build/Arkham.app/Contents/MacOS/arkham "$@" 2> logs/run.err

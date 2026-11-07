@@ -4,10 +4,12 @@
 // the wired Xbox 360 controller (360Driver/XBox360Wired.plist), which every Xbox controller since works like and which the game shows Xbox buttons for.
 // ARKHAM_FAKE_PAD="seconds:page:usage:value,..." shows one with no hardware, for scripted runs, and ARKHAM_FAKE_PAD_TYPE=xbox or ps picks which.
 #import <CoreFoundation/CoreFoundation.h>
+#import <CoreHaptics/CoreHaptics.h>
 #import <GameController/GameController.h>
 #include "shim.h"
 #include "shim_reg.h"
 #include <mach/mach_time.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -129,6 +131,8 @@ static void call_game(u32 fn, u32 a0, u32 a1, u32 a2, u32 a3) {
     if (!held) rt_gate_release();
 }
 
+static void announce_service(void);
+static void rumble_tick(void);
 static int clamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 static int stick(const Profile *f, float v) {
     return f->signed_sticks ? clamp((int)(v * 32767.0f), -32768, 32767) : clamp((int)((v + 1.0f) * 127.5f + 0.5f), 0, 255);
@@ -219,7 +223,9 @@ static void tick(void) {
     if (!shown) {
         shown = want;
         if (match_cb) call_game(match_cb, match_ctx, 0, g_manager, want->guest);
+        announce_service();
     }
+    rumble_tick();
     if (!input_cb) return;
     for (int i = 0; i < want->n; i++) {
         Control *k = &want->controls[i];
@@ -318,6 +324,283 @@ SHIM(CFSetGetValues) {
     free(v);
 }
 
+// ---------- rumble ----------
+// Feral's code finds a controller's force feedback through IOKit: a matching notification for IOHIDDevice services, their properties to pair one with the HID
+// device, then the ForceFeedback API. Each controller shown to the game gets one service here, and the effects the game plays are added up into one intensity,
+// which drives the controller's haptics through CoreHaptics. ARKHAM_TRACE_RUMBLE=1 logs the effects.
+enum { SERVICE_BASE = 0x5A5A0010u, ITERATOR_BASE = 0x5A5A0100u, FF_DEVICE = 0x5A5A0200u };
+typedef struct {
+    int used, playing, periodic;
+    u32 magnitude, gain, duration_us;
+    double started;
+} Effect;
+static Effect effects[16];
+static u32 device_gain = 10000;
+static u32 hid_cb, hid_ctx, hid_iter;  // the game's notification for arriving IOHIDDevice services
+static struct {
+    u32 left[4];
+    int n, at;
+} iterators[8];
+static int trace_rumble = -1;
+static int motor_big, motor_small;  // set by the Xbox 360 driver's escape command, below
+static CHHapticEngine *engine API_AVAILABLE(macos(11.0), ios(14.0));
+static id<CHHapticAdvancedPatternPlayer> player API_AVAILABLE(macos(11.0), ios(14.0));
+static GCController *engine_pad;
+static float sent = -1;
+
+static u32 service_of(const Profile *f) { return SERVICE_BASE + (u32)(f - profiles); }
+static Profile *profile_of_service(u32 s) {
+    u32 i = s - SERVICE_BASE;
+    return i < sizeof profiles / sizeof profiles[0] ? &profiles[i] : NULL;
+}
+static u32 new_iterator(u32 service) {
+    for (u32 i = 0; i < 8; i++) {
+        if (iterators[i].n == 0 || iterators[i].at >= iterators[i].n) {
+            iterators[i].n = service ? 1 : 0;
+            iterators[i].at = 0;
+            iterators[i].left[0] = service;
+            if (!service) iterators[i].n = -1;  // used, but empty
+            return ITERATOR_BASE + i;
+        }
+    }
+    return 0;
+}
+static float rumble_now(void) {
+    double now = CFAbsoluteTimeGetCurrent();
+    float total = 0;
+    for (int i = 0; i < 16; i++) {
+        Effect *e = &effects[i];
+        if (!e->used || !e->playing) continue;
+        if (e->duration_us != 0xFFFFFFFFu && now - e->started > e->duration_us / 1e6) {
+            e->playing = 0;
+            continue;
+        }
+        total += (float)e->magnitude / 10000.0f * (float)e->gain / 10000.0f;
+    }
+    total *= (float)device_gain / 10000.0f;
+    float motors = (float)(motor_big > motor_small ? motor_big : motor_small) / 255.0f;
+    if (motors > total) total = motors;
+    return total > 1 ? 1 : total;
+}
+static void haptics_send(float v) {
+    if (trace_rumble < 0) trace_rumble = getenv("ARKHAM_TRACE_RUMBLE") != NULL;
+    if (trace_rumble) fprintf(stderr, "[pad] rumble %.2f\n", v);
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        if (!pad || !pad.haptics) return;
+        if (engine_pad != pad) {
+            [player cancelAndReturnError:nil];
+            player = nil;
+            [engine stopWithCompletionHandler:nil];
+            engine = [pad.haptics createEngineWithLocality:GCHapticsLocalityDefault];
+            engine_pad = pad;
+            NSError *err = nil;
+            [engine startAndReturnError:&err];
+            CHHapticEvent *ev = [[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticContinuous
+                                                              parameters:@[ [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticIntensity value:1],
+                                                                            [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticSharpness value:0.3] ]
+                                                            relativeTime:0
+                                                                duration:30];
+            CHHapticPattern *pattern = [[CHHapticPattern alloc] initWithEvents:@[ ev ] parameters:@[] error:&err];
+            player = pattern ? [engine createAdvancedPlayerWithPattern:pattern error:&err] : nil;
+            player.loopEnabled = YES;
+            if (!player) fprintf(stderr, "[pad] this controller's haptics didn't start: %s\n", err.localizedDescription.UTF8String);
+            else fprintf(stderr, "[pad] rumble goes to the controller's haptics\n");
+        }
+        if (!player) return;
+        if (v <= 0.01f) {
+            [player stopAtTime:0 error:nil];
+        } else {
+            [player startAtTime:0 error:nil];
+            [player sendParameters:@[ [[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticIntensityControl value:v relativeTime:0] ]
+                            atTime:0
+                             error:nil];
+        }
+    }
+}
+static void rumble_tick(void) {
+    float v = rumble_now();
+    if (fabsf(v - sent) < 0.03f && !(v == 0 && sent > 0)) return;
+    sent = v;
+    haptics_send(v);
+}
+static void read_effect(Effect *e, u32 p, u32 flags) {
+    if (!p) return;
+    if (flags & 1) e->duration_us = G32(p + 8);                     // FFEP_DURATION
+    if (flags & 4) e->gain = G32(p + 16);                           // FFEP_GAIN
+    if ((flags & 0x100) && G32(p + 48)) {                           // FFEP_TYPESPECIFICPARAMS
+        u32 tp = G32(p + 48), size = G32(p + 44);
+        if (e->periodic) e->magnitude = G32(tp);                    // FFPERIODIC.dwMagnitude
+        else if (size >= 4) e->magnitude = (u32)abs((int)G32(tp));  // FFCONSTANTFORCE.lMagnitude, or FFRAMPFORCE.lStart
+        if (e->magnitude > 10000) e->magnitude = 10000;
+    }
+}
+static Effect *effect_of(u32 h) {
+    u32 i = h - 0x5A5A0300u;
+    return i < 16 ? &effects[i] : NULL;
+}
+static void announce_service(void) {
+    if (hid_cb && shown) call_game(hid_cb, hid_ctx, new_iterator(service_of(shown)), 0, 0);
+}
+
+SHIM(IONotificationPortCreate) { RET(opaque()); }
+SHIM(IONotificationPortGetRunLoopSource) {
+    CFRunLoopSourceContext ctx = {0};
+    RET(cf_wrap(CFRunLoopSourceCreate(NULL, 0, &ctx)));
+}
+SHIM(IOServiceAddMatchingNotification) {  // port, type, matching, callback, refcon, out iterator
+    CFDictionaryRef m = cf_unwrap(ARG(2));
+    CFStringRef cls = m ? CFDictionaryGetValue(m, CFSTR("IOProviderClass")) : NULL;
+    int hid = cls && CFEqual(cls, CFSTR("IOHIDDevice"));
+    int arrival = !strstr(GS(ARG(1)), "Terminate");
+    u32 it = new_iterator(hid && arrival && shown ? service_of(shown) : 0);
+    if (hid && arrival) {
+        hid_cb = ARG(3);
+        hid_ctx = ARG(4);
+        hid_iter = it;
+    }
+    G32(ARG(5)) = it;
+    RET(0);
+}
+SHIM(IOServiceGetMatchingService) {  // master port, matching: the game looks up its controller's service this way
+    CFDictionaryRef m = cf_unwrap(ARG(1));
+    CFStringRef cls = m ? CFDictionaryGetValue(m, CFSTR("IOProviderClass")) : NULL;
+    RET(cls && CFEqual(cls, CFSTR("IOHIDDevice")) && shown ? service_of(shown) : 0);
+}
+SHIM(IOIteratorNext) {
+    u32 i = ARG(0) - ITERATOR_BASE;
+    if (i >= 8 || iterators[i].n <= 0 || iterators[i].at >= iterators[i].n) {
+        RET(0);
+        return;
+    }
+    RET(iterators[i].left[iterators[i].at++]);
+}
+SHIM(IOObjectRelease) { RET(0); }
+SHIM(IOObjectRetain) { RET(0); }
+SHIM(IOObjectConformsTo) { RET(profile_of_service(ARG(0)) && !strcmp(GS(ARG(1)), "IOHIDDevice")); }
+SHIM(IORegistryEntryCreateCFProperty) {  // entry, key, allocator, options
+    Profile *f = profile_of_service(ARG(0));
+    CFTypeRef v = f ? CFDictionaryGetValue(f->device, cf_unwrap(ARG(1))) : NULL;
+    RET(v ? cf_wrap(CFRetain(v)) : 0);
+}
+SHIM(IORegistryEntryCreateCFProperties) {  // entry, out dictionary, allocator, options
+    Profile *f = profile_of_service(ARG(0));
+    if (!f) {
+        G32(ARG(1)) = 0;
+        RET(0xE00002C0u);
+        return;
+    }
+    G32(ARG(1)) = cf_wrap(CFDictionaryCreateMutableCopy(NULL, 0, f->device));
+    RET(0);
+}
+SHIM(IORegistryEntryGetName) {
+    Profile *f = profile_of_service(ARG(0));
+    snprintf((char *)GP(ARG(1)), 128, "%s", f ? f->product_name : "");
+    RET(f ? 0 : 0xE00002C0u);
+}
+SHIM(IORegistryEntryGetParentEntry) {
+    G32(ARG(2)) = 0;
+    RET(0xE00002C0u);
+}
+SHIM(FFIsForceFeedback) { RET(profile_of_service(ARG(0)) ? 0 : 0x80040201u); }
+SHIM(FFCreateDevice) {
+    if (!profile_of_service(ARG(0))) {
+        RET(0x80040201u);
+        return;
+    }
+    G32(ARG(1)) = FF_DEVICE;
+    fprintf(stderr, "[pad] the game opened force feedback\n");
+    RET(0);
+}
+SHIM(FFReleaseDevice) { RET(0); }
+SHIM(FFDeviceGetForceFeedbackCapabilities) {
+    u32 p = ARG(1);
+    memset(GP(p), 0, 72);
+    G32(p + 4) = 0x7F | 0x800;  // constant, ramp, square, sine, triangle, sawtooth up and down, custom
+    G32(p + 12) = 2;            // FFCAP_ST_VIBRATION
+    G32(p + 16) = 2;
+    G8(p + 20) = 0;  // FFJOFS_X
+    G8(p + 21) = 4;  // FFJOFS_Y
+    G32(p + 52) = 16;
+    G32(p + 56) = 16;
+    RET(0);
+}
+SHIM(FFDeviceSetForceFeedbackProperty) {
+    if (ARG(1) == 1 && ARG(2)) device_gain = G32(ARG(2));  // FFPROP_FFGAIN
+    RET(0);
+}
+// The Xbox 360 driver's own commands, which the game uses instead of effects. FFEFFESCAPE is {size, command, in buffer, in size, out buffer, out size}.
+// Command 0 with one byte turns manual control on or off, and command 1 with two bytes sets the two motors, big then small, while it's on.
+static int manual_motors;
+SHIM(FFDeviceEscape) {
+    u32 e = ARG(1), cmd = G32(e + 4), in = G32(e + 8), size = G32(e + 12);
+    if (cmd == 0 && size == 1 && in) manual_motors = G8(in) != 0;
+    if (cmd == 1 && size == 2 && in && manual_motors) {
+        int big = G8(in), small = G8(in + 1);
+        if (trace_rumble < 0) trace_rumble = getenv("ARKHAM_TRACE_RUMBLE") != NULL;
+        if (trace_rumble && (big != motor_big || small != motor_small)) fprintf(stderr, "[pad] motors %d %d\n", big, small);
+        motor_big = big;
+        motor_small = small;
+    }
+    RET(0);
+}
+SHIM(FFDeviceCreateEffect) {  // device, effect type uuid, FFEFFECT, out effect
+    int i = 0;
+    while (i < 16 && effects[i].used) i++;
+    if (i == 16) {
+        RET(0x80040209u);
+        return;
+    }
+    Effect *e = &effects[i];
+    memset(e, 0, sizeof *e);
+    e->used = 1;
+    e->gain = 10000;
+    e->duration_us = 0xFFFFFFFFu;
+    CFUUIDRef type = cf_unwrap(ARG(1));
+    CFUUIDBytes b = type ? CFUUIDGetUUIDBytes(type) : (CFUUIDBytes){0};
+    e->periodic = b.byte3 >= 0x62 && b.byte3 <= 0x66;  // square, sine, triangle, sawtooth up and down: E559C462 to E559C466
+    read_effect(e, ARG(2), 0x105);
+    if (trace_rumble < 0) trace_rumble = getenv("ARKHAM_TRACE_RUMBLE") != NULL;
+    if (trace_rumble) fprintf(stderr, "[pad] effect %d of type %02X, magnitude %u, duration %u us\n", i, b.byte3, e->magnitude, e->duration_us);
+    G32(ARG(3)) = 0x5A5A0300u + (u32)i;
+    RET(0);
+}
+SHIM(FFDeviceReleaseEffect) {
+    Effect *e = effect_of(ARG(1));
+    if (e) e->used = e->playing = 0;
+    RET(0);
+}
+SHIM(FFEffectDownload) { RET(0); }
+SHIM(FFEffectSetParameters) {  // effect, FFEFFECT, flags
+    Effect *e = effect_of(ARG(0));
+    if (e) {
+        read_effect(e, ARG(1), ARG(2));
+        if (ARG(2) & 0x20000000u) {  // FFEP_START
+            e->playing = 1;
+            e->started = CFAbsoluteTimeGetCurrent();
+        }
+    }
+    RET(0);
+}
+SHIM(FFEffectStart) {
+    Effect *e = effect_of(ARG(0));
+    if (e) {
+        e->playing = 1;
+        e->started = CFAbsoluteTimeGetCurrent();
+    }
+    RET(0);
+}
+SHIM(FFEffectStop) {
+    Effect *e = effect_of(ARG(0));
+    if (e) e->playing = 0;
+    RET(0);
+}
+SHIM(FFEffectGetEffectStatus) {
+    Effect *e = effect_of(ARG(0));
+    rumble_now();
+    G32(ARG(1)) = e && e->playing ? 1 : 0;
+    RET(0);
+}
+
 // IOKit services: logged, to see what the game looks for beyond the HID manager (Feral's Xbox 360 support goes through a driver's service, rumble included).
 static void note_service(const char *how, const char *name) {
     static char seen[8][64];
@@ -332,7 +615,12 @@ static void note_service(const char *how, const char *name) {
 }
 SHIM(IOServiceMatching) {
     note_service("", GS(ARG(0)));
-    RET(0);
+    // A real matching dictionary, which the game may add to, and which the matching notification above reads its class from.
+    CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFStringRef cls = CFStringCreateWithCString(NULL, GS(ARG(0)), kCFStringEncodingUTF8);
+    CFDictionarySetValue(d, CFSTR("IOProviderClass"), cls);
+    CFRelease(cls);
+    RET(cf_wrap(d));
 }
 SHIM(IOServiceNameMatching) {
     note_service("named ", GS(ARG(0)));
@@ -343,5 +631,9 @@ const ShimReg rt_shims_hid[] = {
     R(IOHIDManagerRegisterDeviceMatchingCallback) R(IOHIDManagerRegisterDeviceRemovalCallback) R(IOHIDManagerRegisterInputValueCallback) R(IOHIDManagerCopyDevices)
     R(IOHIDDeviceGetProperty) R(IOHIDValueGetElement) R(IOHIDValueGetIntegerValue) R(IOHIDValueGetTimeStamp)
     R(IOHIDElementGetDevice) R(IOHIDElementGetUsage) R(IOHIDElementGetUsagePage) R(IOHIDElementGetCookie) R(CFSetGetCount) R(CFSetGetValues)
-    R(IOServiceMatching) R(IOServiceNameMatching)
+    R(IOServiceMatching) R(IOServiceNameMatching) R(IONotificationPortCreate) R(IONotificationPortGetRunLoopSource) R(IOServiceAddMatchingNotification)
+    R(IOServiceGetMatchingService) R(IOIteratorNext) R(IOObjectRelease) R(IOObjectRetain) R(IOObjectConformsTo) R(IORegistryEntryCreateCFProperty) R(IORegistryEntryCreateCFProperties)
+    R(IORegistryEntryGetName) R(IORegistryEntryGetParentEntry) R(FFIsForceFeedback) R(FFCreateDevice) R(FFReleaseDevice) R(FFDeviceGetForceFeedbackCapabilities)
+    R(FFDeviceSetForceFeedbackProperty) R(FFDeviceEscape) R(FFDeviceCreateEffect) R(FFDeviceReleaseEffect) R(FFEffectDownload) R(FFEffectSetParameters)
+    R(FFEffectStart) R(FFEffectStop) R(FFEffectGetEffectStatus)
     {NULL, NULL}};

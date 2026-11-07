@@ -8,4 +8,4 @@ if pgrep -x arkham > /dev/null; then
 fi
 python3 -I tools/build.py > logs/build.log 2>&1 || { tail -5 logs/build.log; exit 1; }
 python3 -I tools/check_shaders.py translate || exit 1
-exec build/arkham --prebuild-shaders logs/msl/files.txt
+exec build/Arkham.app/Contents/MacOS/arkham --prebuild-shaders logs/msl/files.txt

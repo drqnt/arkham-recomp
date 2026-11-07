@@ -137,7 +137,6 @@ SHIM(uncompress) {
 #define IO_ERROR 0xE00002BCu
 SHIM(IOMasterPort) { G32(ARG(1)) = 0; RET(IO_ERROR); }
 SHIM(IOServiceGetMatchingServices) { G32(ARG(2)) = 0; RET(IO_ERROR); }
-SHIM(IOServiceGetMatchingService) { RET(0); }
 // ---------- which process is in front: the engine stops reading the mouse when it isn't this one ----------
 #include <objc/message.h>
 static int scripted_mouse;
@@ -300,7 +299,7 @@ const ShimReg rt_shims_sys[] = {
     R(CFUUIDCreate) R(CFUUIDGetUUIDBytes) R(CFUUIDCreateString) R(CSCopyMachineName)
     R(inflateInit_) R(inflateInit2_) R(deflateInit2_) R(inflate) R(deflate) R(inflateReset) R(deflateReset)
     R(inflateEnd) R(deflateEnd) R(adler32) R(crc32) R(compress) R(uncompress)
-    R(IOMasterPort) R(IOServiceGetMatchingServices) R(IOServiceGetMatchingService)
+    R(IOMasterPort) R(IOServiceGetMatchingServices)
     R(HIGetMousePosition) R(GetFrontProcess) R(SameProcess)
     R(UCKeyTranslate) R(CGWarpMouseCursorPosition) R(CGAssociateMouseAndMouseCursorPosition) R(CGSetLocalEventsSuppressionInterval) R(CGEventSourceKeyState)
     {NULL, NULL},

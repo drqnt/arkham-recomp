@@ -165,7 +165,8 @@ SHIM(store_FileRead) {
     // A test run starts from a frozen copy if there is one, so that the place it starts from doesn't move as the game is played.
     if (cloud_read_only()) {
         char path[256];
-        snprintf(path, sizeof path, "logs/saves/frozen/%s", GS(ARG(1)));
+        const char *dir = getenv("ARKHAM_FROZEN_DIR");  // another set of frozen saves, for a test that needs another place
+        snprintf(path, sizeof path, "%s/%s", dir ? dir : "logs/saves/frozen", GS(ARG(1)));
         FILE *f = fopen(path, "rb");
         if (f) {
             int n = (int)fread(GP(ARG(2)), 1, (size_t)ARG(3), f);

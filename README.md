@@ -10,7 +10,7 @@ are derived from the installed game, stay on this machine, and must never be pub
 
 ```
 python3 -I tools/lift.py     # i386 Mach-O -> gen/*.c (about 10 s)
-python3 -I tools/build.py    # gen + runtime -> build/arkham (about a minute from clean)
+python3 -I tools/build.py    # gen + runtime -> build/Arkham.app, with build/arkham pointing at it (about a minute from clean)
 tools/run.sh                 # Steam must be running
 tools/build_shader_cache.sh  # once, with the game closed: builds pixel shaders ahead of play, about 12 minutes
 python3 -I tests/difftest.py 400   # instruction semantics against real x86 under Rosetta

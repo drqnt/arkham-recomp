@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Incremental parallel build of generated shards and the runtime into build/arkham."""
+"""Incremental parallel build of generated shards and the runtime into build/Arkham.app, with build/arkham pointing at its executable."""
 from __future__ import annotations
 
 import argparse
@@ -15,7 +15,7 @@ ENV = dict(os.environ, DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer
 COMMON = ["-std=gnu11", "-fno-strict-aliasing", "-fwrapv", "-w", "-fno-stack-protector", "-fno-exceptions", "-funwind-tables",
           "-fno-math-errno", "-ffp-contract=off", "-mcpu=apple-m1", "-arch", "arm64", "-mmacosx-version-min=14.0",
           f"-I{ROOT}/runtime"]
-FRAMEWORKS = ["CoreFoundation", "CoreServices", "Foundation", "AppKit", "OpenGL", "ApplicationServices", "Carbon", "ImageIO", "CoreGraphics", "CoreText", "AudioToolbox", "AudioUnit", "CoreAudio", "Metal", "GameController", "QuartzCore"]
+FRAMEWORKS = ["CoreFoundation", "CoreServices", "Foundation", "AppKit", "OpenGL", "ApplicationServices", "Carbon", "ImageIO", "CoreGraphics", "CoreText", "AudioToolbox", "AudioUnit", "CoreAudio", "Metal", "GameController", "CoreHaptics", "QuartzCore"]
 
 
 EXTRA: list[str] = []
@@ -84,7 +84,11 @@ def main() -> int:
     rsp = os.path.join(ROOT, "build", "link.rsp")
     with open(rsp, "w") as fh:
         fh.write("\n".join(objs))
-    out = os.path.join(ROOT, "build", "serial", "arkham") if args.serial else os.path.join(ROOT, "build", "arkham")
+    # The game lives in an app bundle, build/Arkham.app, because macOS only turns Game Mode on for an app marked as a game. build/arkham points at it.
+    # Metal's shader cache depends on the executable's path, so the shaders are built ahead for this one: tools/prebuild_shaders.sh.
+    app = os.path.join(ROOT, "build", "Arkham.app", "Contents")
+    os.makedirs(os.path.join(app, "MacOS"), exist_ok=True)
+    out = os.path.join(ROOT, "build", "serial", "arkham") if args.serial else os.path.join(app, "MacOS", "arkham")
     # With a bundle identifier Metal keeps its shader cache in a folder of its own, instead of the one most of the system shares.
     bundle = ["-Wl,-sectcreate,__TEXT,__info_plist," + os.path.join(ROOT, "runtime", "Info.plist")]
     cmd = ["xcrun", "clang", "-arch", "arm64", "-mmacosx-version-min=14.0", f"@{rsp}", "-o", out, "-Wl,-w", "-lz",
@@ -96,6 +100,19 @@ def main() -> int:
         print(r.stderr[:4000], file=sys.stderr)
         return 1
     print(f"linked {out} {os.path.getsize(out) / 1e6:.0f} MB in {time.time() - t1:.0f}s")
+    if not args.serial:
+        import plistlib
+        with open(os.path.join(ROOT, "runtime", "Info.plist"), "rb") as fh:
+            info = plistlib.load(fh)
+        info.update({"CFBundleExecutable": "arkham", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "1.0", "CFBundleVersion": "1",
+                     "LSMinimumSystemVersion": "14.0", "NSHighResolutionCapable": True})
+        with open(os.path.join(app, "Info.plist"), "wb") as fh:
+            plistlib.dump(info, fh)
+        link = os.path.join(ROOT, "build", "arkham")
+        if os.path.islink(link) or not os.path.exists(link) or os.path.isfile(link):
+            if os.path.lexists(link):
+                os.remove(link)
+            os.symlink(os.path.join("Arkham.app", "Contents", "MacOS", "arkham"), link)
     tool, tool_src = os.path.join(ROOT, "build", "warm_shaders"), os.path.join(ROOT, "tools", "warm_shaders.c")
     if not args.serial and stale(tool_src, tool, []):
         r = subprocess.run(["xcrun", "clang", "-O2", "-arch", "arm64", "-mcpu=apple-m1", "-mmacosx-version-min=14.0", "-Wno-deprecated-declarations", tool_src, "-framework", "OpenGL", *bundle, "-o", tool],
