@@ -5,7 +5,7 @@
 // What the game needs in the app's Documents folder, put there by tools/ios_install.sh (docs/IOS_PORT.md):
 //   Batman Arkham Asylum GOTY/   the Steam folder of the game, as on the Mac
 //   Steam/answer.txt, Steam/cloud/   what the Mac's Steam said when the game was installed, and the saves
-//   arkham.env (optional)        lines of NAME=value, the same settings as config.local on the Mac
+//   arkham.env (optional)        lines of NAME=value, the same settings as config.local on the Mac, ARKHAM_METAL_HUD=1 among them
 // The log of each run is Documents/Logs/run.txt, the previous one run.previous.txt.
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
@@ -38,6 +38,8 @@ static void settings(void) {
         v = [v stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"\"' "]];
         setenv(k.UTF8String, v.UTF8String, 1);
     }
+    const char *hud = getenv("ARKHAM_METAL_HUD");
+    if (hud && *hud == '1') setenv("MTL_HUD_ENABLED", "1", 1);  // and the layer's own switch, in mtl_device.m
 }
 
 // ---------- the log ----------

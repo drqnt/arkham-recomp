@@ -2339,6 +2339,12 @@ static void make_layer_on_main(void) {
     l.frame = content.bounds;
     UIScreen *screen = content.window.windowScene.screen;
     l.contentsScale = screen ? screen.nativeScale : 3.0;
+    // ARKHAM_METAL_HUD=1: Apple's Metal performance HUD on the game's layer, as config.local's switch does on the Mac.
+    const char *hud = getenv("ARKHAM_METAL_HUD");
+    if (hud && *hud == '1') {
+        if (@available(iOS 16.0, *)) l.developerHUDProperties = @{@"mode": @"default", @"logging": @"default"};
+        fprintf(stderr, "[mtl] Metal HUD on\n");
+    }
     [content.layer addSublayer:l];
     layer = [l retain];
     fprintf(stderr, "[mtl] drawing into a layer on the app's view, %.0f x %.0f points at %.0fx\n", content.bounds.size.width, content.bounds.size.height, l.contentsScale);
