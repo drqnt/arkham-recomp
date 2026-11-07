@@ -544,9 +544,13 @@ void rt_run_guest_main_queue(void);  // shims_threads.c: what the game sent to i
 }
 // The game's events, one pass of this thread's run loop: timers and performSelector:afterDelay:, which is how the game starts its main loop, fire here.
 // There are no AppKit events on the phone, so there's never one to return.
+// AppKit waits here until an event comes or the date passes, and the runtime's lock is free all that time. Returning at once would have the
+// game's main thread take the lock back thousands of times a second, and the lock isn't fair: the game's other threads could wait forever.
+// Work sent to the game's main queue wakes the wait (shims_threads.c).
 - (id)nextEventMatchingMask:(unsigned long long)mask untilDate:(NSDate *)date inMode:(NSString *)mode dequeue:(BOOL)dequeue {
     rt_run_guest_main_queue();
-    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, false);
+    double wait = date ? [date timeIntervalSinceNow] : 0;
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, wait < 0 ? 0 : wait > 0.05 ? 0.05 : wait, true);
     rt_run_guest_main_queue();
     return nil;
 }
@@ -555,7 +559,7 @@ void rt_run_guest_main_queue(void);  // shims_threads.c: what the game sent to i
 - (void)run {
     if (_running) {
         rt_run_guest_main_queue();
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, false);
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.002, true);  // a short wait, as above; on a Mac it is the event's handling that takes the time
         rt_run_guest_main_queue();
         atomic_store(&_stopped, 0);
         return;
