@@ -70,3 +70,33 @@ window and view the layer draws into.
   `applicationDidFinishLaunching:` and `runApp:`. The launcher, a web page whose Play button calls into the game's `WebkitJSInterface`, has to be skipped.
 
 Next: the AppKit stand-ins, skipping the launcher, an app shell in `ios/app` that links the library, and copying the game's files onto the phone.
+
+## The app, 2026-11-07
+
+How to put it on a device, with the device connected and unlocked:
+
+1. `ios/app/run.sh [device] install-only` builds the library and the app and installs it, signed by the team in `ios/app/team.local` (or `ios/probe/team.local`).
+2. `tools/ios_install.sh [device]` asks this Mac's Steam about the game (`arkham --steam-check`, Steam running and signed in, offline mode fine), and only if
+   Steam says the account owns it, copies the game's Steam folder into the app's Documents (9.3 GB: the French, German, Italian, Spanish and Polish packs stay
+   behind), Steam's answers to `Documents/Steam/answer.txt`, and the cloud saves to `Documents/Steam/cloud` if the device has no saves yet.
+3. `ios/app/run.sh [device]` starts it with its log in `logs/ios/run.txt`; the app also keeps the log in `Documents/Logs/run.txt`. Settings go in
+   `Documents/arkham.env`, `NAME=value` lines as in `config.local`; the phone's defaults are Metal, `ARKHAM_LANGUAGE=ru`, `ARKHAM_FXAA=1`.
+
+What makes the phone different, in the runtime:
+
+- AppKit: `runtime/ios_appkit.m` has the 25 classes the game uses, named `ArkhamNSWindow` and so on because iOS has its own `NSColor` and `WebView`; the bridge
+  finds them by their AppKit names (`rt_ios_class`). Windows and views keep the frames they're given; the screen is the phone's; menus keep their items;
+  `NSApplication`'s run loop turns the thread's run loop. `MainMenu.nib` can't be loaded there, so `load_main_nib` makes its delegate and menu by hand.
+- The launcher is skipped (always on iOS, `ARKHAM_SKIP_LAUNCHER=1` on the Mac): its modal loop at `0x2055740` answers as if Play was pressed.
+- The game's main thread is not the process's: UIKit keeps that one. `rt_main` runs on a thread with a 256 MB stack, and what the game sends to its main queue,
+  its timers and `CFRunLoopGetMain` all go to that thread's run loop (`rt_guest_main_loop`). Other game threads get 32 MB stacks instead of 64 to spare address
+  space.
+- OpenGL: Feral's code still makes a legacy and a core context at start and asks them about 150 questions. `runtime/ios_gl.c` answers them as the Mac's OpenGL
+  did (recorded with `ARKHAM_GL_RECORD=1`), reports one renderer with 2 GB, and makes every other OpenGL call do nothing.
+- Displays, the keyboard layout and images moved from `shims_gl.c` to `shims_cg.c`, built for both. The phone's display modes are its screen in pixels and
+  75% and 50% of it.
+- Steam: `shims_steam.c` answers from `answer.txt` and keeps the cloud saves as files on the device; without the answer, `SteamAPI_Init` fails as it does on a
+  Mac without Steam.
+
+First look at the device (the iPhone the user calls iPhone Duo): 51.6 GB free, 3369 MB of memory for the app, and while unfolded a 951 x 669 point screen at 3x,
+2853 x 2007 pixels, more than the Mac's 2560 x 1600.

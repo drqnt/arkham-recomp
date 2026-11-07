@@ -805,6 +805,10 @@ int main(int argc, char **argv) {
 #endif
     setvbuf(stderr, NULL, _IOLBF, 0);
     if (argc == 3 && !strcmp(argv[1], "--prebuild-shaders")) return rt_mtl_prebuild(argv[2]);
+#if !TARGET_OS_IPHONE
+    int rt_steam_check(const char *dir);
+    if (argc == 3 && !strcmp(argv[1], "--steam-check")) return rt_steam_check(argv[2]);
+#endif
     rt_main_argc = argc;
     rt_main_argv = argv;
     gate_init();

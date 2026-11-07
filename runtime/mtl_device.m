@@ -2924,6 +2924,9 @@ int rt_mtl_on(void) {
     if (on < 0) {
         const char *v = getenv("ARKHAM_RENDERER");
         on = v && !strcmp(v, "metal");
+#if TARGET_OS_IPHONE
+        on = 1;  // the phone has no OpenGL to draw with
+#endif
     }
     return on;
 }
