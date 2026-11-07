@@ -236,7 +236,7 @@ void rt_touch_mouse(double dx, double dy) {
 // be a click, which is a strike in play. And where a tap puts the cursor, for menus, which the game reads through HIGetMousePosition below.
 int rt_game_holds_cursor(void) {
     pthread_mutex_lock(&cap_mu);
-    int held = cap_active && now_ms() - cap_last_warp < 300;
+    int held = (cap_active || scripted_mouse) && now_ms() - cap_last_warp < 300;  // a scripted run's warps count too (CGWarpMouseCursorPosition)
     pthread_mutex_unlock(&cap_mu);
     return held;
 }
@@ -549,9 +549,18 @@ void rt_touch_move(float x, float y, int in_play) {
     atomic_store(&move_y, in_play ? y : 0);
     atomic_store(&move_owned, in_play);
 }
-int rt_move_owned(void) { return rt_move_direct() && atomic_load(&move_owned); }
+// Walking goes this way only while the game holds the cursor, warping it back each frame as it does in play: on the map and in menus it doesn't, and
+// there the left stick has to reach the game as the pad's, to pan the map and move through menus. The touch controls can't tell by themselves when
+// their menu mode is off ("Прятать вне игры"), and the map, with its hundreds of draws, looks like play to them.
+int rt_move_owned(void) { return rt_move_direct() && atomic_load(&move_owned) && rt_game_holds_cursor(); }
+// For the pad with no hardware on the Mac, which carries the walking stick on the map and in menus as the phone's touch pad does.
+void rt_touch_move_get(float *x, float *y) {
+    *x = atomic_load(&move_x);
+    *y = atomic_load(&move_y);
+}
 static void move_to_engine(CPU *c, u32 bp2) {
     static float sent_x, sent_y;
+    int rt_move_owned(void);
     // Not as the left stick's own keys (XboxTypeS_LeftX and _LeftY): sent that way, from a pad or not, the game damped the camera while Batman walked.
     // As the keyboard's movement names instead, StrafeRight and MoveForward, which are bound to the same aStrafe and aBaseY with no dead zone; and the
     // stick's raw axes, which the keyboard's W, A, S and D feed too, through TurnRight and TurnLeft, rebound to them on the phone (shims_libc.c), as
@@ -559,7 +568,9 @@ static void move_to_engine(CPU *c, u32 bp2) {
     // all the way, as walking with the W key did, against a fifth with the stick.
     u32 lx = atomic_load(&stick_idx[4]), ly = atomic_load(&stick_idx[5]), rx = atomic_load(&stick_idx[6]), ry = atomic_load(&stick_idx[7]);
     if (!rt_move_direct() || !lx || !ly) return;
-    float x = atomic_load(&move_x), y = atomic_load(&move_y);
+    // On the map or in a menu the pad's stick carries it (shims_hid.m), and this sends one last zero if walking was going on.
+    int owned = rt_move_owned();
+    float x = owned ? atomic_load(&move_x) : 0, y = owned ? atomic_load(&move_y) : 0;
     if (x == 0 && y == 0 && sent_x == 0 && sent_y == 0) return;  // at rest, and the last frame's zero already sent
     u32 client = G32(bp2 - 0xc0), window = G32(bp2 - 0xc8);
     u32 vtable = client ? G32(client) : 0, fn = vtable ? G32(vtable + 0x10) : 0;
@@ -675,6 +686,9 @@ SHIM(CGWarpMouseCursorPosition) {
     if (scripted_mouse) {
         scripted_x = ARGF(0);
         scripted_y = ARGF(1);
+        pthread_mutex_lock(&cap_mu);
+        cap_last_warp = now_ms();
+        pthread_mutex_unlock(&cap_mu);
         RET(0);
         return;
     }

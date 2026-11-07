@@ -252,7 +252,8 @@ int rt_controller_connected(void) {
     return 0;
 }
 static void push_control(Control *k, int v);
-int rt_move_owned(void);  // shims_sys.c
+int rt_move_owned(void);                        // shims_sys.c
+void rt_touch_move_get(float *x, float *y);  // shims_sys.c
 static int read_touch(const Profile *f, const Control *k) {
     u32 b = atomic_load(&touch.buttons);
     switch (k->what) {
@@ -316,6 +317,11 @@ static void tick(void) {
     for (int i = 0; i < want->n && i < 64; i++) {
         Control *k = &want->controls[i];
         vals[i] = fake_pad ? k->fake : touching ? read_touch(want, k) : read_control(want, g, k);
+        if (fake_pad && (k->what == LX || k->what == LY) && !rt_move_owned()) {  // a scripted "move" off play, as the phone's touch stick
+            float mx, my;
+            rt_touch_move_get(&mx, &my);
+            if (mx != 0 || my != 0) vals[i] = stick(want, k->what == LX ? mx : -my);
+        }
         if (fake_pad && fake_jitter && (k->what == LX || k->what == LY || k->what == RX || k->what == RY) && k->fake != stick(want, 0)) {
             static unsigned seed = 12345;
             seed = seed * 1103515245u + 12345u;
