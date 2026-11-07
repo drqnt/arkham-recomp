@@ -81,7 +81,7 @@ int rt_shim_no_gate(const char *name) {
 // Find a shim for a function the game asks for by name at run time.
 void (*rt_lookup_shim(const char *sym))(CPU *) {
     const ShimReg *const tables[] = {rt_shims_libc, rt_shims_threads, rt_shims_cxx, rt_shims_misc, rt_shims_cf, rt_shims_objc,
-                                     rt_shims_gl_gen, rt_shims_gl, rt_shims_text, rt_shims_eh, rt_shims_sys, rt_shims_bink, rt_shims_audio};
+                                     rt_shims_gl_gen, rt_shims_gl, rt_shims_text, rt_shims_eh, rt_shims_sys, rt_shims_bink, rt_shims_audio, rt_shims_hid};
     for (size_t t = 0; t < sizeof tables / sizeof tables[0]; t++)
         for (const ShimReg *r = tables[t]; r->name; r++)
             if (!strcmp(r->name, sym)) return r->fn;
@@ -90,6 +90,7 @@ void (*rt_lookup_shim(const char *sym))(CPU *) {
 
 void rt_register_shims(void (**table)(CPU *)) {
     add_table(table, rt_shims_libc);
+    add_table(table, rt_shims_hid);
     add_table(table, rt_shims_threads);
     add_table(table, rt_shims_cxx);
     add_table(table, rt_shims_misc);

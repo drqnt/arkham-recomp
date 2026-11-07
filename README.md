@@ -16,6 +16,11 @@ tools/build_shader_cache.sh  # once, with the game closed: builds pixel shaders 
 python3 -I tests/difftest.py 400   # instruction semantics against real x86 under Rosetta
 ```
 
+`ARKHAM_RENDERER=metal` draws through Metal, after `tools/prebuild_shaders.sh` once. `ARKHAM_LANGUAGE=ru` plays in Russian, voice and text: the Mac game has
+all its languages installed, but Steam only offers English for it. The same works for fr, de, it, es and pl. Feral's own windows stay in English for Russian
+and Polish, which they don't come in. Gamepads go through Apple's GameController framework, so DualSense, DualShock, Xbox and other controllers the system
+knows work, shown to the game as the DualShock 4 it has a profile for.
+
 ## Layout
 
 - `tools/lift.py`, `emit.py`, `x86.py`, `macho.py`: the recompiler. `gen_gl.py`: OpenGL shims from SDK headers.
@@ -118,4 +123,4 @@ sound aside, so don't measure with it on.
 
 1. Play the Metal renderer by hand through more of the game, including a change of resolution and leaving with Cmd+Q. If it holds up, make it the default.
 2. iPhone and iPad: device creation without OpenGL, a UIKit shell, input, and the game's files on the device. `ios/probe` shows the address space, memory and speed are there.
-3. Steam on iOS, which isn't decided, and gamepads.
+3. Steam on iOS, which isn't decided.

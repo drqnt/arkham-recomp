@@ -522,8 +522,44 @@ SHIM(wctob) { RET((i32)ARG(0)); }
 
 // ---------- stdio ----------
 static int trace_fs_early(void) { return getenv("ARKHAM_TRACE_FS") != NULL; }
+// ARKHAM_LANGUAGE=ru (or fr, de, it, es, pl, en): the engine's language, which it reads from the Language line of BmEngine.ini. The Mac game has all of
+// these installed, voice and text, and Feral's code sets that line from Steam's language at every start, which for the Mac version is only ever English.
+// So the line is changed as the engine reads it, and the file stays as it is. Feral's own windows stay in English, which is all they come in.
+static FILE *language_ini(const char *path, const char *mode) {
+    static const char *const codes[][2] = {{"en", "int"}, {"fr", "fra"}, {"de", "deu"}, {"it", "ita"}, {"es", "esn"}, {"pl", "pol"}, {"ru", "rus"}};
+    static const char tail[] = "/BmEngine.ini";
+    const char *lang = getenv("ARKHAM_LANGUAGE"), *ue = NULL;
+    size_t n = strlen(path), t = sizeof tail - 1;
+    if (!lang || mode[0] != 'r' || n < t || strcmp(path + n - t, tail)) return NULL;
+    for (size_t i = 0; i < sizeof codes / sizeof codes[0]; i++)
+        if (!strcmp(lang, codes[i][0])) ue = codes[i][1];
+    FILE *in = ue ? fopen(path, "rb") : NULL;
+    if (!in) return NULL;
+    fseek(in, 0, SEEK_END);
+    long size = ftell(in);
+    fseek(in, 0, SEEK_SET);
+    char *text = malloc((size_t)size + 64), *out = malloc((size_t)size + 64);
+    size_t got = fread(text, 1, (size_t)size, in);
+    fclose(in);
+    text[got] = 0;
+    size_t o = 0;
+    for (char *line = text; *line;) {
+        char *end = strchr(line, '\n');
+        size_t len = end ? (size_t)(end - line + 1) : strlen(line);
+        if (!strncmp(line, "Language=", 9)) o += (size_t)sprintf(out + o, "Language=%s\n", ue);
+        else {
+            memcpy(out + o, line, len);
+            o += len;
+        }
+        line += len;
+    }
+    free(text);
+    fprintf(stderr, "[lang] the engine reads Language=%s\n", ue);
+    return fmemopen(out, o, "r");  // the buffer lives as long as the process: the engine reads this file a few times at start
+}
 SHIM(fopen) {
-    FILE *f = fopen(GS(ARG(0)), GS(ARG(1)));
+    FILE *f = language_ini(GS(ARG(0)), GS(ARG(1)));
+    if (!f) f = fopen(GS(ARG(0)), GS(ARG(1)));
     if (!f) set_errno();
     if (trace_fs_early()) fprintf(stderr, "[fs] fopen %s %s -> %d\n", GS(ARG(0)), GS(ARG(1)), f != NULL);
     RET(rt_handle_new(f));
@@ -554,8 +590,25 @@ SHIM(clearerr) { FILE *f = FILEP(ARG(0)); if (f) clearerr(f); }
 // ---------- files ----------
 static int trace_fs;
 #define TFS(what, path, res) do { if (trace_fs) fprintf(stderr, "[fs] %s %s -> %d\n", what, path, (int)(res)); } while (0)
+// With ARKHAM_LANGUAGE, also the answer to the file where Steam writes the game's language, which Feral's code reads at every start. The file stays as it is.
+static int language_file(const char *path) {
+    static const char tail[] = "/Contents/Resources/steam_language";
+    const char *lang = getenv("ARKHAM_LANGUAGE");
+    size_t n = strlen(path), t = sizeof tail - 1;
+    if (!lang || !*lang || n < t || strcmp(path + n - t, tail)) return -1;
+    char tmp[] = "/tmp/arkham-language-XXXXXX";
+    int fd = mkstemp(tmp);
+    if (fd < 0) return -1;
+    unlink(tmp);
+    if (write(fd, lang, strlen(lang)) < 0 || lseek(fd, 0, SEEK_SET) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
 SHIM(open) {
-    int fd = open(GS(ARG(0)), (int)ARG(1), (int)ARG(2));
+    int fd = language_file(GS(ARG(0)));
+    if (fd < 0) fd = open(GS(ARG(0)), (int)ARG(1), (int)ARG(2));
     if (fd < 0) set_errno();
     TFS("open", GS(ARG(0)), fd);
     RET(fd);

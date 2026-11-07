@@ -299,7 +299,9 @@ static int host_send_from(CPU *c, u32 self, u32 selg, u32 ap, u32 stret, Class s
     if (strstr(sn, "Objects") && collection_send(c, recv, sn, ap)) return 1;
     // Test runs answer the welcome dialog with its default button instead of waiting for a person.
     if (!strcmp(sn, "runModal") && getenv("ARKHAM_AUTO_ALERT")) {
-        fprintf(stderr, "[objc] auto-answering runModal with the first button\n");
+        id msg = ((id(*)(id, SEL))objc_msgSend)(recv, sel_registerName("messageText"));
+        id info = ((id(*)(id, SEL))objc_msgSend)(recv, sel_registerName("informativeText"));
+        fprintf(stderr, "[objc] auto-answering runModal with the first button: %s / %s\n", msg ? ns_utf8(msg) : "", info ? ns_utf8(info) : "");
         RET(1000);
         return 1;
     }

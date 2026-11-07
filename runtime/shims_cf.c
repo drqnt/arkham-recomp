@@ -328,7 +328,19 @@ SHIM(CFBundleCopyResourceURLsOfType) { RET(cf_wrap(CFBundleCopyResourceURLsOfTyp
 SHIM(CFBundleGetInfoDictionary) { RET(cf_wrap(CFBundleGetInfoDictionary(B(0)))); }
 SHIM(CFBundleGetValueForInfoDictionaryKey) { RET(cf_wrap(CFBundleGetValueForInfoDictionaryKey(B(0), S(1)))); }
 SHIM(CFBundleCopyBundleLocalizations) { RET(cf_wrap(CFBundleCopyBundleLocalizations(B(0)))); }
-SHIM(CFBundleCopyPreferredLocalizationsFromArray) { RET(cf_wrap(CFBundleCopyPreferredLocalizationsFromArray((CFArrayRef)O(0)))); }
+// With ARKHAM_LANGUAGE the game's own windows are told they already show that language. Feral's code compares the two and otherwise asks to be relaunched
+// at every start, because its windows only come in English, French, Italian, German and Spanish; for any other language they stay in English.
+SHIM(CFBundleCopyPreferredLocalizationsFromArray) {
+    const char *lang = getenv("ARKHAM_LANGUAGE");
+    if (lang && *lang) {
+        CFStringRef s = CFStringCreateWithCString(NULL, lang, kCFStringEncodingUTF8);
+        CFArrayRef a = CFArrayCreate(NULL, (const void **)&s, 1, &kCFTypeArrayCallBacks);
+        CFRelease(s);
+        RET(cf_wrap(a));
+        return;
+    }
+    RET(cf_wrap(CFBundleCopyPreferredLocalizationsFromArray((CFArrayRef)O(0))));
+}
 SHIM(CFBundleCopyLocalizationsForPreferences) { RET(cf_wrap(CFBundleCopyLocalizationsForPreferences((CFArrayRef)O(0), (CFArrayRef)O(1)))); }
 SHIM(CFBundleCopyLocalizedString) { RET(cf_wrap(CFBundleCopyLocalizedString(B(0), S(1), S(2), S(3)))); }
 // The game calls some system functions by looking them up by name, free among them. A failed lookup quietly turns such a
@@ -674,7 +686,28 @@ static CFStringRef app_id(CFStringRef s) {
     if (s && s != kCFPreferencesCurrentApplication) return s;
     return CFSTR("com.feralinteractive.bmaa");
 }
-SHIM(CFPreferencesCopyAppValue) { RET(cf_wrap(CFPreferencesCopyAppValue(S(0), app_id(S(1))))); }
+// ARKHAM_TRACE_PREFS=1 logs each preference the game reads, with what it got.
+static void trace_pref(const char *how, CFStringRef key, CFStringRef app, CFTypeRef v) {
+    static int on = -1;
+    if (on < 0) on = getenv("ARKHAM_TRACE_PREFS") != NULL;
+    if (!on) return;
+    char k[128] = "", a[128] = "", val[160] = "";
+    if (key) CFStringGetCString(key, k, sizeof k, kCFStringEncodingUTF8);
+    if (app) CFStringGetCString(app, a, sizeof a, kCFStringEncodingUTF8);
+    if (v) {
+        CFStringRef d = CFCopyDescription(v);
+        CFStringGetCString(d, val, sizeof val, kCFStringEncodingUTF8);
+        CFRelease(d);
+    }
+    for (char *p = val; *p; p++)
+        if (*p == '\n') *p = ' ';
+    fprintf(stderr, "[prefs] %s %s in %s -> %s\n", how, k, a, v ? val : "nothing");
+}
+SHIM(CFPreferencesCopyAppValue) {
+    CFTypeRef v = CFPreferencesCopyAppValue(S(0), app_id(S(1)));
+    trace_pref("read", S(0), app_id(S(1)), v);
+    RET(cf_wrap(v));
+}
 SHIM(CFPreferencesSetAppValue) { CFPreferencesSetAppValue(S(0), O(1), app_id(S(2))); }
 SHIM(CFPreferencesAppSynchronize) { RET(CFPreferencesAppSynchronize(app_id(S(0)))); }
 SHIM(CFPreferencesGetAppBooleanValue) {
@@ -683,7 +716,11 @@ SHIM(CFPreferencesGetAppBooleanValue) {
     if (ARG(2)) G8(ARG(2)) = ok;
     RET(v);
 }
-SHIM(CFPreferencesCopyValue) { RET(cf_wrap(CFPreferencesCopyValue(S(0), app_id(S(1)), S(2), S(3)))); }
+SHIM(CFPreferencesCopyValue) {
+    CFTypeRef v = CFPreferencesCopyValue(S(0), app_id(S(1)), S(2), S(3));
+    trace_pref("read", S(0), app_id(S(1)), v);
+    RET(cf_wrap(v));
+}
 
 // ---------- Mach-O self-inspection ----------
 static u32 header_copy;

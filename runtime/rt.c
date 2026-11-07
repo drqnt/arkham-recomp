@@ -357,6 +357,14 @@ static void imp_missing(CPU *c, u32 idx) {
 static u32 *imp_counts;
 static void imp_count(u32 idx) {
     imp_counts[idx]++;
+    // ARKHAM_TRACE_IMPORTS=CF also logs each call to an import whose name starts with that.
+    static const char *only = (const char *)1;
+    if (only == (const char *)1) {
+        only = getenv("ARKHAM_TRACE_IMPORTS");
+        if (only && !*only) only = NULL;
+    }
+    if (only && idx < rt_import_n && !strncmp(rt_import_names[idx] + 1, only, strlen(only)) && !strstr(rt_import_names[idx], "Release") && !strstr(rt_import_names[idx], "Retain"))
+        fprintf(stderr, "[call] %s\n", rt_import_names[idx]);
     static u64 last;
     u64 now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000000;
     if (now - last < 10) return;

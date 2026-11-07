@@ -22,6 +22,7 @@ extern const ShimReg rt_shims_text[];
 extern const ShimReg rt_shims_eh[];
 extern const ShimReg rt_shims_sys[];
 extern const ShimReg rt_shims_bink[];
+extern const ShimReg rt_shims_hid[];
 extern const ShimReg rt_shims_audio[];
 extern const ShimReg rt_shims_bink_exports[];
 void rt_text_init(void);
