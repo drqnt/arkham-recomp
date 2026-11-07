@@ -576,16 +576,36 @@ static int is_main_queue(u32 q) {
     return q == mq;
 }
 #if TARGET_OS_IPHONE
-// The phone's main queue belongs to UIKit, and the game's main thread is another (rt_main): work for it goes to that thread's run loop, which the
-// stand-in NSApplication turns (ios_appkit.m).
+// The phone's main queue belongs to UIKit, and the game's main thread is another (rt_main). Work for it waits in a queue of its own, which
+// the stand-in NSApplication empties each time the game asks it for events (ios_appkit.m), as AppKit's event loop runs the main queue on a Mac.
 #include <CoreFoundation/CoreFoundation.h>
+typedef struct MainWork { DCtx *d; dispatch_semaphore_t done; struct MainWork *next; } MainWork;
+static MainWork *main_head, **main_tail = &main_head;
+static pthread_mutex_t main_mu = PTHREAD_MUTEX_INITIALIZER;
 static void to_guest_main(DCtx *d, dispatch_semaphore_t done) {
-    CFRunLoopRef loop = rt_guest_main_loop();
-    CFRunLoopPerformBlock(loop, kCFRunLoopCommonModes, ^{
-        main_queue_tramp(d);
-        if (done) dispatch_semaphore_signal(done);
-    });
-    CFRunLoopWakeUp(loop);
+    MainWork *w = malloc(sizeof *w);
+    *w = (MainWork){d, done, NULL};
+    pthread_mutex_lock(&main_mu);
+    *main_tail = w;
+    main_tail = &w->next;
+    pthread_mutex_unlock(&main_mu);
+    CFRunLoopWakeUp(rt_guest_main_loop());
+}
+// On the game's main thread: everything sent so far, in order.
+void rt_run_guest_main_queue(void) {
+    for (;;) {
+        pthread_mutex_lock(&main_mu);
+        MainWork *w = main_head;
+        if (w) {
+            main_head = w->next;
+            if (!main_head) main_tail = &main_head;
+        }
+        pthread_mutex_unlock(&main_mu);
+        if (!w) return;
+        main_queue_tramp(w->d);
+        if (w->done) dispatch_semaphore_signal(w->done);
+        free(w);
+    }
 }
 #endif
 static void run_on_main_sync(DCtx *d) {

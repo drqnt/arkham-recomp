@@ -29,6 +29,7 @@ typedef struct {
 static Track *tracks;
 static u32 n_tracks;
 static u64 last_frame;  // host time of the last presented frame
+static int tracks_for_late;  // ARKHAM_TRACE_HITCH: reports of late frames
 
 void rt_hitch_tick(void) { __atomic_store_n(&last_frame, mach_absolute_time(), __ATOMIC_RELAXED); }
 
@@ -228,6 +229,34 @@ static void report(u64 ms) {
     }
     n_tracks = 0;
 }
+// ARKHAM_TRACE_STALL=s: when no frame has gone on screen for s seconds, counting from the start too, a report of what every thread is
+// doing, again every s seconds while it lasts. For a game that hangs before its first frame, where a late-frame report never comes.
+static u64 stall_ticks, started_at, stall_reported;
+static void stall_check(u64 frame) {
+    u64 now = mach_absolute_time(), since = frame ? frame : started_at;
+    if (now - since < stall_ticks || now - stall_reported < stall_ticks) return;
+    stall_reported = now;
+    refresh_threads();
+    for (int i = 0; i < 60; i++) {
+        sample_all();
+        usleep(5000);
+    }
+    fprintf(stderr, "[hitch] no frame for %llu ms%s; every thread, waiting or not, and its last stack:\n", to_ms(now - since), frame ? "" : " since the start");
+    for (u32 k = 0; k < n_tracks; k++) {
+        Track *tr = &tracks[k];
+        if (!tr->samples) continue;
+        char name[64] = "";
+        pthread_t pt = pthread_from_mach_thread_np(tr->port);
+        if (pt) pthread_getname_np(pt, name, sizeof name);
+        u32 s = tr->samples - 1, d = tr->depth[s];
+        char text[700];
+        size_t len = 0;
+        for (u32 i = 0; i < d && i < 14 && len + 60 < sizeof text; i++) len += (size_t)snprintf(text + len, sizeof text - len, "%s%s", i ? " < " : "", sym_of(tr->stack[s][i]));
+        fprintf(stderr, "[hitch]  thread %x %s: %s\n", tr->port, name, len ? text : "(no stack)");
+        tr->samples = 0;
+    }
+    n_tracks = 0;
+}
 static void *monitor(void *arg) {
     (void)arg;
     pthread_setname_np("hitch monitor");
@@ -239,7 +268,8 @@ static void *monitor(void *arg) {
         usleep(5000);
         u64 frame = __atomic_load_n(&last_frame, __ATOMIC_RELAXED);
         if (!late && (!known || ++tick % 200 == 0)) refresh_threads();
-        if (!frame) continue;
+        if (stall_ticks) stall_check(frame);
+        if (!frame || !tracks_for_late) continue;
         if (late && frame != seen) {
             report(to_ms(frame - seen));
             late = 0;
@@ -256,7 +286,15 @@ static void *monitor(void *arg) {
     return NULL;
 }
 void rt_hitch_start(void) {
-    if (!getenv("ARKHAM_TRACE_HITCH")) return;
+    const char *stall = getenv("ARKHAM_TRACE_STALL");
+    tracks_for_late = getenv("ARKHAM_TRACE_HITCH") != NULL;
+    if (stall && atof(stall) > 0) {
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        stall_ticks = (u64)(atof(stall) * 1e9 * tb.denom / tb.numer);
+        started_at = mach_absolute_time();
+    }
+    if (!tracks_for_late && !stall_ticks) return;
     tracks = calloc(MAX_THREADS, sizeof *tracks);
     pthread_t t;
     pthread_create(&t, NULL, monitor, NULL);

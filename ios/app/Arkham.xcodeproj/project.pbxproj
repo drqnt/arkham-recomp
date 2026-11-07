@@ -159,6 +159,7 @@
 					"-framework", Metal, "-framework", QuartzCore, "-framework", CoreGraphics, "-framework", CoreText, "-framework", ImageIO,
 					"-framework", AVFoundation, "-framework", AudioToolbox, "-framework", CoreAudio,
 					"-framework", GameController, "-framework", CoreHaptics,
+					"-framework", CoreVideo, "-framework", CoreMedia, "-framework", Security,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = "local.arkham-recomp.game";
 				PRODUCT_NAME = Arkham;

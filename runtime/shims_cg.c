@@ -134,13 +134,25 @@ SHIM(TISCopyCurrentKeyboardLayoutInputSource) { RET(cf_wrap(phone_source())); }
 SHIM(TISCopyCurrentASCIICapableKeyboardLayoutInputSource) { RET(cf_wrap(phone_source())); }
 SHIM(TISCopyCurrentASCIICapableKeyboardInputSource) { RET(cf_wrap(phone_source())); }
 SHIM(TISCopyCurrentKeyboardInputSource) { RET(cf_wrap(phone_source())); }
+// Answered by the property asked for, named as Carbon names them (shims_cf.c gives the game those names on the phone).
 SHIM(TISGetInputSourceProperty) {
     static CFDataRef zeros;
+    static CFArrayRef languages;
     if (!zeros) {
         static const u8 z[256];
         zeros = CFDataCreate(NULL, z, sizeof z);
+        CFStringRef en = CFSTR("en");
+        languages = CFArrayCreate(NULL, (const void **)&en, 1, &kCFTypeArrayCallBacks);
     }
-    RET(cf_wrap(zeros));
+    CFTypeRef key = cf_unwrap(ARG(1)), v = NULL;
+    if (key && CFGetTypeID(key) == CFStringGetTypeID()) {
+        if (CFEqual(key, CFSTR("TISPropertyUnicodeKeyLayoutData"))) v = zeros;
+        else if (CFEqual(key, CFSTR("TISPropertyInputSourceID"))) v = CFSTR("com.apple.keylayout.US");
+        else if (CFEqual(key, CFSTR("TISPropertyLocalizedName"))) v = CFSTR("U.S.");
+        else if (CFEqual(key, CFSTR("TISPropertyInputSourceLanguages"))) v = languages;
+    }
+    if (!v) fprintf(stderr, "[cg] no keyboard layout property to answer for %08x\n", ARG(1));
+    RET(v ? cf_wrap(v) : 0);
 }
 SHIM(LMGetKbdType) { RET(40); }  // an ANSI keyboard
 #else

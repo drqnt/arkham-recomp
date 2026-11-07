@@ -39,19 +39,43 @@ static void *handles[HANDLE_MAX];
 static u32 handle_next = 1;
 
 static pthread_mutex_t handle_mu = PTHREAD_MUTEX_INITIALIZER;
+// Where in the game each handle was made, for the report when they run out: the shim's return address.
+static int cmp_u32(const void *a, const void *b) {
+    u32 x = *(const u32 *)a, y = *(const u32 *)b;
+    return x < y ? -1 : x > y;
+}
+static u32 handle_from[HANDLE_MAX];
 u32 rt_handle_new(void *p) {
     if (!p) return 0;
+    CPU *cpu = rt_current_cpu();
+    u32 from = cpu ? G32(cpu->esp) : 0;
     pthread_mutex_lock(&handle_mu);
     for (u32 i = 0; i < HANDLE_MAX; i++) {
         u32 k = (handle_next + i) % HANDLE_MAX;
         if (k && !handles[k]) {
             handles[k] = p;
+            handle_from[k] = from;
             handle_next = k + 1;
             pthread_mutex_unlock(&handle_mu);
             return HANDLE_BASE + k * 16;
         }
     }
-    fprintf(stderr, "*** out of guest handles\n");
+    fprintf(stderr, "*** out of guest handles; the places in the game that made the most of them:\n");
+    static u32 sorted[HANDLE_MAX];
+    memcpy(sorted, handle_from, sizeof sorted);
+    qsort(sorted, HANDLE_MAX, sizeof *sorted, cmp_u32);
+    for (int top = 0; top < 10; top++) {
+        u32 best = 0, best_n = 0, run = 0;
+        for (u32 j = 0; j < HANDLE_MAX; j++) {
+            run = j && sorted[j] == sorted[j - 1] ? run + 1 : 1;
+            if (sorted[j] && run > best_n && (j + 1 == HANDLE_MAX || sorted[j + 1] != sorted[j])) best = sorted[j], best_n = run;
+        }
+        if (!best_n) break;
+        fprintf(stderr, "***   %u from %08x\n", best_n, best);
+        for (u32 j = 0; j < HANDLE_MAX; j++)
+            if (sorted[j] == best) sorted[j] = 0;
+        qsort(sorted, HANDLE_MAX, sizeof *sorted, cmp_u32);
+    }
     _Exit(75);
 }
 void *rt_handle_get(u32 h) {
@@ -522,6 +546,115 @@ SHIM(btowc) { RET((i32)ARG(0)); }
 SHIM(wctob) { RET((i32)ARG(0)); }
 
 // ---------- stdio ----------
+// ---------- case in paths ----------
+// The Mac's disks ignore case in names and the phone's don't, and the game isn't consistent: it asks for BMAAData/Binaries and BMGame where
+// the folders are called binaries and BmGame. On the phone a path that isn't there is looked for again one name at a time, ignoring case,
+// with each folder's names kept until the folder changes. On the Mac paths go through untouched.
+#if TARGET_OS_IPHONE
+#include <dirent.h>
+#include <pthread.h>
+#include <sys/stat.h>
+typedef struct { char *dir; struct timespec mtime; char **names; int n; } DirNames;
+enum { DIR_CACHE = 512 };
+static DirNames dir_cache[DIR_CACHE];
+static int dir_cache_next;
+static pthread_mutex_t dir_mu = PTHREAD_MUTEX_INITIALIZER;
+static const DirNames *names_of(const char *dir) {
+    struct stat st;
+    if (stat(dir, &st) || !S_ISDIR(st.st_mode)) return NULL;
+    for (int i = 0; i < DIR_CACHE; i++) {
+        DirNames *d = &dir_cache[i];
+        if (d->dir && !strcmp(d->dir, dir)) {
+            if (d->mtime.tv_sec == st.st_mtimespec.tv_sec && d->mtime.tv_nsec == st.st_mtimespec.tv_nsec) return d;
+            for (int k = 0; k < d->n; k++) free(d->names[k]);
+            free(d->names);
+            free(d->dir);
+            memset(d, 0, sizeof *d);
+        }
+    }
+    DirNames *d = &dir_cache[dir_cache_next];
+    dir_cache_next = (dir_cache_next + 1) % DIR_CACHE;
+    if (d->dir) {
+        for (int k = 0; k < d->n; k++) free(d->names[k]);
+        free(d->names);
+        free(d->dir);
+        memset(d, 0, sizeof *d);
+    }
+    DIR *h = opendir(dir);
+    if (!h) return NULL;
+    int cap = 64;
+    d->names = malloc(sizeof(char *) * (size_t)cap);
+    for (struct dirent *e; (e = readdir(h));) {
+        if (d->n == cap) d->names = realloc(d->names, sizeof(char *) * (size_t)(cap *= 2));
+        d->names[d->n++] = strdup(e->d_name);
+    }
+    closedir(h);
+    d->dir = strdup(dir);
+    d->mtime = st.st_mtimespec;
+    return d;
+}
+// The path as it is on the disk, in buf, or the path itself when it is there already or nothing matches.
+static const char *ci_path(const char *path, char *buf, size_t cap) {
+    struct stat st;
+    if (!path || !*path || !lstat(path, &st)) return path;
+    char cur[PATH_MAX];
+    if (path[0] == '/') cur[0] = 0;
+    else if (!getcwd(cur, sizeof cur)) return path;
+    pthread_mutex_lock(&dir_mu);
+    const char *p = path;
+    int fixed = 0, lost = 0;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *end = strchr(p, '/');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char comp[NAME_MAX + 1];
+        if (len > NAME_MAX) {
+            lost = 1;
+            break;
+        }
+        memcpy(comp, p, len);
+        comp[len] = 0;
+        p += len;
+        if (!strcmp(comp, ".")) continue;
+        if (!strcmp(comp, "..")) {
+            char *slash = strrchr(cur, '/');
+            if (slash) *slash = 0;
+            continue;
+        }
+        size_t cl = strlen(cur);
+        if (cl + 1 + len >= sizeof cur) {
+            lost = 1;
+            break;
+        }
+        snprintf(cur + cl, sizeof cur - cl, "/%s", comp);
+        if (!lost && lstat(cur, &st)) {
+            cur[cl] = 0;
+            const DirNames *d = names_of(cl ? cur : "/");
+            const char *match = NULL;
+            for (int k = 0; d && k < d->n && !match; k++)
+                if (!strcasecmp(d->names[k], comp)) match = d->names[k];
+            snprintf(cur + cl, sizeof cur - cl, "/%s", match ? match : comp);
+            if (match) fixed = 1;
+            else lost = 1;  // not there in any case: the rest stays as asked, for a file about to be made
+        }
+    }
+    pthread_mutex_unlock(&dir_mu);
+    if (!fixed || strlen(cur) >= cap) return path;
+    memcpy(buf, cur, strlen(cur) + 1);
+    return buf;
+}
+#else
+static const char *ci_path(const char *path, char *buf, size_t cap) {
+    (void)buf, (void)cap;
+    return path;
+}
+#endif
+// For the other files that take paths from the game (shims_cf.c's file manager on the phone).
+const char *rt_ci_path(const char *path, char *buf, size_t cap) { return ci_path(path, buf, cap); }
+#define CIP(n) ci_path(GS(ARG(n)), ci_buf##n, sizeof ci_buf##n)
+#define CIBUF(n) char ci_buf##n[PATH_MAX]
+
 static int trace_fs_early(void) { return getenv("ARKHAM_TRACE_FS") != NULL; }
 // ARKHAM_LANGUAGE=ru (or fr, de, it, es, pl, en): the engine's language, which it reads from the Language line of BmEngine.ini. The Mac game has all of
 // these installed, voice and text, and Feral's code sets that line from Steam's language at every start, which for the Mac version is only ever English.
@@ -560,7 +693,8 @@ static FILE *language_ini(const char *path, const char *mode) {
 }
 SHIM(fopen) {
     FILE *f = language_ini(GS(ARG(0)), GS(ARG(1)));
-    if (!f) f = fopen(GS(ARG(0)), GS(ARG(1)));
+    CIBUF(0);
+    if (!f) f = fopen(CIP(0), GS(ARG(1)));
     if (!f) set_errno();
     if (trace_fs_early()) fprintf(stderr, "[fs] fopen %s %s -> %d\n", GS(ARG(0)), GS(ARG(1)), f != NULL);
     RET(rt_handle_new(f));
@@ -590,7 +724,16 @@ SHIM(clearerr) { FILE *f = FILEP(ARG(0)); if (f) clearerr(f); }
 
 // ---------- files ----------
 static int trace_fs;
-#define TFS(what, path, res) do { if (trace_fs) fprintf(stderr, "[fs] %s %s -> %d\n", what, path, (int)(res)); } while (0)
+// With the place in the game that asked and the two callers above it, found through the frame pointers.
+static void tfs_callers(CPU *c, u32 out[6]) {
+    out[0] = G32(c->esp);
+    u32 bp = c->ebp;
+    for (int i = 1; i < 6; i++) {
+        out[i] = bp > 0x1000 && bp < 0xFFFFFFF0u ? G32(bp + 4) : 0;
+        bp = bp > 0x1000 && bp < 0xFFFFFFF0u ? G32(bp) : 0;
+    }
+}
+#define TFS(what, path, res) do { if (trace_fs) { u32 cs_[6]; tfs_callers(c, cs_); fprintf(stderr, "[fs] %s %s -> %d (from %08x < %08x < %08x < %08x < %08x < %08x)\n", what, path, (int)(res), cs_[0], cs_[1], cs_[2], cs_[3], cs_[4], cs_[5]); } } while (0)
 // With ARKHAM_LANGUAGE, also the answer to the file where Steam writes the game's language, which Feral's code reads at every start. The file stays as it is.
 static int language_file(const char *path) {
     static const char tail[] = "/Contents/Resources/steam_language";
@@ -612,7 +755,8 @@ static int language_file(const char *path) {
 }
 SHIM(open) {
     int fd = language_file(GS(ARG(0)));
-    if (fd < 0) fd = open(GS(ARG(0)), (int)ARG(1), (int)ARG(2));
+    CIBUF(0);
+    if (fd < 0) fd = open(CIP(0), (int)ARG(1), (int)ARG(2));
     if (fd < 0) set_errno();
     TFS("open", GS(ARG(0)), fd);
     RET(fd);
@@ -631,25 +775,28 @@ SHIM(pread) {
 }
 SHIM(pwrite) { ssize_t r = pwrite((int)ARG(0), GS(ARG(1)), ARG(2), (off_t)ARGQ(3)); if (r < 0) set_errno(); RET((i32)r); }
 SHIM(lseek) { off_t r = lseek((int)ARG(0), (off_t)ARGQ(1), (int)ARG(3)); if (r < 0) set_errno(); RET64(r); }
-SHIM(access) { int r = access(GS(ARG(0)), (int)ARG(1)); if (r) set_errno(); TFS("access", GS(ARG(0)), r); RET(r); }
-SHIM(mkdir) { int r = mkdir(GS(ARG(0)), (mode_t)ARG(1)); if (r) set_errno(); RET(r); }
-SHIM(rmdir) { RET(rmdir(GS(ARG(0)))); }
-SHIM(unlink) { RET(unlink(GS(ARG(0)))); }
-SHIM(remove) { RET(remove(GS(ARG(0)))); }
-SHIM(rename) { RET(rename(GS(ARG(0)), GS(ARG(1)))); }
-SHIM(chmod) { RET(chmod(GS(ARG(0)), (mode_t)ARG(1))); }
+SHIM(access) { CIBUF(0); int r = access(CIP(0), (int)ARG(1)); if (r) set_errno(); TFS("access", GS(ARG(0)), r); RET(r); }
+SHIM(mkdir) { CIBUF(0); int r = mkdir(CIP(0), (mode_t)ARG(1)); if (r) set_errno(); RET(r); }
+SHIM(rmdir) { CIBUF(0); RET(rmdir(CIP(0))); }
+SHIM(unlink) { CIBUF(0); RET(unlink(CIP(0))); }
+SHIM(remove) { CIBUF(0); RET(remove(CIP(0))); }
+SHIM(rename) { CIBUF(0); CIBUF(1); RET(rename(CIP(0), CIP(1))); }
+SHIM(chmod) { CIBUF(0); RET(chmod(CIP(0), (mode_t)ARG(1))); }
 SHIM(ftruncate) { RET(ftruncate((int)ARG(0), (off_t)ARGQ(1))); }
-SHIM(truncate) { RET(truncate(GS(ARG(0)), (off_t)ARGQ(1))); }
+SHIM(truncate) { CIBUF(0); RET(truncate(CIP(0), (off_t)ARGQ(1))); }
 SHIM(fsync) { RET(fsync((int)ARG(0))); }
 SHIM(isatty) { RET(isatty((int)ARG(0))); }
 SHIM(dup) { RET(dup((int)ARG(0))); }
 SHIM(dup2) { RET(dup2((int)ARG(0), (int)ARG(1))); }
 SHIM(fcntl) { RET(fcntl((int)ARG(0), (int)ARG(1), (int)ARG(2))); }
 SHIM(umask) { RET(umask((mode_t)ARG(0))); }
-SHIM(readlink) { RET((i32)readlink(GS(ARG(0)), GP(ARG(1)), ARG(2))); }
+SHIM(readlink) { CIBUF(0); RET((i32)readlink(CIP(0), GP(ARG(1)), ARG(2))); }
 SHIM(realpath) {
     char tmp[PATH_MAX];
-    char *r = realpath(GS(ARG(0)), tmp);
+    CIBUF(0);
+    char *r = realpath(CIP(0), tmp);
+    TFS("realpath", GS(ARG(0)), r != NULL);
+    if (trace_fs && r) fprintf(stderr, "[fs]   = %s\n", tmp);
     if (!r) {
         set_errno();
         RET(0);
@@ -704,15 +851,15 @@ static void put_stat32(u32 g, const struct stat *s) {
     G32(g + 68) = s->st_flags;
     G32(g + 72) = s->st_gen;
 }
-SHIM(stat64) { struct stat s; int r = stat(GS(ARG(0)), &s); if (r) set_errno(); else put_stat64(ARG(1), &s); TFS("stat", GS(ARG(0)), r); RET(r); }
-SHIM(lstat64) { struct stat s; int r = lstat(GS(ARG(0)), &s); if (r) set_errno(); else put_stat64(ARG(1), &s); RET(r); }
+SHIM(stat64) { CIBUF(0); struct stat s; int r = stat(CIP(0), &s); if (r) set_errno(); else put_stat64(ARG(1), &s); TFS("stat", GS(ARG(0)), r); RET(r); }
+SHIM(lstat64) { CIBUF(0); struct stat s; int r = lstat(CIP(0), &s); if (r) set_errno(); else put_stat64(ARG(1), &s); RET(r); }
 SHIM(fstat64) { struct stat s; int r = fstat((int)ARG(0), &s); if (r) set_errno(); else put_stat64(ARG(1), &s); RET(r); }
-SHIM(stat32) { struct stat s; int r = stat(GS(ARG(0)), &s); if (r) set_errno(); else put_stat32(ARG(1), &s); TFS("stat", GS(ARG(0)), r); RET(r); }
-SHIM(lstat32) { struct stat s; int r = lstat(GS(ARG(0)), &s); if (r) set_errno(); else put_stat32(ARG(1), &s); RET(r); }
+SHIM(stat32) { CIBUF(0); struct stat s; int r = stat(CIP(0), &s); if (r) set_errno(); else put_stat32(ARG(1), &s); TFS("stat", GS(ARG(0)), r); RET(r); }
+SHIM(lstat32) { CIBUF(0); struct stat s; int r = lstat(CIP(0), &s); if (r) set_errno(); else put_stat32(ARG(1), &s); RET(r); }
 SHIM(fstat32) { struct stat s; int r = fstat((int)ARG(0), &s); if (r) set_errno(); else put_stat32(ARG(1), &s); RET(r); }
 
 // Directories: guest dirent with 64-bit inodes (d_ino 8, d_seekoff 8, d_reclen 2, d_namlen 2, d_type 1, d_name 1024).
-SHIM(opendir) { DIR *d = opendir(GS(ARG(0))); TFS("opendir", GS(ARG(0)), d != NULL); RET(rt_handle_new(d)); }
+SHIM(opendir) { CIBUF(0); DIR *d = opendir(CIP(0)); TFS("opendir", GS(ARG(0)), d != NULL); RET(rt_handle_new(d)); }
 SHIM(closedir) { DIR *d = rt_handle_get(ARG(0)); RET(d ? closedir(d) : -1); rt_handle_free(ARG(0)); }
 static u32 dirent_buf;
 static void put_dirent(u32 g, const struct dirent *e) {

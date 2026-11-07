@@ -44,6 +44,7 @@ static void settings(void) {
 // The game's stderr goes both where it went (the Mac's console when started from there) and to Documents/Logs/run.txt, for the runs
 // nobody is watching.
 static int log_fd = -1, console_fd = -1;
+static dispatch_semaphore_t log_drained;
 static void *log_pump(void *arg) {
     int in = (int)(intptr_t)arg;
     char buf[16384];
@@ -51,7 +52,17 @@ static void *log_pump(void *arg) {
         if (console_fd >= 0) write(console_fd, buf, (size_t)n);
         if (log_fd >= 0) write(log_fd, buf, (size_t)n);
     }
+    dispatch_semaphore_signal(log_drained);
     return NULL;
+}
+// At exit the pump gets what's still in the pipe out before the process ends; otherwise the last lines, the ones that say why, are lost.
+static void finish_log(void) {
+    fflush(stdout);
+    fflush(stderr);
+    int devnull = open("/dev/null", O_WRONLY);
+    dup2(devnull, STDOUT_FILENO);
+    dup2(devnull, STDERR_FILENO);  // the pipe's last writer goes, so the pump reads to its end
+    dispatch_semaphore_wait(log_drained, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC));
 }
 static void start_log(void) {
     NSString *dir = [documents() stringByAppendingPathComponent:@"Logs"];
@@ -68,9 +79,11 @@ static void start_log(void) {
     close(p[1]);
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
+    log_drained = dispatch_semaphore_create(0);
     pthread_t t;
     pthread_create(&t, NULL, log_pump, (void *)(intptr_t)p[0]);
     pthread_detach(t);
+    atexit(finish_log);
 }
 
 // ---------- the game ----------
@@ -182,7 +195,9 @@ static void show_text(UIViewController *vc, NSString *text) {
 }
 @end
 
+int rt_reserve_guest(void);
 int main(int argc, char **argv) {
+    rt_reserve_guest();  // first, while the address space is still empty (rt.c)
     start_log();
     settings();
     fprintf(stderr, "[ios] Arkham on %s\n", UIDevice.currentDevice.systemVersion.UTF8String);

@@ -633,13 +633,23 @@ void rt_st80(u8 *p, double v) {
 
 // ---------- guest memory layout ----------
 
-static void map_guest(void) {
+// The 4 GB the game sees as its memory, at one fixed place. On the phone the app shell takes it first thing (rt_reserve_guest), before UIKit and
+// Metal have spread themselves over the address space; whatever is already there decides whether the place is free.
+static void *guest_window;
+int rt_reserve_guest(void) {
+    if (guest_window) return 1;
     void *p = mmap((void *)RT_MEM_BASE, 1ull << 32, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
-    if (p != (void *)RT_MEM_BASE) {
-        fprintf(stderr, "could not reserve 4 GB of guest address space at %#llx (got %p)\n", RT_MEM_BASE, p);
-        exit(1);
+    if (p == (void *)RT_MEM_BASE) {
+        guest_window = p;
+        return 1;
     }
-    rt_mem = p;
+    fprintf(stderr, "could not reserve 4 GB of guest address space at %#llx (got %p)\n", RT_MEM_BASE, p);
+    if (p != MAP_FAILED) munmap(p, 1ull << 32);
+    return 0;
+}
+static void map_guest(void) {
+    if (!rt_reserve_guest()) exit(1);
+    rt_mem = guest_window;
 }
 
 const u8 *rt_header_bytes;

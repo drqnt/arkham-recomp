@@ -167,12 +167,25 @@ static CGRect screen_rect(void) { return CGRectMake(0, 0, rt_ios_screen_w, rt_io
     if (!s) s = [NSScreen new];
     return s;
 }
-+ (NSArray *)screens { return @[[self mainScreen]]; }
+// The same objects each time, as AppKit gives: the game asks for these every frame, and each new object would take one of the bridge's handles.
++ (NSArray *)screens {
+    static NSArray *a;
+    if (!a) a = [@[[self mainScreen]] retain];
+    return a;
+}
 - (CGRect)frame { return screen_rect(); }
 - (CGRect)visibleFrame { return screen_rect(); }
 - (CGFloat)backingScaleFactor { return rt_ios_screen_scale; }
 - (NSDictionary *)deviceDescription {
-    return @{@"NSScreenNumber": @1, @"NSDeviceSize": [NSValue valueWithBytes:&(CGSize){rt_ios_screen_w, rt_ios_screen_h} objCType:@encode(CGSize)]};
+    static NSDictionary *d;
+    static CGSize made;
+    CGSize now = CGSizeMake(rt_ios_screen_w, rt_ios_screen_h);
+    if (!d || !CGSizeEqualToSize(made, now)) {
+        [d release];
+        d = [@{@"NSScreenNumber": @1, @"NSDeviceSize": [NSValue valueWithBytes:&now objCType:@encode(CGSize)]} retain];
+        made = now;
+    }
+    return d;
 }
 - (NSString *)localizedName { return @"iPhone"; }
 @end
@@ -466,6 +479,7 @@ static NSMutableArray *all_windows;
 - (void)update {}
 @end
 
+void rt_run_guest_main_queue(void);  // shims_threads.c: what the game sent to its main queue
 @interface NSApplication : NSResponder {
     id _delegate, _menu;
     _Atomic int _stopped;
@@ -500,9 +514,14 @@ static NSMutableArray *all_windows;
 - (id)targetForAction:(SEL)a to:(id)t from:(id)f { return nil; }
 - (BOOL)validateMenuItem:(id)item { return YES; }
 - (NSArray *)windows {
-    NSMutableArray *out = [NSMutableArray array];
-    for (NSValue *v in all_windows) [out addObject:v.nonretainedObjectValue];
-    return out;
+    static NSArray *last;
+    NSMutableArray *now = [NSMutableArray array];
+    for (NSValue *v in all_windows) [now addObject:v.nonretainedObjectValue];
+    if (![last isEqualToArray:now]) {
+        [last release];
+        last = [now copy];
+    }
+    return last;
 }
 - (id)keyWindow {
     for (NSValue *v in all_windows)
@@ -526,12 +545,18 @@ static NSMutableArray *all_windows;
 // The game's events, one pass of this thread's run loop: timers and performSelector:afterDelay:, which is how the game starts its main loop, fire here.
 // There are no AppKit events on the phone, so there's never one to return.
 - (id)nextEventMatchingMask:(unsigned long long)mask untilDate:(NSDate *)date inMode:(NSString *)mode dequeue:(BOOL)dequeue {
+    rt_run_guest_main_queue();
     CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, false);
+    rt_run_guest_main_queue();
     return nil;
 }
-// The first call is NSApplicationMain's: launching, then this thread's run loop until stop:. A modal run inside it has nothing to wait for here.
+// The first call is NSApplicationMain's: launching, then this thread's run loop until stop:. A run inside it is how Feral's code pumps events
+// once on a Mac (stop:, then run, which handles one event and returns), so here it is one pass: the main queue and the run loop.
 - (void)run {
     if (_running) {
+        rt_run_guest_main_queue();
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, false);
+        rt_run_guest_main_queue();
         atomic_store(&_stopped, 0);
         return;
     }
@@ -539,7 +564,8 @@ static NSMutableArray *all_windows;
     [self finishLaunching];
     while (!atomic_exchange(&_stopped, 0)) {
         @autoreleasepool {
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
+            rt_run_guest_main_queue();
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, true);
         }
     }
     _running = NO;
@@ -712,7 +738,9 @@ int rt_ios_gl_context_is_core(void *ctx) {
 }
 - (NSURL *)bundleURL {
     extern const char *rt_game_root(void);
-    return [NSURL fileURLWithPath:[NSString stringWithFormat:@"%s/Batman Arkham Asylum GOTY.app", rt_game_root()]];
+    static NSURL *u;
+    if (!u) u = [[NSURL fileURLWithPath:[NSString stringWithFormat:@"%s/Batman Arkham Asylum GOTY.app", rt_game_root()]] retain];
+    return u;
 }
 - (NSString *)bundleIdentifier { return @"com.feralinteractive.bmaa"; }
 - (int)processIdentifier { return getpid(); }
@@ -728,7 +756,11 @@ int rt_ios_gl_context_is_core(void *ctx) {
     if (!w) w = [NSWorkspace new];
     return w;
 }
-- (NSArray *)runningApplications { return @[[NSRunningApplication currentApplication]]; }
+- (NSArray *)runningApplications {
+    static NSArray *a;
+    if (!a) a = [@[[NSRunningApplication currentApplication]] retain];
+    return a;
+}
 - (NSNotificationCenter *)notificationCenter {
     static NSNotificationCenter *c;
     if (!c) c = [NSNotificationCenter new];

@@ -109,14 +109,31 @@ TYPEID(CFStringGetTypeID) TYPEID(CFArrayGetTypeID) TYPEID(CFDictionaryGetTypeID)
 TYPEID(CFBooleanGetTypeID) TYPEID(CFDataGetTypeID) TYPEID(CFDateGetTypeID) TYPEID(CFURLGetTypeID)
 
 // ---------- strings ----------
-SHIM(CFStringCreateWithCString) { RET(cf_wrap(CFStringCreateWithCString(NULL, GS(ARG(1)), ARG(2)))); }
-SHIM(CFStringCreateWithBytes) { RET(cf_wrap(CFStringCreateWithBytes(NULL, GP(ARG(1)), (i32)ARG(2), ARG(3), (Boolean)ARG(4)))); }
-SHIM(CFStringCreateWithBytesNoCopy) { RET(cf_wrap(CFStringCreateWithBytes(NULL, GP(ARG(1)), (i32)ARG(2), ARG(3), (Boolean)ARG(4)))); }
-SHIM(CFStringCreateWithCharacters) { RET(cf_wrap(CFStringCreateWithCharacters(NULL, GP(ARG(1)), (i32)ARG(2)))); }
-SHIM(CFStringCreateWithFileSystemRepresentation) { RET(cf_wrap(CFStringCreateWithFileSystemRepresentation(NULL, GS(ARG(1))))); }
-SHIM(CFStringCreateCopy) { RET(cf_wrap(CFStringCreateCopy(NULL, S(1)))); }
+// ARKHAM_TRACE_STRINGS=text: each string the game makes or changes that holds that text, with where in the game it happened.
+static CFTypeRef note_string(CPU *c, const char *what, CFTypeRef s) {
+    static const char *want = (const char *)1;
+    if (want == (const char *)1) want = getenv("ARKHAM_TRACE_STRINGS");
+    if (!want || !s || CFGetTypeID(s) != CFStringGetTypeID()) return s;
+    char b[1100] = "";
+    CFStringGetCString((CFStringRef)s, b, sizeof b, kCFStringEncodingUTF8);
+    if (!strstr(b, want)) return s;
+    u32 bp = c->ebp, from[4] = {G32(c->esp)};
+    for (int i = 1; i < 4; i++) {
+        from[i] = bp > 0x1000 && bp < 0xFFFFFFF0u ? G32(bp + 4) : 0;
+        bp = bp > 0x1000 && bp < 0xFFFFFFF0u ? G32(bp) : 0;
+    }
+    fprintf(stderr, "[str] %s \"%s\" (from %08x < %08x < %08x < %08x)\n", what, b, from[0], from[1], from[2], from[3]);
+    return s;
+}
+#define NOTE(what, s) note_string(c, what, (CFTypeRef)(s))
+SHIM(CFStringCreateWithCString) { RET(cf_wrap(NOTE("CreateWithCString", CFStringCreateWithCString(NULL, GS(ARG(1)), ARG(2))))); }
+SHIM(CFStringCreateWithBytes) { RET(cf_wrap(NOTE("CreateWithBytes", CFStringCreateWithBytes(NULL, GP(ARG(1)), (i32)ARG(2), ARG(3), (Boolean)ARG(4))))); }
+SHIM(CFStringCreateWithBytesNoCopy) { RET(cf_wrap(NOTE("CreateWithBytesNoCopy", CFStringCreateWithBytes(NULL, GP(ARG(1)), (i32)ARG(2), ARG(3), (Boolean)ARG(4))))); }
+SHIM(CFStringCreateWithCharacters) { RET(cf_wrap(NOTE("CreateWithCharacters", CFStringCreateWithCharacters(NULL, GP(ARG(1)), (i32)ARG(2))))); }
+SHIM(CFStringCreateWithFileSystemRepresentation) { RET(cf_wrap(NOTE("CreateWithFileSystemRepresentation", CFStringCreateWithFileSystemRepresentation(NULL, GS(ARG(1)))))); }
+SHIM(CFStringCreateCopy) { RET(cf_wrap(NOTE("CreateCopy", CFStringCreateCopy(NULL, S(1))))); }
 SHIM(CFStringCreateMutable) { RET(cf_wrap(CFStringCreateMutable(NULL, (i32)ARG(1)))); }
-SHIM(CFStringCreateMutableCopy) { RET(cf_wrap(CFStringCreateMutableCopy(NULL, (i32)ARG(1), S(2)))); }
+SHIM(CFStringCreateMutableCopy) { RET(cf_wrap(NOTE("CreateMutableCopy", CFStringCreateMutableCopy(NULL, (i32)ARG(1), S(2))))); }
 SHIM(CFStringCreateWithSubstring) {
     i32 loc = (i32)ARG(2), len = (i32)ARG(3);
     CFStringRef str = S(1);
@@ -141,10 +158,10 @@ SHIM(CFStringConvertWindowsCodepageToEncoding) { RET(CFStringConvertWindowsCodep
 SHIM(CFStringConvertIANACharSetNameToEncoding) { RET(CFStringConvertIANACharSetNameToEncoding(S(0))); }
 SHIM(CFStringCompare) { RET(CFStringCompare(S(0), S(1), ARG(2))); }
 SHIM(CFStringCompareWithOptions) { RET(CFStringCompareWithOptions(S(0), S(1), CFRangeMake((i32)ARG(2), (i32)ARG(3)), ARG(4))); }
-SHIM(CFStringAppend) { CFStringAppend((CFMutableStringRef)S(0), S(1)); }
-SHIM(CFStringInsert) { CFStringInsert((CFMutableStringRef)S(0), (i32)ARG(1), S(2)); }
-SHIM(CFStringDelete) { CFStringDelete((CFMutableStringRef)S(0), CFRangeMake((i32)ARG(1), (i32)ARG(2))); }
-SHIM(CFStringReplace) { CFStringReplace((CFMutableStringRef)S(0), CFRangeMake((i32)ARG(1), (i32)ARG(2)), S(3)); }
+SHIM(CFStringAppend) { CFStringAppend((CFMutableStringRef)S(0), S(1)); NOTE("Append", S(0)); }
+SHIM(CFStringInsert) { CFStringInsert((CFMutableStringRef)S(0), (i32)ARG(1), S(2)); NOTE("Insert", S(0)); }
+SHIM(CFStringDelete) { CFStringDelete((CFMutableStringRef)S(0), CFRangeMake((i32)ARG(1), (i32)ARG(2))); NOTE("Delete", S(0)); }
+SHIM(CFStringReplace) { CFStringReplace((CFMutableStringRef)S(0), CFRangeMake((i32)ARG(1), (i32)ARG(2)), S(3)); NOTE("Replace", S(0)); }
 SHIM(CFStringLowercase) { CFStringLowercase((CFMutableStringRef)S(0), NULL); }
 SHIM(CFStringUppercase) { CFStringUppercase((CFMutableStringRef)S(0), NULL); }
 SHIM(CFStringFindWithOptions) {
@@ -186,13 +203,79 @@ SHIM(CFStringCreateExternalRepresentation) { RET(cf_wrap(CFStringCreateExternalR
 SHIM(CFStringCreateArrayBySeparatingStrings) { RET(cf_wrap(CFStringCreateArrayBySeparatingStrings(NULL, S(1), S(2)))); }
 
 // ---------- URLs ----------
+#if TARGET_OS_IPHONE
+// Carbon's HFS paths, "Macintosh HD:Users:me:file", which Feral's code turns paths into and back to resolve "..". iOS's CoreFoundation has no
+// HFS style, so the phone converts them here: its one volume, named as FSGetVolumeInfo names it, is /, and a ':' in a name is a '/' in the other.
+#define HFS_STYLE 1u
+static const char phone_volume_name[] = "iPhone";
+static CFStringRef posix_from_hfs(CFStringRef hfs) {
+    char in[1300], out[1400];
+    if (!hfs || !CFStringGetCString(hfs, in, sizeof in, kCFStringEncodingUTF8)) return NULL;
+    const char *p = in;
+    size_t n = strlen(phone_volume_name), o = 0;
+    if (!strncmp(p, phone_volume_name, n) && (p[n] == ':' || !p[n])) p += n;  // the volume: /
+    else if (*p != ':') {  // another volume, as a Mac mounts it
+        o = (size_t)snprintf(out, sizeof out, "/Volumes/");
+    }
+    if (*p == ':') p++;
+    if (o == 0) out[o++] = '/';
+    for (; *p && o + 1 < sizeof out; p++) out[o++] = *p == ':' ? '/' : *p == '/' ? ':' : *p;
+    while (o > 1 && out[o - 1] == '/') o--;
+    out[o] = 0;
+    return CFStringCreateWithCString(NULL, out, kCFStringEncodingUTF8);
+}
+static CFStringRef hfs_from_posix(CFStringRef posix) {
+    char in[1300], out[1400];
+    if (!posix || !CFStringGetCString(posix, in, sizeof in, kCFStringEncodingUTF8)) return NULL;
+    size_t o = (size_t)snprintf(out, sizeof out, "%s", phone_volume_name);
+    for (const char *p = in; *p && o + 1 < sizeof out; p++) {
+        if (*p == '/' && (p[1] == '/' || !p[1])) continue;  // doubled and trailing slashes
+        out[o++] = *p == '/' ? ':' : *p == ':' ? '/' : *p;
+    }
+    if (!strchr(out, ':') && o + 1 < sizeof out) out[o++] = ':';  // the volume itself
+    out[o] = 0;
+    return CFStringCreateWithCString(NULL, out, kCFStringEncodingUTF8);
+}
+SHIM(CFURLCreateWithFileSystemPath) {
+    if (ARG(2) == HFS_STYLE) {
+        CFStringRef p = posix_from_hfs(S(1));
+        RET(p ? cf_wrap(CFURLCreateWithFileSystemPath(NULL, p, kCFURLPOSIXPathStyle, (Boolean)ARG(3))) : 0);
+        if (p) CFRelease(p);
+        return;
+    }
+    RET(cf_wrap(CFURLCreateWithFileSystemPath(NULL, S(1), ARG(2), (Boolean)ARG(3))));
+}
+SHIM(CFURLCreateWithFileSystemPathRelativeToBase) {
+    if (ARG(2) == HFS_STYLE) {
+        CFStringRef p = posix_from_hfs(S(1));
+        RET(p ? cf_wrap(CFURLCreateWithFileSystemPathRelativeToBase(NULL, p, kCFURLPOSIXPathStyle, (Boolean)ARG(3), U(4))) : 0);
+        if (p) CFRelease(p);
+        return;
+    }
+    RET(cf_wrap(CFURLCreateWithFileSystemPathRelativeToBase(NULL, S(1), ARG(2), (Boolean)ARG(3), U(4))));
+}
+#else
 SHIM(CFURLCreateWithFileSystemPath) { RET(cf_wrap(CFURLCreateWithFileSystemPath(NULL, S(1), ARG(2), (Boolean)ARG(3)))); }
 SHIM(CFURLCreateWithFileSystemPathRelativeToBase) { RET(cf_wrap(CFURLCreateWithFileSystemPathRelativeToBase(NULL, S(1), ARG(2), (Boolean)ARG(3), U(4)))); }
+#endif
 SHIM(CFURLCreateFromFileSystemRepresentation) { RET(cf_wrap(CFURLCreateFromFileSystemRepresentation(NULL, GP(ARG(1)), (i32)ARG(2), (Boolean)ARG(3)))); }
 SHIM(CFURLCreateWithString) { RET(cf_wrap(CFURLCreateWithString(NULL, S(1), U(2)))); }
 SHIM(CFURLCreateWithBytes) { RET(cf_wrap(CFURLCreateWithBytes(NULL, GP(ARG(1)), (i32)ARG(2), ARG(3), U(4)))); }
 SHIM(CFURLCopyAbsoluteURL) { RET(cf_wrap(CFURLCopyAbsoluteURL(U(0)))); }
+#if TARGET_OS_IPHONE
+SHIM(CFURLCopyFileSystemPath) {
+    if (ARG(1) == HFS_STYLE) {
+        CFStringRef p = CFURLCopyFileSystemPath(U(0), kCFURLPOSIXPathStyle);
+        CFStringRef h = hfs_from_posix(p);
+        if (p) CFRelease(p);
+        RET(h ? cf_wrap(h) : 0);
+        return;
+    }
+    RET(cf_wrap(CFURLCopyFileSystemPath(U(0), ARG(1))));
+}
+#else
 SHIM(CFURLCopyFileSystemPath) { RET(cf_wrap(CFURLCopyFileSystemPath(U(0), ARG(1)))); }
+#endif
 SHIM(CFURLCopyLastPathComponent) { RET(cf_wrap(CFURLCopyLastPathComponent(U(0)))); }
 SHIM(CFURLCopyScheme) { RET(cf_wrap(CFURLCopyScheme(U(0)))); }
 SHIM(CFURLCopyHostName) { RET(cf_wrap(CFURLCopyHostName(U(0)))); }
@@ -543,11 +626,14 @@ SHIM(UCConvertLongDateTimeToCFAbsoluteTime) {
 }
 #else
 // ---------- Carbon's file manager, on the phone ----------
+#include <sys/mount.h>
+const char *rt_ci_path(const char *path, char *buf, size_t cap);  // shims_libc.c: the name's case as it is on the disk
 // iOS has none of it, and Feral's code still finds folders and looks at files through it. An FSRef is 80 bytes the caller can't look into: here they hold a
 // mark and the number of a path in a table, and every call works on that path. FSCatalogInfo is filled from stat in the guest's 32-bit layout, where the
 // permissions are 16 bytes instead of 20, so every field after them sits 4 bytes lower than in the host's.
 enum { FSREF_MARK = 0x46535246u, MAX_REF_PATHS = 4096 };
 enum { noErr_ = 0, fnfErr_ = -43, paramErr_ = -50, nsvErr_ = -35 };
+#define PHONE_VOLUME ((i16)-100)
 static char *ref_paths[MAX_REF_PATHS];
 static u32 n_ref_paths;
 static os_unfair_lock ref_lock = OS_UNFAIR_LOCK_INIT;
@@ -587,9 +673,14 @@ SHIM(CFURLCreateFromFSRef) {
     RET(cf_wrap(CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, (CFIndex)strlen(path), stat(path, &st) == 0 && S_ISDIR(st.st_mode))));
 }
 SHIM(CFURLGetFSRef) {
-    char path[1200];
+    char asked[1200], real[1200];
     struct stat st;
-    if (!CFURLGetFileSystemRepresentation(U(0), true, (UInt8 *)path, sizeof path) || stat(path, &st) != 0) {
+    if (!CFURLGetFileSystemRepresentation(U(0), true, (UInt8 *)asked, sizeof asked)) {
+        RET(0);
+        return;
+    }
+    const char *path = rt_ci_path(asked, real, sizeof real);
+    if (stat(path, &st) != 0) {
         RET(0);
         return;
     }
@@ -619,7 +710,8 @@ SHIM(FSFindFolder) {  // volume, type, create, out
 }
 SHIM(FSPathMakeRef) {  // path, ref, is directory
     struct stat st;
-    const char *path = (const char *)GP(ARG(0));
+    char real[1200];
+    const char *path = rt_ci_path((const char *)GP(ARG(0)), real, sizeof real);
     if (stat(path, &st) != 0) {
         RET((u32)fnfErr_);
         return;
@@ -666,6 +758,18 @@ SHIM(FSGetCatalogInfo) {  // ref, which, info, name, spec, parent
         memset(GP(g), 0, 144);
         int dir = S_ISDIR(st.st_mode);
         *(u16a *)GP(g) = dir ? 0x10 : 0;  // nodeFlags: kFSNodeIsDirectoryMask
+        // One volume, whose root is /: its folder number is 2 and its parent's 1, as Carbon numbers them, and every other item has its inode.
+        // Feral's code walks up through parents until it reaches the root, so these must be right.
+        struct stat up;
+        char parent_path[1200];
+        snprintf(parent_path, sizeof parent_path, "%s", path);
+        char *cut = strrchr(parent_path, '/');
+        if (cut && cut != parent_path) *cut = 0;
+        else snprintf(parent_path, sizeof parent_path, "/");
+        int is_root = !strcmp(path, "/");
+        *(i16 *)GP(g + 2) = PHONE_VOLUME;
+        G32(g + 4) = is_root ? 1u : !strcmp(parent_path, "/") ? 2u : stat(parent_path, &up) == 0 ? (u32)up.st_ino : 0;
+        G32(g + 8) = is_root ? 2u : (u32)st.st_ino;
         put_utc_date(g + 16, st.st_birthtimespec.tv_sec);
         put_utc_date(g + 24, st.st_mtimespec.tv_sec);
         put_utc_date(g + 32, st.st_ctimespec.tv_sec);
@@ -700,14 +804,41 @@ SHIM(FSGetCatalogInfo) {  // ref, which, info, name, spec, parent
         snprintf(parent, sizeof parent, "%s", path);
         char *slash = strrchr(parent, '/');
         if (slash && slash != parent) *slash = 0;
+        else snprintf(parent, sizeof parent, "/");
         ref_put(ARG(5), parent);
     }
     RET(noErr_);
 }
-SHIM(FSGetVolumeInfo) {
-    static int told;
-    if (!told++) fprintf(stderr, "[cf] FSGetVolumeInfo asked, which the phone doesn't answer\n");
-    RET((u32)nsvErr_);
+// The phone's one volume: asked by its number or as the first of a list. FSVolumeInfo in the guest's layout, two-byte packed: dates at 0-31, counts at
+// 32 and 36, total and free bytes at 40 and 48, the block size and counts at 56-67, flags, file system and signature at 116-121.
+SHIM(FSGetVolumeInfo) {  // volume, index, actual volume, which, info, name, root
+    i16 vol = (i16)ARG(0);
+    u32 index = ARG(1);
+    if ((index && index != 1) || (!index && vol != PHONE_VOLUME)) {
+        RET((u32)nsvErr_);
+        return;
+    }
+    if (ARG(2)) *(i16 *)GP(ARG(2)) = PHONE_VOLUME;
+    if (ARG(4)) {
+        u32 g = ARG(4);
+        memset(GP(g), 0, 126);
+        struct statfs fs;
+        if (statfs(getenv("HOME"), &fs) == 0) {
+            *(u64a *)GP(g + 40) = (u64)fs.f_blocks * fs.f_bsize;
+            *(u64a *)GP(g + 48) = (u64)fs.f_bavail * fs.f_bsize;
+            G32(g + 56) = (u32)fs.f_bsize;
+            G32(g + 60) = (u32)fs.f_blocks;
+            G32(g + 64) = (u32)fs.f_bavail;
+        }
+        *(u16a *)GP(g + 120) = 0x482B;  // 'H+', as Carbon reports APFS volumes
+    }
+    if (ARG(5)) {
+        static const char name[] = "iPhone";
+        *(u16a *)GP(ARG(5)) = (u16)(sizeof name - 1);
+        for (unsigned i = 0; i < sizeof name - 1; i++) *(u16a *)GP(ARG(5) + 2 + i * 2) = (u16)name[i];
+    }
+    if (ARG(6)) ref_put(ARG(6), "/");
+    RET(noErr_);
 }
 SHIM(GetProcessBundleLocation) {  // process, out
     char path[1200];
@@ -979,6 +1110,24 @@ void rt_cf_init(u32 cfstring_start, u32 cfstring_end) {
         if (strncmp(n, "_k", 2) && strncmp(n, "_NS", 3)) continue;
         if (strstr(n, "CallBacks") || strstr(n, "TimeInterval") || strstr(n, "NSZero") || strstr(n, "NSApp") || strstr(n, "NSConcrete")) continue;
         void **p = dlsym(RTLD_DEFAULT, n + 1);
+#if TARGET_OS_IPHONE
+        // Carbon's and AppKit's string constants, which iOS doesn't have: the values those frameworks give them.
+        static const char *const phone_strings[][2] = {
+            {"_kTISPropertyInputSourceID", "TISPropertyInputSourceID"}, {"_kTISPropertyInputSourceLanguages", "TISPropertyInputSourceLanguages"},
+            {"_kTISPropertyUnicodeKeyLayoutData", "TISPropertyUnicodeKeyLayoutData"},
+            {"_kTISNotifySelectedKeyboardInputSourceChanged", "TISNotifySelectedKeyboardInputSourceChanged"},
+            {"_kUTTypeJPEG", "public.jpeg"}, {"_kUTTypeTIFF", "public.tiff"}, {"_NSImageNameCaution", "NSCaution"},
+            {"_NSPasteboardTypeString", "public.utf8-plain-text"}, {"_NSWindowDidBecomeMainNotification", "NSWindowDidBecomeMainNotification"},
+            {"_NSWindowDidResignMainNotification", "NSWindowDidResignMainNotification"},
+            {"_NSWindowDidEnterFullScreenNotification", "NSWindowDidEnterFullScreenNotification"},
+            {"_NSWindowDidExitFullScreenNotification", "NSWindowDidExitFullScreenNotification"},
+        };
+        if (!p) {
+            for (unsigned k = 0; k < sizeof phone_strings / sizeof *phone_strings; k++)
+                if (!strcmp(n, phone_strings[k][0])) G32(rt_import_addr(n)) = cf_wrap(CFStringCreateWithCString(NULL, phone_strings[k][1], kCFStringEncodingUTF8));
+            continue;
+        }
+#endif
         if (!p) continue;
         void *v = *p;
         u32 s = rt_import_addr(n);

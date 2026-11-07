@@ -247,6 +247,10 @@ static FormatInfo format_info(u32 f) {
             i.bytes = 1;
             i.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleRed, MTLTextureSwizzleRed, MTLTextureSwizzleOne);
             break;
+        case 34:  // G16R16, read as (r, g, 1, 1)
+            i.pf = MTLPixelFormatRG16Unorm;
+            i.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleOne, MTLTextureSwizzleOne);
+            break;
         case 36: i.pf = MTLPixelFormatRGBA16Unorm; i.bytes = 8; break;
         case 113: i.pf = MTLPixelFormatRGBA16Float; i.bytes = 8; break;
         case 112:
