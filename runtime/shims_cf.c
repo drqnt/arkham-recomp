@@ -696,9 +696,20 @@ SHIM(FSFindFolder) {  // volume, type, create, out
         case 0x63616368: sub = "Library/Caches"; break;               // 'cach'
         case 0x74656d70: sub = "tmp"; break;                          // 'temp'
         case 0x646f6373: sub = "Documents"; break;                    // 'docs'
+        case 0x6672616d: sub = "Library/Frameworks"; break;           // 'fram': the game asks for it all the time
+        case 0x73646174: sub = "Library/Shared"; break;               // 'sdat', /Users/Shared on a Mac
     }
     if (!sub) {
-        fprintf(stderr, "[cf] FSFindFolder for a folder type the phone has no place for: %.4s\n", (const char *)&(u32){__builtin_bswap32(ARG(1))});
+        static u32 told[16];
+        int seen = 0;
+        for (int i = 0; i < 16 && !seen; i++) {
+            if (told[i] == ARG(1)) seen = 1;
+            else if (!told[i]) {
+                told[i] = ARG(1);
+                break;
+            }
+        }
+        if (!seen) fprintf(stderr, "[cf] FSFindFolder for a folder type the phone has no place for: %.4s\n", (const char *)&(u32){__builtin_bswap32(ARG(1))});
         RET((u32)fnfErr_);
         return;
     }
