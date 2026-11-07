@@ -656,18 +656,22 @@ const char *rt_ci_path(const char *path, char *buf, size_t cap) { return ci_path
 #define CIBUF(n) char ci_buf##n[PATH_MAX]
 
 static int trace_fs_early(void) { return getenv("ARKHAM_TRACE_FS") != NULL; }
-// ARKHAM_LANGUAGE=ru (or fr, de, it, es, pl, en): the engine's language, which it reads from the Language line of BmEngine.ini. The Mac game has all of
-// these installed, voice and text, and Feral's code sets that line from Steam's language at every start, which for the Mac version is only ever English.
-// So the line is changed as the engine reads it, and the file stays as it is. Feral's own windows stay in English, which is all they come in.
+// BmEngine.ini as the engine reads it, with lines changed and the file left as it is:
+// - ARKHAM_LANGUAGE=ru (or fr, de, it, es, pl, en): the Language line. The Mac game has all of these installed, voice and text, and Feral's code sets
+//   that line from Steam's language at every start, which for the Mac version is only ever English. Feral's own windows stay in English, all they come in.
+// - bSmoothFrameRate, the engine's own frame limit at MaxSmoothedFrameRate (62), off unless ARKHAM_FRAME_LIMIT=1 (rt_no_frame_limit); a first start
+//   on a new machine writes it on. ARKHAM_FPS_CAP is the runtime's own limit.
+extern int rt_no_frame_limit;
 static FILE *language_ini(const char *path, const char *mode) {
     static const char *const codes[][2] = {{"en", "int"}, {"fr", "fra"}, {"de", "deu"}, {"it", "ita"}, {"es", "esn"}, {"pl", "pol"}, {"ru", "rus"}};
     static const char tail[] = "/BmEngine.ini";
     const char *lang = getenv("ARKHAM_LANGUAGE"), *ue = NULL;
     size_t n = strlen(path), t = sizeof tail - 1;
-    if (!lang || mode[0] != 'r' || n < t || strcmp(path + n - t, tail)) return NULL;
-    for (size_t i = 0; i < sizeof codes / sizeof codes[0]; i++)
+    if (mode[0] != 'r' || n < t || strcmp(path + n - t, tail)) return NULL;
+    for (size_t i = 0; lang && i < sizeof codes / sizeof codes[0]; i++)
         if (!strcmp(lang, codes[i][0])) ue = codes[i][1];
-    FILE *in = ue ? fopen(path, "rb") : NULL;
+    if (!ue && !rt_no_frame_limit) return NULL;
+    FILE *in = fopen(path, "rb");
     if (!in) return NULL;
     fseek(in, 0, SEEK_END);
     long size = ftell(in);
@@ -680,7 +684,8 @@ static FILE *language_ini(const char *path, const char *mode) {
     for (char *line = text; *line;) {
         char *end = strchr(line, '\n');
         size_t len = end ? (size_t)(end - line + 1) : strlen(line);
-        if (!strncmp(line, "Language=", 9)) o += (size_t)sprintf(out + o, "Language=%s\n", ue);
+        if (ue && !strncmp(line, "Language=", 9)) o += (size_t)sprintf(out + o, "Language=%s\n", ue);
+        else if (rt_no_frame_limit && !strncmp(line, "bSmoothFrameRate=", 17)) o += (size_t)sprintf(out + o, "bSmoothFrameRate=FALSE\n");
         else {
             memcpy(out + o, line, len);
             o += len;
@@ -688,7 +693,7 @@ static FILE *language_ini(const char *path, const char *mode) {
         line += len;
     }
     free(text);
-    fprintf(stderr, "[lang] the engine reads Language=%s\n", ue);
+    if (ue) fprintf(stderr, "[lang] the engine reads Language=%s\n", ue);
     return fmemopen(out, o, "r");  // the buffer lives as long as the process: the engine reads this file a few times at start
 }
 SHIM(fopen) {
