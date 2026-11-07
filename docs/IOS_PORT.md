@@ -128,3 +128,18 @@ Direct3D threads and the GPU look to run one after another (about 15 ms in all).
 Next, in the user's order of interest: shaders built ahead for the phone; the frame's parts overlapping; touch controls like Feral's Tomb Raider for
 iOS; a settings screen (resolution, MSAA, 60/120 FPS cap); rumble (the DualSense's haptics engine fails to make a player on the phone); pausing when the
 app goes to the background.
+
+## Touch controls, settings and the frame rate, 2026-11-07
+
+- Touch controls (`ios/app/TouchControls.m`), after Feral's Tomb Raider for iOS: a stick where the left thumb lands (past its edge it also runs), swipes on
+  the right as the touch pad's right stick (the game ignores the mouse while a pad moves, so mouse look stopped when walking), the main buttons in an arc
+  under the right thumb. Three styles: PlayStation, Xbox, or icons of each button's action from the game's own bindings (`BmInput.ini`); the game is shown
+  the pad drawn, so its prompts match. In menus, where the game doesn't hold the cursor, a tap is a click: the stand-in `NSApplication` queues events and
+  windows hand mouse events to the game's handlers.
+- Settings behind a gear at the top right, kept in the app's defaults: frame rate limit (30, 60, 120, none, changed live), button style, size, opacity,
+  camera speed, the run push, the frame rate line, the Metal HUD (live), and moving and resizing each button.
+- The frame rate stopped at about 65 with every part of the frame mostly idle. `ARKHAM_TRACE_PROFILE=s` showed the game thread waiting 73% of the time in
+  `dispatch_sync` to the main queue, which it does several times a frame: the work went into a queue and a bare `CFRunLoopWakeUp`, which doesn't make a
+  sleeping run loop run anything, so each hop waited out the loop's timeout. The queue is now a run loop source. The menu went from 65 to 150-210 FPS,
+  with up to 117 frames a second on the 120 Hz screen.
+- Shaders built ahead: `tools/build_ios_shaders.py` (about 40 minutes for the 32,010 different texts, 16 libraries); `tools/ios_install.sh` copies them.
