@@ -25,7 +25,7 @@
 #import <objc/message.h>
 
 void rt_touch_pad(float lx, float ly, float rx, float ry, float lt, float rt, unsigned buttons);
-void rt_touch_look(double yaw_right, double pitch_up);  // shims_hid.m: degrees the camera should turn, handed to the game a frame at a time
+void rt_touch_mouse(double dx, double dy);  // shims_sys.c: the pointer's motion in pixels, which the game reads as its mouse's
 void rt_touch_pad_on(int on);
 void rt_touch_pad_playstation(int ps);
 int rt_controller_connected(void);
@@ -51,6 +51,9 @@ enum { SIDE_UP, SIDE_RIGHT, SIDE_DOWN, SIDE_LEFT };
 
 // What a point of swipe turns the camera, at speed 1: a swipe across the phone's 951 points turns it about 270 degrees.
 #define CAMERA_DEG_PER_POINT 0.284
+// What a pixel of the game's mouse turns it, as the phone reads its settings (shims_libc.c: MouseSensitivity 7.5, no smoothing): 7.5 of the
+// engine's rotation units, 65536 to a turn. A scripted run on the Mac measured the same, at any speed (docs/IOS_PORT.md, controls v7).
+#define CAMERA_DEG_PER_PIXEL (7.5 * 360.0 / 65536.0)
 
 // ---------- settings ----------
 static NSUserDefaults *prefs(void) { return NSUserDefaults.standardUserDefaults; }
@@ -343,7 +346,7 @@ static void open_settings(void);
     if (@available(iOS 15.0, *)) link.preferredFrameRateRange = CAFrameRateRangeMake(60, 120, 120);
     [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     fprintf(stderr, "[touch] camera: %.0f degrees across the screen's width (speed %.2f)%s\n",
-            setting(@"swipeSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT * MAX(frame.size.width, frame.size.height), setting(@"swipeSpeed", "ARKHAM_TOUCH_LOOK", 1.0),
+            setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT * MAX(frame.size.width, frame.size.height), setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0),
             setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 ? ", up and down inverted" : "");
     return self;
 }
@@ -919,7 +922,7 @@ static UIView *gear_view;
             ly = d > 0 ? (float)(-dy / d) * m : 0;
             [self showStickAt:stick_center knob:CGPointMake(stick_center.x + (d > 0 ? dx / d * shown : 0), stick_center.y + (d > 0 ? dy / d * shown : 0))];
         } else if (t == look_touch) {
-            // The camera: the thumb's travel, in degrees, as it comes. Right turns right; up looks up, unless the settings invert it.
+            // The camera: the thumb's travel as the game's mouse, as it comes. Right turns right; up looks up, unless the settings invert it.
             CGPoint d = CGPointZero;
             for (UITouch *c in [event coalescedTouchesForTouch:t] ?: @[t]) {
                 CGPoint q = [c locationInView:self];
@@ -928,8 +931,8 @@ static UIView *gear_view;
                 look_last = q;
             }
             if (!in_menu) {
-                double k = setting(@"swipeSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT;
-                rt_touch_look(d.x * k, -d.y * k * (setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 ? -1 : 1));
+                double k = setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT / CAMERA_DEG_PER_PIXEL;
+                rt_touch_mouse(d.x * k, d.y * k * (setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 ? -1 : 1));
             }
         }
     }
@@ -1256,7 +1259,7 @@ static UIView *gear_view;
     [self action:@"Расположение кнопок" selector:@selector(editLayout)];
 
     [self section:@"Управление" footer:@"Камера поворачивается ровно на столько, на сколько проведён палец, с любой скоростью и на ходу. Скорость — на сколько градусов поворачивает свайп через весь экран."];
-    look_value = [self slider:@"Скорость камеры" min:0.25 max:3.0 value:setting(@"swipeSpeed", "ARKHAM_TOUCH_LOOK", 1.0) action:@selector(lookChanged:)];
+    look_value = [self slider:@"Скорость камеры" min:0.25 max:3.0 value:setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) action:@selector(lookChanged:)];
     [self toggle:@"Инвертировать вверх-вниз" on:setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 action:@selector(invertChanged:)];
     [self toggle:@"Бег: стик за край" on:setting(@"autoRun", "ARKHAM_TOUCH_RUN", 1) > 0 action:@selector(runChanged:)];
     [self showValues];
@@ -1265,7 +1268,7 @@ static UIView *gear_view;
 - (void)showValues {
     size_value.text = [NSString stringWithFormat:@"%.0f %%", setting(@"buttonScale", "ARKHAM_TOUCH_SIZE", 1.0) * 100];
     opacity_value.text = [NSString stringWithFormat:@"%.0f %%", setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.6) * 100];
-    look_value.text = [NSString stringWithFormat:@"%.0f° на экран", setting(@"swipeSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT * 951];
+    look_value.text = [NSString stringWithFormat:@"%.0f° на экран", setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT * 951];
 }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)t { return (NSInteger)rows.count; }
 - (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return (NSInteger)rows[(NSUInteger)s].count; }
@@ -1297,7 +1300,7 @@ static UIView *gear_view;
     [controls restyle];
 }
 - (void)lookChanged:(UISlider *)s {
-    set_setting(@"swipeSpeed", s.value);
+    set_setting(@"mouseCameraSpeed", s.value);
     [self showValues];
 }
 - (void)invertChanged:(UISwitch *)s { set_setting(@"invertLook", s.on); }

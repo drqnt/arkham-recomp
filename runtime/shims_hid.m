@@ -10,7 +10,6 @@
 #include "shim_reg.h"
 #include <mach/mach_time.h>
 #include <math.h>
-#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -151,28 +150,12 @@ static int hat(GCControllerDirectionPad *d) {
     if (left) return 6;
     return 8;
 }
-// On the phone the game takes its right stick as the mouse (BmInput.ini as shims_libc.c gives it, for the touch controls' swipes), and the game's
-// mouse turns the camera by about the square of a frame's push (see the touch camera below). A real controller's stick, past a dead zone of 0.15, is
-// given 0.055 to 0.55 of a push: just past the pad code's own dead zone at the start, so that the slightest push still turns, and about 250 degrees a
-// second at 60 frames a second held all the way; the stick's raw axes, read at 1.8 times, still see all of it. Not in menus, where the game takes the
-// stick as it comes, as its gamepad mouse (DefaultInput.ini, [GFxUI.GamepadMouse]): there it's left as it is.
-int rt_game_holds_cursor(void);  // shims_sys.c: in play
-static float right_stick(float v) {
-#if TARGET_OS_IPHONE
-    if (!rt_game_holds_cursor()) return v;
-    float a = fabsf(v);
-    if (a < 0.15f) return 0;
-    return copysignf(0.055f + (a - 0.15f) / 0.85f * (0.55f - 0.055f), v);
-#else
-    return v;
-#endif
-}
 static int read_control(const Profile *f, GCExtendedGamepad *g, const Control *k) {
     switch (k->what) {
         case LX: return stick(f, g.leftThumbstick.xAxis.value);
         case LY: return stick(f, -g.leftThumbstick.yAxis.value);
-        case RX: return stick(f, right_stick(g.rightThumbstick.xAxis.value));
-        case RY: return stick(f, -right_stick(g.rightThumbstick.yAxis.value));
+        case RX: return stick(f, g.rightThumbstick.xAxis.value);
+        case RY: return stick(f, -g.rightThumbstick.yAxis.value);
         case LT: return clamp((int)(g.leftTrigger.value * 255.0f + 0.5f), 0, 255);
         case RT: return clamp((int)(g.rightTrigger.value * 255.0f + 0.5f), 0, 255);
         case HAT: return hat(g.dpad);
@@ -261,111 +244,14 @@ int rt_controller_connected(void) {
         if (k.extendedGamepad && !k.isSnapshot) return 1;
     return 0;
 }
-// ---------- the touch camera ----------
-// Swipes turn the camera through the right stick, which on the phone the game takes as the mouse (shims_libc.c): a frame turns the camera by its
-// push as the curve below says. The thumb's turning, in degrees, waits here (rt_touch_look, from TouchControls.m), and at each of the game's
-// frames, from its own cursor warp, which it does once a frame in play right after reading its input (shims_sys.c), exactly what came since the last
-// one is handed over as the stick's push for the next frame. So each frame gets its own share, however the screen's touches and the game's frames
-// fall, and a small, slow move of the thumb turns the camera by just as much. What's finer than one of the stick's steps, or beyond its full push,
-// waits for the next frame. Sent as the thumb's speed instead, as before, the stick's 255 steps and the two clocks made small moves come out as
-// nothing or as jerks.
-// What a frame of the stick turns, measured with scripted runs on the Mac (docs/IOS_PORT.md): the stick feeds the mouse's axis at STICK_MOUSE_SPEED
-// (shims_libc.c) times its push, x a frame, and the game's mouse turns the camera by about CURVE_C x^CURVE_P points of a 712-point-wide picture,
-// some 7 of them to a degree; and the pad code drops a push under 7 of the stick's 127.5 steps from the middle. So for a frame's turn the push is
-// the inverse of that, and what a step can't give waits for the next frame.
-#define STICK_SPEED 60.0
-#define CURVE_C 0.038
-#define CURVE_P 1.9
-#define POINTS_PER_DEG 7.0
-#define MIN_STEPS 7
-#define CAM_NONE (-100000)
-static pthread_mutex_t look_mu = PTHREAD_MUTEX_INITIALIZER;
-static double look_yaw, look_pitch;
-static _Atomic int cam_hid[2] = {CAM_NONE, CAM_NONE};  // the stick's values the last frame was given
-static _Atomic u64 cam_frame_ns;                        // when that was
-static _Atomic int touch_shown;                         // the touch pad is what the game sees
-static int cam_trace = -1;  // ARKHAM_TRACE_TOUCH_CAMERA=n: the first n of the hook's frames and pushes, with times
-static void cam_note(const char *what, int a, int b) {
-    if (cam_trace < 0) cam_trace = getenv("ARKHAM_TRACE_TOUCH_CAMERA") ? atoi(getenv("ARKHAM_TRACE_TOUCH_CAMERA")) : 0;
-    if (cam_trace <= 0) return;
-    cam_trace--;
-    fprintf(stderr, "[tcam] %.2f ms frame %u %s %d %d\n", (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) % 100000000000ull) / 1e6, rt_frames_presented(), what, a, b);
-}
-void rt_touch_look(double yaw_right, double pitch_up) {
-    pthread_mutex_lock(&look_mu);
-    look_yaw += yaw_right;
-    look_pitch += pitch_up;
-    pthread_mutex_unlock(&look_mu);
-}
-static int stick_steps_value(const Profile *f, long n) { return f->signed_sticks ? (int)(n < -32767 ? -32767 : n > 32767 ? 32767 : n) : clamp(128 + (int)n, 0, 255); }
 static void push_control(Control *k, int v);
-// The frame's share, given to the game at its main loop's next pass, right before the next frame reads its input: from the warp itself the pad's
-// callback isn't called, since the game may hold a lock of the pad code's there. A run loop source of its own wakes that pass; the pad's timer,
-// on the same loop, gives it too if that pass went to another source.
-static _Atomic int cam_pending;
-static CFRunLoopSourceRef cam_source;
-static void push_camera(void *unused) {
-    (void)unused;
-    if (!atomic_exchange(&cam_pending, 0)) return;
-    Profile *f = shown;
-    if (!f || !atomic_load(&touch_shown) || !input_cb) return;
-    int held = rt_gate_held();
-    if (!held) rt_gate_acquire();
-    for (int i = 0; i < f->n; i++) {
-        Control *k = &f->controls[i];
-        if (k->what == RX || k->what == RY) {
-            int v = atomic_load(&cam_hid[k->what == RY]);
-            if (v != k->last) cam_note(k->what == RX ? "push RX" : "push RY", v, k->last);
-            push_control(k, v);
-        }
-    }
-    if (!held) rt_gate_release();
-}
-// From the game's cursor warp, on its own thread.
-void rt_touch_camera_frame(void) {
-    static double carry[2];
-    pthread_mutex_lock(&look_mu);
-    double want[2] = {look_yaw, look_pitch};
-    look_yaw = look_pitch = 0;
-    pthread_mutex_unlock(&look_mu);
-    Profile *f = shown;
-    if (!f || !atomic_load(&touch_shown) || !input_cb) return;
-    u64 now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    if (now - atomic_load(&cam_frame_ns) > 250000000ull) carry[0] = carry[1] = 0;  // after a pause, what was left over is stale
-    atomic_store(&cam_frame_ns, now);
-    double steps = f->signed_sticks ? 32767.0 : 127.5, min_steps = MIN_STEPS / 127.5 * steps;
-    for (int a = 0; a < 2; a++) {
-        // Pitch up is the stick's down: the game looks up for it. carry is in degrees still owed.
-        carry[a] += want[a];
-        double sign = carry[a] < 0 ? -1 : 1;
-        double owed = fabs(carry[a]) * POINTS_PER_DEG;  // points of picture this frame should turn
-        double n = owed > 0 ? pow(owed / CURVE_C, 1 / CURVE_P) / STICK_SPEED * steps : 0;
-        double turn_min = CURVE_C * pow(min_steps / steps * STICK_SPEED, CURVE_P);
-        if (n < min_steps) n = owed >= turn_min * 0.5 ? min_steps : 0;  // below the pad code's dead zone: the smallest it lets through, or nothing yet
-        long k = lround(fmin(n, steps));
-        double turned = k ? CURVE_C * pow((double)k / steps * STICK_SPEED, CURVE_P) / POINTS_PER_DEG : 0;
-        carry[a] -= sign * turned;
-        atomic_store(&cam_hid[a], stick_steps_value(f, (long)sign * k));
-    }
-    if (want[0] != 0 || atomic_load(&cam_hid[0]) != 128) cam_note("warp share", atomic_load(&cam_hid[0]), atomic_load(&cam_hid[1]));
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        CFRunLoopSourceContext ctx = {0};
-        ctx.perform = push_camera;
-        cam_source = CFRunLoopSourceCreate(NULL, 0, &ctx);
-        CFRunLoopAddSource(rt_guest_main_loop(), cam_source, kCFRunLoopCommonModes);
-    });
-    atomic_store(&cam_pending, 1);
-    CFRunLoopSourceSignal(cam_source);
-    CFRunLoopWakeUp(rt_guest_main_loop());
-}
 static int read_touch(const Profile *f, const Control *k) {
     u32 b = atomic_load(&touch.buttons);
     switch (k->what) {
         case LX: return stick(f, atomic_load(&touch.lx));
         case LY: return stick(f, -atomic_load(&touch.ly));
-        case RX: return atomic_load(&cam_hid[0]) != CAM_NONE ? atomic_load(&cam_hid[0]) : stick(f, 0);  // the camera: rt_touch_camera_frame
-        case RY: return atomic_load(&cam_hid[1]) != CAM_NONE ? atomic_load(&cam_hid[1]) : stick(f, 0);
+        case RX: return stick(f, atomic_load(&touch.rx));
+        case RY: return stick(f, -atomic_load(&touch.ry));
         case LT: return clamp((int)(atomic_load(&touch.lt) * 255.0f + 0.5f), 0, 255);
         case RT: return clamp((int)(atomic_load(&touch.rt) * 255.0f + 0.5f), 0, 255);
         case HAT: {
@@ -417,23 +303,11 @@ static void tick(void) {
         announce_service();
     }
     rumble_tick();
-    // ARKHAM_TEST_TOUCH_CAMERA=1 with the pad with no hardware: the touch camera's path on the Mac, for scripted runs ("tlook" steps, shims_objc.c).
-    static int test_cam = -1;
-    if (test_cam < 0) test_cam = fake_pad && getenv("ARKHAM_TEST_TOUCH_CAMERA");
-    atomic_store(&touch_shown, touching || test_cam);
     if (!input_cb) return;
-    push_camera(NULL);
-    // The touch camera's stick is the frame hook's (rt_touch_camera_frame): here only put back in the middle once play has stopped calling it.
-    int cam_stale = (touching || test_cam) && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - atomic_load(&cam_frame_ns) > 100000000ull;
-    if (cam_stale) {
-        atomic_store(&cam_hid[0], CAM_NONE);
-        atomic_store(&cam_hid[1], CAM_NONE);
-    }
     int vals[64], any = 0;
     for (int i = 0; i < want->n && i < 64; i++) {
         Control *k = &want->controls[i];
         vals[i] = fake_pad ? k->fake : touching ? read_touch(want, k) : read_control(want, g, k);
-        if ((touching || test_cam) && (k->what == RX || k->what == RY) && !cam_stale) vals[i] = k->last;
         any |= vals[i] != k->last;
     }
     if (!any) return;

@@ -256,3 +256,44 @@ app goes to the background.
   pipelines build three at a time at utility priority.
 - **Mac safety.** A Mac run with `ARKHAM_RIGHT_STICK_MOUSE` sends the engine's writes of `*Input.ini` to `/dev/null`. One write still got
   through and regenerated `MacInit/BmInput.ini` with the game's defaults, which is what it should hold.
+
+## Controls v7: the camera is the game's mouse again; startup's path lookups remembered, 2026-11-07
+
+- **The user's verdict on v4 to v6:** the camera felt like a joystick whatever was done to the stick, and the first version, which moved the
+  mouse, had felt right except that walking stopped it. So the stick camera is gone (`rt_touch_look`, the frame hook in the cursor warp, the
+  curve inversion, `ARKHAM_RIGHT_STICK_MOUSE`, `ARKHAM_TEST_TOUCH_CAMERA` and the `tlook` step), and a swipe is the pointer's motion again.
+- **Why walking stopped the mouse:** Feral's input loop (F_19deea0) hands the pointer's motion to the engine as the MouseX and MouseY axes
+  through the viewport client's InputAxis (vtable slot 0x10, the engine's at 0x00dee280), marked as not from a pad, and the engine ignores
+  those while a pad is in use. The touch controls are a pad, so a swipe counted for nothing while the left stick walked.
+- **The fix, in the game's own path:** a host function stands in front of that InputAxis in the dispatcher (`input_axis_as_pad`,
+  `shims_sys.c`) and marks only those two calls, known by their return addresses 0x19df2ea and 0x19df353, as from a pad. The camera then
+  turns through the game's own mouse bindings, walking or not. It is on on the phone (`ARKHAM_MOUSE_NOT_PAD=1` turns it off) and on the Mac
+  with `ARKHAM_MOUSE_AS_PAD=1`.
+- **Whole pixels:** the game turns the pointer's offset from the centre into whole pixels and warps back, so a fraction would be lost each
+  frame. On the phone the runtime hands over whole pixels only and keeps the remainder for the next frame (`rt_touch_mouse`).
+- **The phone's input settings** as the engine reads them (`shims_libc.c`, same length, on disk unchanged):
+  - `MouseSensitivity` 7.5 instead of 30, so a pixel is a quarter of the turn and slow swipes turn smoothly;
+  - mouse smoothing off: with one sample a frame, at 60 FPS UE3's smoothing doubles the motion of frames a little under 1/60 s and not
+    of the others, so the same swipe came out different;
+  - the right stick's lines back to the game's own (aTurn 1.0, aLookup 0.8 or 1.0 with the raw axis, dead zone 0.2, raw axes 1.0), where v5
+    and v6 had put them on the mouse's axes and the engine had written that into the phone's `BmInput.ini`. A controller is as in the original.
+  - `ARKHAM_TOUCH_MOUSE_INI=1` gives the Mac the same, with the engine's writes of those files sent to `/dev/null`.
+- **Measured on the Mac** with the phone's settings at 60 FPS (frames' shifts in points of a 712-point picture): 96 pixels gave 27, 28 and
+  27 points sent as 24 steps of 4, 4 of 24 and one of 96, and 288 back gave -81. So the turn is linear and doesn't depend on speed:
+  7.5 of the engine's rotation units a pixel (65536 to a turn), 0.041°.
+- **The swipe:** 0.284° a point at speed 1, about 270° across the screen, which is 6.9 pixels a point. The speed setting has a new key
+  (`mouseCameraSpeed`, 1.0), because v6's camera had been set to its maximum of 3.0, which on this camera would be three times too fast.
+- **Startup, 18 s on the phone against about 4.3 s on the Mac.** The phone's log had nothing between 2.9 s and 15.6 s. On the Mac, the
+  startup makes about 75,000 `stat` calls, 40,800 of them for files that aren't there in any case: the engine looks for each localization file
+  in four folders (BmGame's and Engine's, RUS and INT), BmGame.RUS some 5,280 times in each. On the phone, whose disk doesn't ignore case,
+  each of those was looked for again one name at a time: an `lstat` for every folder in the path, then a scan of the last folder's names.
+- **Now each lookup is remembered** for the path as asked, with the folder the answer came from, and used again while that folder's
+  modification time stays the same. A new file or folder in it changes that time. A test with a case-sensitive disk image covered folders
+  and files in another case, missing files and a file added later. On the Mac, 41,000 lookups of missing localization files took 1.85 s
+  looked up afresh and 0.26 s remembered, about 7 times less. Phone syscalls cost more, so the gain there should be larger.
+- **The phone's log** now has a `[ci]` line every 10 s while lookups happen: how many paths weren't there as asked, how many were answered
+  from memory, how many were found in another case, and the time spent. On the Mac, `ARKHAM_CI_PATHS=1` turns the lookup on, and
+  `ARKHAM_CI_NO_MEMO=1` gives the old way.
+- **The slow seconds after the first cutscene** in the v6 log: about 8 s at 15 FPS with frames 75 ms apart. The engine's game thread
+  (1dab9d0) took about 67 ms of CPU a frame, while the render thread and the GPU were mostly idle. New packages coming in look for their
+  localization the same way, so this is likely the same cost. Not confirmed yet: the next phone log shows it.

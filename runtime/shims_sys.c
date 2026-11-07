@@ -12,6 +12,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <zlib.h>
 
 u32 cf_wrap(CFTypeRef o);
@@ -174,7 +175,7 @@ static double cap_x, cap_y, cap_dx, cap_dy;
 static u64 cap_last_warp;
 static inline u64 now_ms(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000; }
 #if TARGET_OS_IPHONE
-// The phone has no pointer: the camera comes from a controller there, through shims_hid.m, and later from touch.
+// The phone has no pointer: there the camera's swipes are its motion (rt_touch_mouse below), and a controller's stick is the game's own.
 void rt_input_release(void) {}
 static void cap_setup(void) { cap_ready = 1; }
 #else
@@ -218,6 +219,17 @@ static void cap_setup(void) {
 }
 #endif
 
+// The phone's camera swipes (ios/app/TouchControls.m) as the pointer's motion, in pixels, the way a Mac's mouse turns the camera: while the game holds
+// the cursor, what's added here is what it reads next through HIGetMousePosition. The game's own mouse bindings, smoothing and sensitivity then turn
+// it, and walking doesn't stop it (input_axis_as_pad).
+void rt_touch_mouse(double dx, double dy) {
+    pthread_mutex_lock(&cap_mu);
+    if (cap_active) {
+        cap_dx += dx;
+        cap_dy += dy;
+    }
+    pthread_mutex_unlock(&cap_mu);
+}
 // The phone's touches (ios/app/TouchControls.m). Whether the game holds the cursor, warping it back each frame as it does in play: then a tap mustn't
 // be a click, which is a strike in play. And where a tap puts the cursor, for menus, which the game reads through HIGetMousePosition below.
 int rt_game_holds_cursor(void) {
@@ -249,8 +261,102 @@ void rt_scripted_mouse_get(double *x, double *y) {
     *y = scripted_y;
 }
 // The game asks for 72 DPI global coordinates (origin at the top left); HIPoint is two floats on the guest.
+// ARKHAM_TRACE_MOUSE=n: every nth read of the pointer, who asked (six callers up through the frame pointers) and what it got; for finding where
+// the game turns the pointer's motion into input, and why it drops it while a pad's stick is held.
+static void trace_mouse(CPU *c, double x, double y) {
+    static int every = -1, n;
+    if (every < 0) every = getenv("ARKHAM_TRACE_MOUSE") ? atoi(getenv("ARKHAM_TRACE_MOUSE")) : 0;
+    if (every <= 0 || n++ % every) return;
+    u32 at[6];
+    at[0] = G32(c->esp);
+    u32 bp = c->ebp;
+    for (int i = 1; i < 6; i++) {
+        at[i] = bp > 0x1000 && bp < 0xFFFFFFF0u ? G32(bp + 4) : 0;
+        bp = bp > 0x1000 && bp < 0xFFFFFFF0u ? G32(bp) : 0;
+    }
+    unsigned rt_frames_presented(void);
+    fprintf(stderr, "[mouse] read %d at frame %u: %.1f,%.1f from %08x < %08x < %08x < %08x < %08x < %08x\n", n, rt_frames_presented(), x, y, at[0], at[1], at[2], at[3],
+            at[4], at[5]);
+}
+// Feral's input loop (F_19deea0) drops the pointer's move, counting down, while a counter of its window object (at +0x4d4) is above zero; the pad
+// code raises it, so that a mouse doesn't fight a held stick, and walking holds one. Found with ARKHAM_TRACE_MOUSE and scripted runs (docs/IOS_PORT.md).
+// When the pointer is read from there (F_1c40d00 for F_0048c10 for F_19deea0, found by the frames' return addresses), the counter is at hand:
+// [F_19deea0's ebp - 0xc8] is the window object.
+static u32 mouse_skip_counter(CPU *c) {
+    u32 bp = c->ebp;
+    if (bp < 0x1000 || G32(bp + 4) != 0x48c4bu) return 0;
+    u32 bp1 = G32(bp);
+    if (bp1 < 0x1000 || G32(bp1 + 4) != 0x19df02fu) return 0;
+    u32 bp2 = G32(bp1);
+    u32 window = bp2 > 0x1000 ? G32(bp2 - 0xc8) : 0;
+    return window ? window + 0x4d4 : 0;
+}
+// The game drops the pointer's motion while a pad's stick is held (walking holds one): Feral's input loop (F_19deea0) hands it to the engine as the
+// MouseX and MouseY axes, marked as not from a pad, and the engine ignores those while a pad is in use. On the phone, where the pointer is the
+// touch camera (rt_touch_mouse below), those two calls are marked as from a pad instead: the engine's own InputAxis, a virtual function of the
+// viewport client, is called through the dispatcher, so a host function in front of it at that address sees each call, and changes the last argument
+// (bGamepad) of only those two, known by where they return to. Then the camera turns as the mouse turns it, walking or not, through the game's own
+// mouse bindings and smoothing. ARKHAM_MOUSE_AS_PAD=1 does the same on the Mac, for scripted runs.
+guest_fn rt_guest_fn(u32 addr);           // rt.c: the translated function at a guest address
+void rt_ht_add(u32 addr, guest_fn fn);  // rt.c: a host function in front of it for calls through the dispatcher
+static guest_fn input_axis_orig;
+static u32 input_axis_at;
+static void input_axis_as_pad(CPU *c) {
+    u32 ret = G32(c->esp);
+    if (ret == 0x19df2eau || ret == 0x19df353u) G32(c->esp + 0x20) = 1;
+    c->jt = input_axis_at;
+    input_axis_orig(c);
+}
+static int mouse_as_pad(void) {
+    static int on = -1;
+#if TARGET_OS_IPHONE
+    if (on < 0) on = !getenv("ARKHAM_MOUSE_NOT_PAD");
+#else
+    if (on < 0) on = getenv("ARKHAM_MOUSE_AS_PAD") != NULL;
+#endif
+    return on;
+}
+static void install_mouse_as_pad(u32 bp2) {
+    if (input_axis_orig || !mouse_as_pad() || bp2 < 0x1000) return;
+    u32 client = G32(bp2 - 0xc0);
+    u32 vtable = client ? G32(client) : 0;
+    u32 fn = vtable ? G32(vtable + 0x10) : 0;
+    guest_fn orig = fn ? rt_guest_fn(fn) : NULL;
+    if (!orig) return;
+    input_axis_orig = orig;
+    input_axis_at = fn;
+    rt_ht_add(fn, input_axis_as_pad);
+    fprintf(stderr, "[mouse] the pointer's motion reaches the engine as a pad's (its InputAxis at %08x)\n", fn);
+}
 SHIM(HIGetMousePosition) {
     u32 out = ARG(2);
+    {
+        // Called from Feral's input loop: the place to put the hook in, and the counter that drops the first moves after start (see mouse_skip_counter).
+        u32 bp = c->ebp;
+        if (bp > 0x1000 && G32(bp + 4) == 0x48c4bu) {
+            u32 bp1 = G32(bp);
+            if (bp1 > 0x1000 && G32(bp1 + 4) == 0x19df02fu) install_mouse_as_pad(G32(bp1));
+        }
+#if TARGET_OS_IPHONE
+        // The first moves after start, or after the window came back, are dropped by that counter: on the phone a swipe is never a stray move.
+        u32 skip = mouse_skip_counter(c);
+        if (skip && G32(skip)) G32(skip) = 0;
+#endif
+    }
+    {
+        static int trace = -1;
+        if (trace < 0) trace = getenv("ARKHAM_TRACE_MOUSE_SKIP") != NULL;
+        u32 at = mouse_skip_counter(c);
+        if (trace && at) {
+            static u32 last = 0xFFFFFFFFu;
+            u32 v = G32(at);
+            if (v != last) {
+                unsigned rt_frames_presented(void);
+                fprintf(stderr, "[mouse] skip counter %u at frame %u\n", v, rt_frames_presented());
+                last = v;
+            }
+        }
+    }
     CGPoint p = CGPointMake(scripted_x, scripted_y);
     int captured = 0;
     if (!scripted_mouse) {
@@ -260,9 +366,19 @@ SHIM(HIGetMousePosition) {
         if (cap_active && now_ms() - cap_last_warp > 300) cap_active = 0;
 #endif
         if (cap_active) {
+#if TARGET_OS_IPHONE
+            // Whole points only: the game turns the motion into whole pixels (F_0048c10), so a fraction left here would be lost at its next warp;
+            // kept, it adds up, and a slow swipe still turns the camera.
+            double ix = trunc(cap_dx), iy = trunc(cap_dy);
+            cap_x += ix;
+            cap_y += iy;
+            cap_dx -= ix;
+            cap_dy -= iy;
+#else
             cap_x += cap_dx;
             cap_y += cap_dy;
             cap_dx = cap_dy = 0;
+#endif
             p = CGPointMake(cap_x, cap_y);
             captured = 1;
         }
@@ -289,16 +405,13 @@ SHIM(HIGetMousePosition) {
         *(f32a *)GP(out) = (float)p.x;
         *(f32a *)GP(out + 4) = (float)p.y;
     }
+    trace_mouse(c, p.x, p.y);
     RET(0);
 }
 // The game measures mouse motion as the distance from where it last put the cursor, so a scripted cursor has to follow too.
-void rt_touch_camera_frame(void);  // shims_hid.m
 SHIM(CGWarpMouseCursorPosition) {
     static u32 warps;
     if (warps++ % 600 == 0) fprintf(stderr, "[input] cursor warp %u to %.0f,%.0f\n", warps, ARGF(0), ARGF(1));
-    // The game warps once a frame in play, right after reading its input: the touch camera's moment to hand over a frame's turning (shims_hid.m).
-    // It does nothing unless the touch controls are what the game sees (or a scripted run on the Mac tests them).
-    rt_touch_camera_frame();
     if (scripted_mouse) {
         scripted_x = ARGF(0);
         scripted_y = ARGF(1);

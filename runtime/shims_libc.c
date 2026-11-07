@@ -548,9 +548,11 @@ SHIM(wctob) { RET((i32)ARG(0)); }
 // ---------- stdio ----------
 // ---------- case in paths ----------
 // The Mac's disks ignore case in names and the phone's don't, and the game isn't consistent: it asks for BMAAData/Binaries and BMGame where
-// the folders are called binaries and BmGame. On the phone a path that isn't there is looked for again one name at a time, ignoring case,
-// with each folder's names kept until the folder changes. On the Mac paths go through untouched.
-#if TARGET_OS_IPHONE
+// the folders are called binaries and BmGame. On the phone a path that isn't there is looked for again ignoring case, and what that finds is
+// remembered for the path as asked, checked against the folder it was found in, which changes whenever a name in it does. That matters: the
+// engine asks about some 75,000 paths at startup, 41,000 of them localization files that aren't there in any case (Engine.RUS in BmGame's folder
+// and the like), and looked for afresh one name at a time, that took about 10 s on the phone, and long again whenever new packages came in
+// (docs/IOS_PORT.md, controls v7). On the Mac paths go through untouched, unless ARKHAM_CI_PATHS=1, for measuring this.
 #include <dirent.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -593,8 +595,9 @@ static const DirNames *names_of(const char *dir) {
     d->mtime = st.st_mtimespec;
     return d;
 }
-// The path as it is on the disk, in buf, or the path itself when it is there already or nothing matches.
-static const char *ci_path(const char *path, char *buf, size_t cap) {
+// The path as it is on the disk, in buf, or the path itself when it is there already or nothing matches, looked for one name at a time: for a
+// path relative to the working folder, and for all of them with ARKHAM_CI_NO_MEMO=1, the way it was before the lookups were remembered.
+static const char *ci_walk(const char *path, char *buf, size_t cap) {
     struct stat st;
     if (!path || !*path || !lstat(path, &st)) return path;
     char cur[PATH_MAX];
@@ -644,12 +647,165 @@ static const char *ci_path(const char *path, char *buf, size_t cap) {
     memcpy(buf, cur, strlen(cur) + 1);
     return buf;
 }
+static int ci_on(void) {
+#if TARGET_OS_IPHONE
+    return 1;
 #else
-static const char *ci_path(const char *path, char *buf, size_t cap) {
-    (void)buf, (void)cap;
-    return path;
-}
+    static int on = -1;
+    if (on < 0) on = getenv("ARKHAM_CI_PATHS") != NULL;
+    return on;
 #endif
+}
+typedef struct Memo {
+    struct Memo *next;
+    u64 hash;
+    char *asked, *real;  // real is NULL when the path as asked is the answer
+    char *check;         // the folder the answer was found in, or the deepest one there was
+    struct timespec mtime;
+    int exists;
+} Memo;
+enum { MEMO_BUCKETS = 1 << 14, MEMO_MAX = 1 << 16 };
+static Memo *memo[MEMO_BUCKETS];
+static unsigned memo_n;
+static u64 ci_lookups, ci_remembered, ci_found, ci_ns;
+static u64 path_hash(const char *s) {
+    u64 h = 1469598103934665603ull;
+    for (; *s; s++) h = (h ^ (u8)*s) * 1099511628211ull;
+    return h;
+}
+static void memo_put(const char *asked, u64 h, const char *real, int exists, const char *check, struct timespec mtime) {
+    Memo *m = NULL;
+    for (Memo *e = memo[h & (MEMO_BUCKETS - 1)]; e && !m; e = e->next)
+        if (e->hash == h && !strcmp(e->asked, asked)) m = e;
+    if (!m) {
+        if (memo_n >= MEMO_MAX) {  // the game asking about this many different paths is unlikely: start over
+            for (int i = 0; i < MEMO_BUCKETS; i++)
+                for (Memo *e = memo[i], *nx; e; e = nx) {
+                    nx = e->next;
+                    free(e->asked), free(e->real), free(e->check), free(e);
+                }
+            memset(memo, 0, sizeof memo);
+            memo_n = 0;
+        }
+        m = calloc(1, sizeof *m);
+        m->hash = h;
+        m->asked = strdup(asked);
+        m->next = memo[h & (MEMO_BUCKETS - 1)];
+        memo[h & (MEMO_BUCKETS - 1)] = m;
+        memo_n++;
+    } else {
+        free(m->real);
+        free(m->check);
+    }
+    m->real = strcmp(real, asked) ? strdup(real) : NULL;
+    m->exists = exists;
+    m->check = strdup(check);
+    m->mtime = mtime;
+}
+// An absolute path as it is on the disk, into real (PATH_MAX), and whether it's there; with dir_mu held. Through what's remembered for it, if its
+// folder hasn't changed since; else its folder the same way, and then its last name in that folder, as asked or in any case.
+static int resolve(const char *path, char *real, char *check, struct timespec *mtime) {
+    struct stat st;
+    u64 h = path_hash(path);
+    for (Memo *m = memo[h & (MEMO_BUCKETS - 1)]; m; m = m->next) {
+        if (m->hash != h || strcmp(m->asked, path)) continue;
+        if (stat(m->check, &st) || st.st_mtimespec.tv_sec != m->mtime.tv_sec || st.st_mtimespec.tv_nsec != m->mtime.tv_nsec) break;
+        snprintf(real, PATH_MAX, "%s", m->real ? m->real : path);
+        snprintf(check, PATH_MAX, "%s", m->check);
+        *mtime = m->mtime;
+        ci_remembered++;
+        return m->exists;
+    }
+    size_t n = strlen(path);
+    while (n > 1 && path[n - 1] == '/') n--;
+    if (!lstat(path, &st)) {
+        snprintf(real, PATH_MAX, "%.*s", (int)n, path);
+        check[0] = 0;
+        return 1;
+    }
+    size_t cut = n;
+    while (cut > 0 && path[cut - 1] != '/') cut--;  // path[cut..n) is the last name
+    char parent[PATH_MAX], name[NAME_MAX + 1], rp[PATH_MAX];
+    if (n - cut > NAME_MAX || cut >= sizeof parent) {
+        snprintf(real, PATH_MAX, "%s", path);
+        check[0] = 0;
+        return 0;
+    }
+    size_t pl = cut > 1 ? cut - 1 : 1;  // the parent without its last slash; "/" for the root
+    memcpy(parent, path, pl);
+    parent[pl] = 0;
+    memcpy(name, path + cut, n - cut);
+    name[n - cut] = 0;
+    int pexists = resolve(parent, rp, check, mtime);
+    int exists = 0;
+    const char *sep = strcmp(rp, "/") ? "/" : "";
+    if (!pexists) {
+        snprintf(real, PATH_MAX, "%s%s%s", rp, sep, name);  // check and mtime stay the parent's: the deepest folder there was
+    } else if (!strcmp(name, ".") || !strcmp(name, "..")) {
+        snprintf(real, PATH_MAX, "%s%s%s", rp, sep, name);
+        exists = !lstat(real, &st);
+        check[0] = 0;
+    } else {
+        snprintf(real, PATH_MAX, "%s%s%s", rp, sep, name);
+        exists = strcmp(rp, parent) && !lstat(real, &st);  // the folder was found in another case, the name as asked
+        if (!exists) {
+            const DirNames *d = names_of(rp);
+            for (int k = 0; d && k < d->n && !exists; k++)
+                if (!strcasecmp(d->names[k], name)) {
+                    snprintf(real, PATH_MAX, "%s%s%s", rp, sep, d->names[k]);
+                    exists = 1;
+                }
+        }
+        snprintf(check, PATH_MAX, "%s", rp);
+        if (!stat(rp, &st)) *mtime = st.st_mtimespec;
+    }
+    if (check[0]) memo_put(path, h, real, exists, check, *mtime);
+    return exists;
+}
+static void ci_report(void) {
+    static u64 last_ns, told_lookups;
+    u64 now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (now - last_ns < 10000000000ull || ci_lookups == told_lookups) return;
+    last_ns = now;
+    told_lookups = ci_lookups;
+    fprintf(stderr, "[ci] %llu paths not there as asked, %llu answered from memory, %llu found in another case, %.0f ms looking, %u remembered\n",
+            ci_lookups, ci_remembered, ci_found, (double)ci_ns / 1e6, memo_n);
+}
+// The path as it is on the disk, in buf, or the path itself when it is there already or nothing matches.
+static const char *ci_path(const char *path, char *buf, size_t cap) {
+    if (!path || !*path || !ci_on()) return path;
+    static int old = -1;
+    if (old < 0) old = getenv("ARKHAM_CI_NO_MEMO") != NULL;
+    if (path[0] != '/' || old) {
+        struct stat st;
+        if (!lstat(path, &st)) return path;
+        u64 t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        const char *r = ci_walk(path, buf, cap);
+        pthread_mutex_lock(&dir_mu);
+        ci_lookups++;
+        ci_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+        ci_report();
+        pthread_mutex_unlock(&dir_mu);
+        return r;
+    }
+    if (strlen(path) >= PATH_MAX) return path;
+    char real[PATH_MAX], check[PATH_MAX];
+    struct timespec mtime = {0, 0};
+    u64 t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    pthread_mutex_lock(&dir_mu);
+    u64 remembered = ci_remembered;
+    int exists = resolve(path, real, check, &mtime);
+    if (!exists || strcmp(real, path) || ci_remembered != remembered) {  // not there as asked
+        ci_lookups++;
+        if (exists && strcmp(real, path)) ci_found++;
+        ci_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+        ci_report();
+    }
+    pthread_mutex_unlock(&dir_mu);
+    if (!strcmp(real, path) || strlen(real) >= cap) return path;
+    memcpy(buf, real, strlen(real) + 1);
+    return buf;
+}
 // For the other files that take paths from the game (shims_cf.c's file manager on the phone).
 const char *rt_ci_path(const char *path, char *buf, size_t cap) { return ci_path(path, buf, cap); }
 #define CIP(n) ci_path(GS(ARG(n)), ci_buf##n, sizeof ci_buf##n)
@@ -662,94 +818,99 @@ static int trace_fs_early(void) { return getenv("ARKHAM_TRACE_FS") != NULL; }
 // - bSmoothFrameRate, the engine's own frame limit at MaxSmoothedFrameRate (62), off unless ARKHAM_FRAME_LIMIT=1 (rt_no_frame_limit); a first start
 //   on a new machine writes it on. ARKHAM_FPS_CAP is the runtime's own limit.
 extern int rt_no_frame_limit;
-// The input settings on the phone (BaseInput.ini, DefaultInput.ini, BmInput.ini, UserInput.ini), as the engine reads them with open(): the right
-// stick's turning (aTurn, aLookup) goes to the mouse's axes (aMouseX, aMouseY) at STICK_MOUSE_SPEED, and the engine's mouse smoothing is off.
-// The game takes the stick as a joystick, with an acceleration of its own and the camera's own ideas while walking, so swipes (ios/app/TouchControls.m),
-// which reach it as that stick, felt like one. As the mouse, a frame turns the camera by exactly what came in that frame, while walking too. The mouse
-// itself can't do it: the game drops it while a pad's stick is held, and walking holds one. Scripted runs on the Mac showed all of it (docs/IOS_PORT.md).
-// The stick's raw axes (aRawRHJoyRight, aRawRHJoyUp, which some gadgets read) get Speed=1.8 against the 0.55 at most a real controller's push is
-// given in shims_hid.m, so that they still see all of it, and no dead zone. The text keeps its length, since the engine may take the size from stat(), and values are set, not multiplied, since
-// the engine writes what it read back into BmInput.ini, which is then read again at the next start. On the Mac only with ARKHAM_RIGHT_STICK_MOUSE.
-#define STICK_MOUSE_SPEED 60
-static const char *right_stick_axis(const char *q, const char *end) {
-    static const char *const names[] = {"Axis aTurn ", "Axis aLookup ", "Axis aRawRHJoyRight ", "Axis aRawRHJoyUp ", "Axis aMouseX ", "Axis aMouseY "};
-    for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
-        size_t n = strlen(names[i]);
-        if ((size_t)(end - q) > n && !strncmp(q, names[i], n)) return q;
-    }
-    return NULL;
+// The input settings as the engine reads them with open() (BaseInput.ini, DefaultInput.ini, BmInput.ini, UserInput.ini), changed in the text it reads
+// and kept on disk as they are. On the phone, where the mouse is the touch camera (rt_touch_mouse, shims_sys.c):
+// - MouseSensitivity at a quarter of the game's 30. The pointer moves in whole pixels, and four times as many of them for the same turn let a slow
+//   swipe turn smoothly rather than a quarter of a degree at a time (TouchControls.m sends four times as many).
+// - The engine's mouse smoothing off. With one sample a frame, at 60 frames a second it doubles the motion of a frame a little shorter than 1/60 s
+//   and not that of one a little longer, so the same swipe turned by different amounts.
+// - The right stick's lines as the game has them, where controls v5 and v6 of this port (docs/IOS_PORT.md) had put them on the mouse's axes and
+//   the engine had written that back into BmInput.ini.
+// ARKHAM_TOUCH_MOUSE_INI=1 does the same on the Mac, for scripted runs, and then the engine's writes of those files go nowhere, so that the Mac's
+// game keeps its own settings.
+// The text keeps its length, since the engine may take the size from stat(), and values are set, not multiplied, since the engine writes what it read
+// back into BmInput.ini, which is then read again at the next start.
+static int input_rewrites(void) {
+#if TARGET_OS_IPHONE
+    return 1;
+#else
+    static int on = -1;
+    if (on < 0) on = getenv("ARKHAM_TOUCH_MOUSE_INI") != NULL;
+    return on;
+#endif
 }
-// A value after "name=" in one command, overwritten in place, padded with spaces; 0 if it doesn't fit.
+// A value after "name=" in one command, overwritten in place, padded with spaces; 1 if that changed the text, 0 if not or if it doesn't fit.
 static int set_field(char *cmd, char *cmd_end, const char *name, const char *value) {
     size_t nl = strlen(name), vl = strlen(value);
     char *at = memmem(cmd, (size_t)(cmd_end - cmd), name, nl);
     if (!at) return 0;
     char *v = at + nl, *ve = v;
-    while (ve < cmd_end && *ve != ' ' && *ve != '|' && *ve != '"' && *ve != ')') ve++;
-    if ((size_t)(ve - v) < vl) return 0;
-    memset(v, ' ', (size_t)(ve - v));
+    while (ve < cmd_end && *ve != ' ' && *ve != '|' && *ve != '"' && *ve != ')' && *ve != '\r') ve++;
+    size_t room = (size_t)(ve - v);
+    if (room < vl) return 0;
+    char was[64];
+    if (room > sizeof was) return 0;
+    memcpy(was, v, room);
+    memset(v, ' ', room);
     memcpy(v, value, vl);
-    return 1;
+    return memcmp(was, v, room) != 0;
 }
-static double stick_mouse_speed(void) {
-    const char *v = getenv("ARKHAM_RIGHT_STICK_MOUSE");
-    if (v && *v) return atof(v);
-#if TARGET_OS_IPHONE
-    return STICK_MOUSE_SPEED;
-#else
-    return 0;
-#endif
-}
-// A whole command replaced by another no longer than it, padded with spaces to its length.
+// A whole command replaced by another no longer than it, padded with spaces to its length; 1 if that changed the text.
 static int set_command(char *cmd, char *cmd_end, const char *text) {
     size_t room = (size_t)(cmd_end - cmd), n = strlen(text);
-    if (n > room) return 0;
+    if (n > room || room > 256) return 0;
+    char was[256];
+    memcpy(was, cmd, room);
     memset(cmd, ' ', room);
     memcpy(cmd, text, n);
-    return 1;
+    return memcmp(was, cmd, room) != 0;
 }
-static int right_stick_rewrite(char *text, size_t len) {
+// In a line of the right stick's, what controls v5 and v6 left: "Axis aMouseX Speed=60 DeadZone=0" (and aMouseY) where the game has aTurn at 1.0
+// and aLookup at 0.8, or at 1.0 where the line also has the raw axis, both with a dead zone of 0.2; and the raw axes at another speed than 1.0.
+static int right_stick_restore(char *line, char *line_end) {
+    int changed = 0, raw = memmem(line, (size_t)(line_end - line), "Axis aRawRHJoy", 14) != NULL;
+    for (char *q = line; q < line_end; q++) {
+        size_t left = (size_t)(line_end - q);
+        int mx = left > 13 && !strncmp(q, "Axis aMouseX ", 13), my = left > 13 && !strncmp(q, "Axis aMouseY ", 13);
+        int rr = left > 14 && !strncmp(q, "Axis aRawRHJoy", 14);
+        if (!mx && !my && !rr) continue;
+        char *cmd_end = q;
+        while (cmd_end < line_end && *cmd_end != '|' && *cmd_end != '"') cmd_end++;
+        char *sp = memmem(q, (size_t)(cmd_end - q), "Speed=", 6);
+        int neg = sp && sp[6] == '-';
+        if (mx || my) {
+            char cmd[64];
+            snprintf(cmd, sizeof cmd, "Axis %s Speed=%s%s DeadZone=0.2", mx ? "aTurn" : "aLookup", neg ? "-" : "", mx || raw ? "1.0" : "0.8");
+            changed += set_command(q, cmd_end, cmd);
+        } else {
+            changed += set_field(q, cmd_end, "Speed=", neg ? "-1.0" : "1.0");
+        }
+        q = cmd_end;
+    }
+    return changed;
+}
+static int input_rewrite(char *text, size_t len) {
     int changed = 0;
-    double mouse = stick_mouse_speed();
     char *end_all = text + len;
+    static const char sensitivity[] = "MouseSensitivity=", smoothing[] = "bEnableMouseSmoothing=";
     for (char *line = text; line < end_all;) {
         char *nl = memchr(line, '\n', (size_t)(end_all - line));
         char *line_end = nl ? nl : end_all;
-        // With the stick on the mouse's axes, the engine's mouse smoothing off: it spreads a mouse's samples over the frames between them, and took most
-        // of a stick's turning away, which counts no samples. Then each frame turns the camera by exactly what came in that frame.
-        static const char smoothing[] = "bEnableMouseSmoothing=true";
-        if (mouse > 0 && (size_t)(line_end - line) >= sizeof smoothing - 1 && !strncmp(line, smoothing, sizeof smoothing - 1)) {
-            memcpy(line + 22, "0   ", 4);
-            changed++;
-        }
-        if (memmem(line, (size_t)(line_end - line), "XboxTypeS_RightX", 16) || memmem(line, (size_t)(line_end - line), "XboxTypeS_RightY", 16)) {
-            for (char *q = line; q < line_end; q++) {
-                if (!right_stick_axis(q, line_end)) continue;
-                char *cmd_end = q;
-                while (cmd_end < line_end && *cmd_end != '|' && *cmd_end != '"') cmd_end++;
-                char *sp = memmem(q, (size_t)(cmd_end - q), "Speed=", 6);
-                int neg = sp && sp[6] == '-';
-                int x = !strncmp(q, "Axis aTurn ", 11) || !strncmp(q, "Axis aMouseX ", 13), y = !strncmp(q, "Axis aLookup ", 13) || !strncmp(q, "Axis aMouseY ", 13);
-                if (x || y) {
-                    char cmd[64];
-                    snprintf(cmd, sizeof cmd, "Axis %s Speed=%s%g DeadZone=0", x ? "aMouseX" : "aMouseY", neg ? "-" : "", mouse);
-                    changed += set_command(q, cmd_end, cmd);
-                } else {
-                    changed += set_field(q, cmd_end, "Speed=", neg ? "-1.8" : "1.8");
-                    set_field(q, cmd_end, "DeadZone=", "0");
-                }
-                q = cmd_end;
-            }
-        }
+        size_t n = (size_t)(line_end - line);
+        if (n > sizeof sensitivity - 1 && !strncmp(line, sensitivity, sizeof sensitivity - 1)) changed += set_field(line, line_end, sensitivity, "7.5");
+        else if (n > sizeof smoothing - 1 && !strncmp(line, smoothing, sizeof smoothing - 1)) changed += set_field(line, line_end, smoothing, "0");
+        else if (memmem(line, n, "XboxTypeS_RightX", 16) || memmem(line, n, "XboxTypeS_RightY", 16)) changed += right_stick_restore(line, line_end);
         line = line_end + 1;
     }
     return changed;
 }
+static int is_input_ini(const char *path) {
+    size_t n = strlen(path);
+    return n > 9 && !strcmp(path + n - 9, "Input.ini");
+}
 // The rewritten text in a file of its own, already unlinked, for open() to hand the engine; -1 for any other file, or one with nothing to change.
 static int input_ini_file(const char *path) {
-    static const char tail[] = "Input.ini";
-    size_t n = strlen(path), t = sizeof tail - 1;
-    if (n < t || strcmp(path + n - t, tail)) return -1;
+    if (!is_input_ini(path)) return -1;
     int in = open(path, O_RDONLY);
     if (in < 0) return -1;
     struct stat st;
@@ -765,7 +926,7 @@ static int input_ini_file(const char *path) {
         got += (size_t)r;
     }
     close(in);
-    int changed = got == size && stick_mouse_speed() > 0 ? right_stick_rewrite(text, size) : 0;
+    int changed = got == size ? input_rewrite(text, size) : 0;
     int fd = -1;
     if (changed) {
         const char *dir = getenv("TMPDIR");
@@ -781,8 +942,7 @@ static int input_ini_file(const char *path) {
         }
         static int told;
         if (fd >= 0 && told++ < 8)
-            fprintf(stderr, "[input] the engine reads %s with the right stick on the mouse's axes at %g a frame, mouse smoothing off\n",
-                    strrchr(path, '/') ? strrchr(path, '/') + 1 : path, stick_mouse_speed());
+            fprintf(stderr, "[input] the engine reads %s with %d settings changed for the touch camera\n", strrchr(path, '/') ? strrchr(path, '/') + 1 : path, changed);
     }
     free(text);
     return fd;
@@ -825,8 +985,7 @@ SHIM(fopen) {
     FILE *f = language_ini(GS(ARG(0)), GS(ARG(1)));
 #if !TARGET_OS_IPHONE
     // As in open() below: an experiment's input settings aren't written back into the Mac's game.
-    size_t pl = strlen(GS(ARG(0)));
-    if (!f && GS(ARG(1))[0] != 'r' && stick_mouse_speed() > 0 && pl > 9 && !strcmp(GS(ARG(0)) + pl - 9, "Input.ini")) {
+    if (!f && GS(ARG(1))[0] != 'r' && input_rewrites() && is_input_ini(GS(ARG(0)))) {
         f = fopen("/dev/null", GS(ARG(1)));
         fprintf(stderr, "[input] the engine's write of %s goes nowhere during this experiment\n", GS(ARG(0)));
     }
@@ -894,10 +1053,10 @@ static int language_file(const char *path) {
 SHIM(open) {
     int fd = language_file(GS(ARG(0)));
     CIBUF(0);
-    if (fd < 0 && ((int)ARG(1) & O_ACCMODE) == O_RDONLY && stick_mouse_speed() > 0) fd = input_ini_file(CIP(0));
+    if (fd < 0 && ((int)ARG(1) & O_ACCMODE) == O_RDONLY && input_rewrites()) fd = input_ini_file(CIP(0));
 #if !TARGET_OS_IPHONE
     // An experiment on the Mac mustn't leave its input settings in the Mac's game: what the engine writes back to them goes nowhere.
-    if (fd < 0 && ((int)ARG(1) & O_ACCMODE) != O_RDONLY && stick_mouse_speed() > 0 && strlen(GS(ARG(0))) > 9 && !strcmp(GS(ARG(0)) + strlen(GS(ARG(0))) - 9, "Input.ini")) {
+    if (fd < 0 && ((int)ARG(1) & O_ACCMODE) != O_RDONLY && input_rewrites() && is_input_ini(GS(ARG(0)))) {
         fd = open("/dev/null", O_WRONLY);
         fprintf(stderr, "[input] the engine's write of %s goes nowhere during this experiment\n", GS(ARG(0)));
     }
