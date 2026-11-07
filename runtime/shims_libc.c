@@ -842,6 +842,8 @@ extern int rt_no_frame_limit;
 //   and not that of one a little longer, so the same swipe turned by different amounts.
 // - The right stick's lines as the game has them, where controls v5 and v6 of this port (docs/IOS_PORT.md) had put them on the mouse's axes and
 //   the engine had written that back into BmInput.ini.
+// - And in the camera's settings (BmCamera.ini and the files it's based on), the game's camera assist as the phone's settings say (ARKHAM_CAMERA_ASSIST,
+//   off unless set): with a pad, and the touch camera is one to the engine, it turns the camera behind Batman as he runs, over what a swipe turns.
 // ARKHAM_TOUCH_MOUSE_INI=1 does the same on the Mac, for scripted runs, and then the engine's writes of those files go nowhere, so that the Mac's
 // game keeps its own settings.
 // The text keeps its length, since the engine may take the size from stat(), and values are set, not multiplied, since the engine writes what it read
@@ -908,13 +910,16 @@ static int right_stick_restore(char *line, char *line_end) {
 static int input_rewrite(char *text, size_t len) {
     int changed = 0;
     char *end_all = text + len;
-    static const char sensitivity[] = "MouseSensitivity=", smoothing[] = "bEnableMouseSmoothing=";
+    static const char sensitivity[] = "MouseSensitivity=", smoothing[] = "bEnableMouseSmoothing=", assist[] = "EnableCameraAssist=";
+    const char *assist_on = getenv("ARKHAM_CAMERA_ASSIST");
     for (char *line = text; line < end_all;) {
         char *nl = memchr(line, '\n', (size_t)(end_all - line));
         char *line_end = nl ? nl : end_all;
         size_t n = (size_t)(line_end - line);
         if (n > sizeof sensitivity - 1 && !strncmp(line, sensitivity, sizeof sensitivity - 1)) changed += set_field(line, line_end, sensitivity, "7.5");
         else if (n > sizeof smoothing - 1 && !strncmp(line, smoothing, sizeof smoothing - 1)) changed += set_field(line, line_end, smoothing, "0");
+        else if (n > sizeof assist - 1 && !strncmp(line, assist, sizeof assist - 1))
+            changed += set_field(line, line_end, assist, assist_on && *assist_on == '1' ? "1" : "0");
         else if (memmem(line, n, "XboxTypeS_RightX", 16) || memmem(line, n, "XboxTypeS_RightY", 16)) changed += right_stick_restore(line, line_end);
         line = line_end + 1;
     }
@@ -922,7 +927,7 @@ static int input_rewrite(char *text, size_t len) {
 }
 static int is_input_ini(const char *path) {
     size_t n = strlen(path);
-    return n > 9 && !strcmp(path + n - 9, "Input.ini");
+    return (n > 9 && !strcmp(path + n - 9, "Input.ini")) || (n > 10 && !strcmp(path + n - 10, "Camera.ini"));
 }
 // The rewritten text in a file of its own, already unlinked, for open() to hand the engine; -1 for any other file, or one with nothing to change.
 static int input_ini_file(const char *path) {
@@ -958,7 +963,8 @@ static int input_ini_file(const char *path) {
         }
         static int told;
         if (fd >= 0 && told++ < 8)
-            fprintf(stderr, "[input] the engine reads %s with %d settings changed for the touch camera\n", strrchr(path, '/') ? strrchr(path, '/') + 1 : path, changed);
+            fprintf(stderr, "[input] the engine reads %s with %d settings changed for the touch camera%s\n", strrchr(path, '/') ? strrchr(path, '/') + 1 : path, changed,
+                    strstr(path, "Camera.ini") ? (getenv("ARKHAM_CAMERA_ASSIST") && *getenv("ARKHAM_CAMERA_ASSIST") == '1' ? ", camera assist on" : ", camera assist off") : "");
     }
     free(text);
     return fd;

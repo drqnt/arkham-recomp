@@ -8,8 +8,10 @@
 #define UNW_LOCAL_ONLY
 #include <libunwind.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 extern const unsigned rt_eh_frame_addr, rt_eh_frame_size;
 u32 rt_find_base(u32 ti, u32 obj, u32 dst);
@@ -414,6 +416,18 @@ static u32 function_identity(u32 guest) {
 typedef struct Run { struct Run *prev; unw_cursor_t resume; } Run;
 static __thread Run *run_top;
 
+// What throwing costs, in the log every 5 s while the game throws: how many, the time finding the handler in the game's own tables (phase 1) and the
+// time finding its native frame with libunwind, with the number of steps that took.
+static _Atomic u64 eh_throws, eh_steps, eh_ns_find, eh_ns_native;
+static void eh_report(void) {
+    static _Atomic u64 last_ns, told;
+    u64 now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), n = atomic_load(&eh_throws);
+    if (now - atomic_load(&last_ns) < 5000000000ull || n == atomic_load(&told)) return;
+    atomic_store(&last_ns, now);
+    atomic_store(&told, n);
+    fprintf(stderr, "[eh] %llu throws so far: %.0f ms finding handlers, %.0f ms finding their native frames in %llu steps\n", n,
+            (double)atomic_load(&eh_ns_find) / 1e6, (double)atomic_load(&eh_ns_native) / 1e6, atomic_load(&eh_steps));
+}
 // Native frames mirror guest frames, so the k-th native frame of the handler's function is the handler's frame.
 static int find_native_caller(unw_cursor_t *out, u32 identity, int occurrence) {
     unw_context_t uc;
@@ -423,6 +437,7 @@ static int find_native_caller(unw_cursor_t *out, u32 identity, int occurrence) {
     Run *r = run_top;
     int seen = 0;
     while (unw_step(&cur) > 0) {
+        atomic_fetch_add(&eh_steps, 1);
         unw_word_t sp = 0, ip = 0;
         unw_get_reg(&cur, UNW_REG_SP, &sp);
         if (r && sp > (uintptr_t)r) {
@@ -507,6 +522,7 @@ static void raise_exception(CPU *c, Exc *e) {
     e->frame = 0;
     e->have_handler = 0;
     uncaught++;
+    u64 t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     // Phase 1: find the handler without changing anything.
     Ctx x = top;
     int frame = 0;
@@ -538,7 +554,13 @@ static void raise_exception(CPU *c, Exc *e) {
     int occurrence = 0;
     for (int i = 0; i <= e->handler_frame && i < 4096; i++)
         if (identity_of_frame[i] == e->handler_begin) occurrence++;
+    u64 t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (!find_native_caller(&e->resume, e->handler_begin, occurrence)) rt_trap(c, top.r[R_EIP], "no native frame for handler");
+    u64 t2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    atomic_fetch_add(&eh_throws, 1);
+    atomic_fetch_add(&eh_ns_find, t1 - t0);
+    atomic_fetch_add(&eh_ns_native, t2 - t1);
+    eh_report();
     phase2(c, e);
 }
 

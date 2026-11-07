@@ -1273,6 +1273,8 @@ static UIView *gear_view;
     look_value = [self slider:@"Скорость камеры" min:0.25 max:3.0 value:setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) action:@selector(lookChanged:)];
     [self toggle:@"Инвертировать вверх-вниз" on:setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 action:@selector(invertChanged:)];
     [self toggle:@"Бег: стик за край" on:setting(@"autoRun", "ARKHAM_TOUCH_RUN", 1) > 0 action:@selector(runChanged:)];
+    [self section:@"Камера игры" footer:@"Помощь камеры — сама разворачивает камеру за спину Бэтмена на бегу. С сенсорной камерой она мешает поворачивать на бегу, с геймпадом может быть удобна. Меняется со следующего запуска игры."];
+    [self toggle:@"Помощь камеры" on:setting(@"cameraAssist", "ARKHAM_CAMERA_ASSIST", 0) > 0 action:@selector(assistChanged:)];
     [self showValues];
     return self;
 }
@@ -1316,6 +1318,7 @@ static UIView *gear_view;
 }
 - (void)invertChanged:(UISwitch *)s { set_setting(@"invertLook", s.on); }
 - (void)runChanged:(UISwitch *)s { set_setting(@"autoRun", s.on); }
+- (void)assistChanged:(UISwitch *)s { set_setting(@"cameraAssist", s.on); }
 - (void)hideChanged:(UISwitch *)s { set_setting(@"hideInMenus", s.on); }
 - (void)fpsLineChanged:(UISwitch *)s {
     set_setting(@"showFPS", s.on);
@@ -1367,6 +1370,8 @@ static void update_visibility(void) {
 }
 // What the settings say, applied once at start: the frame rate limit, the HUD and the frame rate line.
 void rt_ios_apply_settings(void) {
+    // Read by the engine at its start, from its camera settings (shims_libc.c): this game's camera assist.
+    setenv("ARKHAM_CAMERA_ASSIST", setting(@"cameraAssist", "ARKHAM_CAMERA_ASSIST", 0) > 0 ? "1" : "0", 1);
     rt_set_fps_cap(setting(@"fpsCap", "ARKHAM_FPS_CAP", 0));
     rt_set_async_pipelines(setting(@"asyncPipelines", "ARKHAM_ASYNC_PIPELINES", 1) > 0);
     rt_set_metal_hud(setting(@"metalHUD", "ARKHAM_METAL_HUD", 0) > 0);

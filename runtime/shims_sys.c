@@ -300,9 +300,10 @@ static u32 mouse_skip_counter(CPU *c) {
 // On the phone the touch camera's motion therefore never goes through the pointer: at the loop's reading of it, the runtime calls the engine's
 // InputAxis itself, with what the loop would pass (its viewport client, window and frame time, the names MouseX and MouseY) and marked as from a pad,
 // and the pointer stays where the game put it. Then the camera turns through the game's own mouse bindings and sensitivity, walking or not.
-// ARKHAM_MOUSE_AS_PAD=1, for the Mac's own mouse, marks the loop's two calls as from a pad instead: the engine's InputAxis, a virtual function of the
-// viewport client, is called through the dispatcher, so a host function in front of it at that address sees each call and changes the last argument
-// (bGamepad) of only those two, known by where they return to. That fixes the engine's half only.
+// The loop's own two calls are marked as from a pad too, on the phone, and on the Mac with ARKHAM_MOUSE_AS_PAD=1: the engine's InputAxis, a virtual
+// function of the viewport client, is called through the dispatcher, so a host function in front of it at that address sees each call and changes the
+// last argument (bGamepad) of only those two, known by where they return to. On the phone that's for the menus, where a tap moves the pointer: marked
+// so, the engine stays with the pad and the menus don't show their mouse cursor (ARKHAM_MOUSE_NOT_PAD=1 leaves them unmarked).
 guest_fn rt_guest_fn(u32 addr);           // rt.c: the translated function at a guest address
 void rt_ht_add(u32 addr, guest_fn fn);  // rt.c: a host function in front of it for calls through the dispatcher
 static guest_fn input_axis_orig;
@@ -315,7 +316,11 @@ static void input_axis_as_pad(CPU *c) {
 }
 static int mouse_as_pad(void) {
     static int on = -1;
+#if TARGET_OS_IPHONE
+    if (on < 0) on = !getenv("ARKHAM_MOUSE_NOT_PAD");
+#else
     if (on < 0) on = getenv("ARKHAM_MOUSE_AS_PAD") != NULL;
+#endif
     return on;
 }
 static void install_mouse_as_pad(u32 bp2) {
@@ -345,7 +350,7 @@ static void touch_mouse_to_engine(CPU *c, u32 bp2, double dx, double dy) {
         return;
     }
     const u32 names[2] = {G32(base + 0x1aaf027u), G32(base + 0x1aaf02bu)};
-    const double d[2] = {dx, dy};
+    const double d[2] = {dx, -dy};  // as F_0048c10 gives them: right and up positive, the pointer's y growing downwards
     for (int k = 0; k < 2; k++) {
         if (d[k] == 0 || !names[k]) continue;
         float f = (float)d[k];
