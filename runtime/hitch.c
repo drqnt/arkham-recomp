@@ -265,7 +265,7 @@ static void stall_check(u64 frame) {
 }
 // ARKHAM_TRACE_PROFILE=s: every s seconds, half a second of samples of every thread, waiting or not, and where each one was most often: in steady play,
 // what a thread waits for is what holds the frame rate.
-static u64 profile_ticks, profile_last;
+static u64 profile_ticks, profile_last, profile_until;  // ARKHAM_TRACE_PROFILE_FOR=s: only for the first s seconds, as for a startup
 static void describe_full(const Track *tr, u32 s, char *out, size_t cap) {
     size_t len = 0;
     int shown = 0;
@@ -278,6 +278,11 @@ static void describe_full(const Track *tr, u32 s, char *out, size_t cap) {
 }
 static void profile_check(void) {
     u64 now = mach_absolute_time();
+    if (profile_until && now > profile_until) {
+        profile_ticks = 0;
+        fprintf(stderr, "[profile] done\n");
+        return;
+    }
     if (now - profile_last < profile_ticks) return;
     profile_last = now;
     refresh_threads();
@@ -371,6 +376,8 @@ void rt_hitch_start(void) {
         mach_timebase_info(&tb);
         profile_ticks = (u64)(atof(prof) * 1e9 * tb.denom / tb.numer);
         profile_last = mach_absolute_time();
+        const char *for_s = getenv("ARKHAM_TRACE_PROFILE_FOR");
+        if (for_s && atof(for_s) > 0) profile_until = profile_last + (u64)(atof(for_s) * 1e9 * tb.denom / tb.numer);
     }
     if (!tracks_for_late && !stall_ticks && !profile_ticks) return;
     tracks = calloc(MAX_THREADS, sizeof *tracks);

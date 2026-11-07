@@ -297,3 +297,33 @@ app goes to the background.
 - **The slow seconds after the first cutscene** in the v6 log: about 8 s at 15 FPS with frames 75 ms apart. The engine's game thread
   (1dab9d0) took about 67 ms of CPU a frame, while the render thread and the GPU were mostly idle. New packages coming in look for their
   localization the same way, so this is likely the same cost. Not confirmed yet: the next phone log shows it.
+
+## Controls v8: the touch camera straight to the engine; opacity and the Metal HUD switch fixed, 2026-11-07
+
+- **v7 on the phone:** standing still, the camera felt right; walking, it hardly turned. The cutscene-to-play lag was gone, and the first picture
+  came at 8.2 s instead of 18.7 s (sound at 5.5 s instead of 15.6 s).
+- **Why walking still dropped it:** Feral's input loop reads the pointer, then handles its queue of events, and only then checks the counter
+  at window+0x4d4: while it's above zero the motion is thrown away and the counter goes down by one. A pad's stick events raise it. The scripted
+  Mac test held the stick still, so there were no events; a thumb on the touch stick is never quite still. The v7 hook fixed only the engine's
+  half (the calls marked as not from a pad).
+- **Now:** at the loop's reading of the pointer (HIGetMousePosition called from F_0048c10 from F_19deea0), the runtime calls the engine's
+  InputAxis itself (`touch_mouse_to_engine`, `shims_sys.c`) with what the loop would pass, and marks the calls as from a pad:
+  - the loop's viewport client `[ebp-0xc0]`;
+  - its window `[ebp-0xc8]`, with the viewport 4 bytes in;
+  - the frame's time `[ebp+0xc]`;
+  - the names MouseX and MouseY from its globals (`[ebp-0xbc]` = 0x19deeb1, +0x1aaf027 and +0x1aaf02b).
+
+  The pointer stays where the game put it, so the loop sees no motion and its counter doesn't matter. Fractions of a pixel go through as they are.
+  Motion the game hasn't taken for 250 ms is dropped. The log has a `[mouse] touch camera` line every 10 s. `ARKHAM_MOUSE_AS_PAD` is now only for
+  the Mac's own mouse.
+- **"Заметность"** set only 70% to 100% of the icons' alpha, so the slider seemed to do nothing. It is now the whole button's opacity, all of it
+  while pressed, the stick's too, with a default of 80%.
+- **The Metal HUD switch** had no effect: `developerHUDProperties` only shows and hides the HUD in a process it was enabled for from the launch.
+  The switch's state now decides that at launch (`MTL_HUD_ENABLED` and Metal's `MetalForceHudEnabled` default). Then the switch shows and hides
+  it live. Turned on in a game started without it, it says the HUD comes at the next launch.
+- **Path lookups** remembered in v7 were each checked with a `stat` of their folder, about 0.8 s of the startup on the phone. Now a check happens only
+  after the game made, renamed or removed a name through the shims (open with O_CREAT, fopen for writing, mkdir, rmdir, unlink, remove, rename),
+  or after 2 s, for files made some other way. The case-sensitive image test covers both.
+- **What's left of the black screen** (v7 log): engine start to sound 4.2 s (Mac 2.6 s); the back buffer to the first frame 2.6 s (Mac 0.3 s);
+  then about 3.8 s of black frames before the logo film, the same on the Mac. `ARKHAM_TRACE_PROFILE=0.5 ARKHAM_TRACE_PROFILE_FOR=13` samples
+  every thread for only the first 13 s.

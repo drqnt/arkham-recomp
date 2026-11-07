@@ -12,6 +12,7 @@
 #include <mach/mach_time.h>
 #include <mach-o/dyld.h>
 #include <os/lock.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -663,11 +664,18 @@ typedef struct Memo {
     char *check;         // the folder the answer was found in, or the deepest one there was
     struct timespec mtime;
     int exists;
+    unsigned gen;        // ci_gen when that folder was last seen unchanged
+    u64 checked_ms;      // and when
 } Memo;
 enum { MEMO_BUCKETS = 1 << 14, MEMO_MAX = 1 << 16 };
 static Memo *memo[MEMO_BUCKETS];
 static unsigned memo_n;
 static u64 ci_lookups, ci_remembered, ci_found, ci_ns;
+// The game making, renaming or removing a name, through the shims below: what's remembered is checked against its folder again before it's used.
+// Otherwise that happens at most every 2 s, for names made some other way: one stat() for each folder, not one for each of thousands of lookups.
+static _Atomic unsigned ci_gen;
+static void ci_changed(void) { atomic_fetch_add(&ci_gen, 1); }
+static u64 ci_now_ms(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000; }
 static u64 path_hash(const char *s) {
     u64 h = 1469598103934665603ull;
     for (; *s; s++) h = (h ^ (u8)*s) * 1099511628211ull;
@@ -701,6 +709,8 @@ static void memo_put(const char *asked, u64 h, const char *real, int exists, con
     m->exists = exists;
     m->check = strdup(check);
     m->mtime = mtime;
+    m->gen = atomic_load(&ci_gen);
+    m->checked_ms = ci_now_ms();
 }
 // An absolute path as it is on the disk, into real (PATH_MAX), and whether it's there; with dir_mu held. Through what's remembered for it, if its
 // folder hasn't changed since; else its folder the same way, and then its last name in that folder, as asked or in any case.
@@ -709,7 +719,13 @@ static int resolve(const char *path, char *real, char *check, struct timespec *m
     u64 h = path_hash(path);
     for (Memo *m = memo[h & (MEMO_BUCKETS - 1)]; m; m = m->next) {
         if (m->hash != h || strcmp(m->asked, path)) continue;
-        if (stat(m->check, &st) || st.st_mtimespec.tv_sec != m->mtime.tv_sec || st.st_mtimespec.tv_nsec != m->mtime.tv_nsec) break;
+        unsigned g = atomic_load(&ci_gen);
+        u64 now = ci_now_ms();
+        if (m->gen != g || now - m->checked_ms > 2000) {
+            if (stat(m->check, &st) || st.st_mtimespec.tv_sec != m->mtime.tv_sec || st.st_mtimespec.tv_nsec != m->mtime.tv_nsec) break;
+            m->gen = g;
+            m->checked_ms = now;
+        }
         snprintf(real, PATH_MAX, "%s", m->real ? m->real : path);
         snprintf(check, PATH_MAX, "%s", m->check);
         *mtime = m->mtime;
@@ -991,7 +1007,10 @@ SHIM(fopen) {
     }
 #endif
     CIBUF(0);
-    if (!f) f = fopen(CIP(0), GS(ARG(1)));
+    if (!f) {
+        f = fopen(CIP(0), GS(ARG(1)));
+        if (f && GS(ARG(1))[0] != 'r') ci_changed();  // "w" and "a" make the file if it isn't there
+    }
     if (!f) set_errno();
     if (trace_fs_early()) fprintf(stderr, "[fs] fopen %s %s -> %d\n", GS(ARG(0)), GS(ARG(1)), f != NULL);
     RET(rt_handle_new(f));
@@ -1061,7 +1080,10 @@ SHIM(open) {
         fprintf(stderr, "[input] the engine's write of %s goes nowhere during this experiment\n", GS(ARG(0)));
     }
 #endif
-    if (fd < 0) fd = open(CIP(0), (int)ARG(1), (int)ARG(2));
+    if (fd < 0) {
+        fd = open(CIP(0), (int)ARG(1), (int)ARG(2));
+        if (fd >= 0 && ((int)ARG(1) & O_CREAT)) ci_changed();
+    }
     if (fd < 0) set_errno();
     TFS("open", GS(ARG(0)), fd);
     RET(fd);
@@ -1081,11 +1103,11 @@ SHIM(pread) {
 SHIM(pwrite) { ssize_t r = pwrite((int)ARG(0), GS(ARG(1)), ARG(2), (off_t)ARGQ(3)); if (r < 0) set_errno(); RET((i32)r); }
 SHIM(lseek) { off_t r = lseek((int)ARG(0), (off_t)ARGQ(1), (int)ARG(3)); if (r < 0) set_errno(); RET64(r); }
 SHIM(access) { CIBUF(0); int r = access(CIP(0), (int)ARG(1)); if (r) set_errno(); TFS("access", GS(ARG(0)), r); RET(r); }
-SHIM(mkdir) { CIBUF(0); int r = mkdir(CIP(0), (mode_t)ARG(1)); if (r) set_errno(); RET(r); }
-SHIM(rmdir) { CIBUF(0); RET(rmdir(CIP(0))); }
-SHIM(unlink) { CIBUF(0); RET(unlink(CIP(0))); }
-SHIM(remove) { CIBUF(0); RET(remove(CIP(0))); }
-SHIM(rename) { CIBUF(0); CIBUF(1); RET(rename(CIP(0), CIP(1))); }
+SHIM(mkdir) { CIBUF(0); int r = mkdir(CIP(0), (mode_t)ARG(1)); if (r) set_errno(); else ci_changed(); RET(r); }
+SHIM(rmdir) { CIBUF(0); int r = rmdir(CIP(0)); if (!r) ci_changed(); RET(r); }
+SHIM(unlink) { CIBUF(0); int r = unlink(CIP(0)); if (!r) ci_changed(); RET(r); }
+SHIM(remove) { CIBUF(0); int r = remove(CIP(0)); if (!r) ci_changed(); RET(r); }
+SHIM(rename) { CIBUF(0); CIBUF(1); int r = rename(CIP(0), CIP(1)); if (!r) ci_changed(); RET(r); }
 SHIM(chmod) { CIBUF(0); RET(chmod(CIP(0), (mode_t)ARG(1))); }
 SHIM(ftruncate) { RET(ftruncate((int)ARG(0), (off_t)ARGQ(1))); }
 SHIM(truncate) { CIBUF(0); RET(truncate(CIP(0), (off_t)ARGQ(1))); }

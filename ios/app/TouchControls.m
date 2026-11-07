@@ -38,6 +38,7 @@ void rt_ios_click(double share_x, double share_y);
 void rt_ios_park_cursor(void);
 void rt_set_fps_cap(double n);
 void rt_set_metal_hud(int on);
+extern int rt_ios_hud_at_launch;  // main.m: whether Apple's HUD was on for this process from its launch, which it needs to show at all
 void rt_set_async_pipelines(int on);  // mtl_device.m: new pipelines built off the game's thread
 void rt_ios_overlay_enable(int on);  // main.m: the frame rate line
 void rt_ios_overlay_hidden(int hidden);
@@ -545,23 +546,30 @@ static void open_settings(void);
 }
 // A grey from white (ink 0) to black (ink 1).
 static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithWhite:1 - ink alpha:alpha]; }
+// How much of a button shows: the settings' "Заметность" as the whole button's opacity, all of it while pressed, and the close button never faint.
+- (CGFloat)opacityOf:(PadButton *)b {
+    if (self.editing) return b.hiddenByPlayer ? 0.35 : 1;
+    CGFloat o = setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.8);
+    if (b == close_button) o = MAX(0.7, o);
+    return b.holders > 0 ? MAX(o, 0.95) : o;
+}
 - (void)colorButton:(PadButton *)b {
-    CGFloat o = b == close_button ? MAX(0.7, setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.6)) : setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.6);
     BOOL down = b.holders > 0;
     float ink = b.ink;
     BOOL lit = b.def->control == C_RT && b.kind == KIND_BAT;  // R2 while aiming: lit up, to show where to throw
-    UIColor *fg = ink_color(ink, down ? 1 : 0.62 + 0.38 * o);
-    b.back.fillColor = (down ? ink_color(ink, 0.55) : ink_color(1 - ink, 0.16 + 0.34 * o)).CGColor;
+    UIColor *fg = ink_color(ink, 1);
+    b.group.opacity = [self opacityOf:b];
+    b.back.fillColor = (down ? ink_color(ink, 0.55) : ink_color(1 - ink, 0.5)).CGColor;
     b.back.strokeColor = (self.editing && b.hiddenByPlayer ? rgb(0xE86A6A, 0.95)
                           : lit                          ? rgb(0x7FB2E5, 1)
-                                                         : ink_color(ink, self.editing ? 0.9 : 0.38 + 0.5 * o)).CGColor;
+                                                         : ink_color(ink, 0.9)).CGColor;
     if (lit) b.back.lineWidth = MAX(3, b.radius * 0.09);
     switch (b.kind) {
         case KIND_PS_SHAPE:
             b.symbol.fillColor = UIColor.clearColor.CGColor;
-            b.symbol.strokeColor = rgb(b.tint, down ? 1 : 0.7 + 0.3 * o).CGColor;
+            b.symbol.strokeColor = rgb(b.tint, 1).CGColor;
             break;
-        case KIND_TEXT: b.text.foregroundColor = (b.tint ? rgb(b.tint, down ? 1 : 0.7 + 0.3 * o) : fg).CGColor; break;
+        case KIND_TEXT: b.text.foregroundColor = (b.tint ? rgb(b.tint, 1) : fg).CGColor; break;
         case KIND_ICON: b.icon.backgroundColor = fg.CGColor; break;
         case KIND_BAT:
             b.symbol.fillColor = (lit ? rgb(0x7FB2E5, 1) : fg).CGColor;
@@ -584,7 +592,7 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
             b.holders = 0;
             continue;
         }
-        b.group.opacity = self.editing && b.hiddenByPlayer ? 0.35 : 1;
+        b.group.opacity = [self opacityOf:b];
         [self drawButton:b style:style];
         [self colorButton:b];
     }
@@ -624,10 +632,12 @@ static float ink_for(float luma) {
     [CATransaction commit];
 }
 - (void)colorStick {
-    CGFloat o = setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.6);
-    stick_base.fillColor = ink_color(1 - stick_ink, 0.14 + 0.3 * o).CGColor;
-    stick_base.strokeColor = ink_color(stick_ink, 0.4 + 0.45 * o).CGColor;
-    stick_knob.fillColor = (running ? rgb(0x7FB2E5, 0.85) : ink_color(stick_ink, 0.45 + 0.4 * o)).CGColor;
+    CGFloat o = setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.8);
+    stick_base.opacity = (float)o;
+    stick_knob.opacity = (float)MAX(o, 0.9);  // the thumb's own place always shows
+    stick_base.fillColor = ink_color(1 - stick_ink, 0.44).CGColor;
+    stick_base.strokeColor = ink_color(stick_ink, 0.85).CGColor;
+    stick_knob.fillColor = (running ? rgb(0x7FB2E5, 0.85) : ink_color(stick_ink, 0.75)).CGColor;
 }
 
 - (PadButton *)buttonAt:(CGPoint)p {
@@ -1254,7 +1264,7 @@ static UIView *gear_view;
     [self section:@"Кнопки" footer:@"Кнопки светлеют над тёмной картинкой и темнеют над светлой. Глаз в углу прячет их все для скриншота; вернуть — коснуться экрана."];
     [self choice:@"Вид" items:@[@"PlayStation", @"Xbox", @"Иконки"] value:(NSInteger)setting(@"buttonStyle", "ARKHAM_TOUCH_STYLE", STYLE_PS) action:@selector(styleChanged:)];
     size_value = [self slider:@"Размер" min:0.7 max:1.5 value:setting(@"buttonScale", "ARKHAM_TOUCH_SIZE", 1.0) action:@selector(sizeChanged:)];
-    opacity_value = [self slider:@"Заметность" min:0.2 max:1.0 value:setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.6) action:@selector(opacityChanged:)];
+    opacity_value = [self slider:@"Заметность" min:0.2 max:1.0 value:setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.8) action:@selector(opacityChanged:)];
     [self toggle:@"Прятать вне игры" on:setting(@"hideInMenus", "ARKHAM_TOUCH_HIDE", 1) > 0 action:@selector(hideChanged:)];
     [self action:@"Расположение кнопок" selector:@selector(editLayout)];
 
@@ -1267,7 +1277,7 @@ static UIView *gear_view;
 }
 - (void)showValues {
     size_value.text = [NSString stringWithFormat:@"%.0f %%", setting(@"buttonScale", "ARKHAM_TOUCH_SIZE", 1.0) * 100];
-    opacity_value.text = [NSString stringWithFormat:@"%.0f %%", setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.6) * 100];
+    opacity_value.text = [NSString stringWithFormat:@"%.0f %%", setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.8) * 100];
     look_value.text = [NSString stringWithFormat:@"%.0f° на экран", setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT * 951];
 }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)t { return (NSInteger)rows.count; }
@@ -1312,7 +1322,15 @@ static UIView *gear_view;
 }
 - (void)hudChanged:(UISwitch *)s {
     set_setting(@"metalHUD", s.on);
+    [prefs() setBool:s.on forKey:@"MetalForceHudEnabled"];  // Metal's own key: the HUD on from the next launch
     rt_set_metal_hud(s.on);
+    if (s.on && !rt_ios_hud_at_launch) {
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Metal HUD"
+                                                                   message:@"Появится со следующего запуска игры: iOS показывает его только в приложении, где он был включён с самого старта."
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+    }
 }
 - (void)asyncChanged:(UISwitch *)s {
     set_setting(@"asyncPipelines", s.on);

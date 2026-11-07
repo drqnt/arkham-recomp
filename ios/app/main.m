@@ -27,6 +27,7 @@ int rt_main(int argc, char **argv);
 static NSString *documents(void) { return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject; }
 
 // ---------- settings ----------
+int rt_ios_hud_at_launch;  // Apple's Metal HUD on for this process from its start (see the end of settings)
 // The phone's defaults, then Documents/arkham.env over them.
 static void settings(void) {
     setenv("ARKHAM_STUB_ALL", "1", 0);   // as tools/run.sh: imports without a shim answer 0, listed in the log as [stub]
@@ -43,8 +44,14 @@ static void settings(void) {
         v = [v stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"\"' "]];
         setenv(k.UTF8String, v.UTF8String, 1);
     }
-    // ARKHAM_METAL_HUD is only what the settings' switch starts as (TouchControls.m), which then turns the HUD on the game's layer (mtl_device.m).
-    // Metal's own MTL_HUD_ENABLED would show it whatever the switch said, so it isn't set.
+    // Apple's Metal HUD shows only in a process it was on for from the launch; the layer's own properties then show and hide it (mtl_device.m), and
+    // the settings' switch does that (TouchControls.m). So the switch's state, or ARKHAM_METAL_HUD before it was ever touched, decides here whether
+    // this process gets it, and Metal's own key in the defaults keeps that for the next launch too.
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    const char *env_hud = getenv("ARKHAM_METAL_HUD");
+    rt_ios_hud_at_launch = [d objectForKey:@"metalHUD"] ? [d doubleForKey:@"metalHUD"] > 0 : env_hud && *env_hud == '1';
+    [d setBool:rt_ios_hud_at_launch forKey:@"MetalForceHudEnabled"];
+    if (rt_ios_hud_at_launch) setenv("MTL_HUD_ENABLED", "1", 1);
 }
 
 // ---------- the log ----------

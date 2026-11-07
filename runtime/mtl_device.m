@@ -2870,7 +2870,7 @@ void rt_set_metal_hud(int on) {
 #if TARGET_OS_IPHONE
     dispatch_async(dispatch_get_main_queue(), ^{
         if (layer) {
-            if (@available(iOS 16.0, *)) layer.developerHUDProperties = on ? @{@"mode": @"default", @"logging": @"default"} : @{@"mode": @"off"};
+            if (@available(iOS 16.0, *)) layer.developerHUDProperties = on ? @{@"mode": @"default", @"logging": @"default"} : @{};  // no mode: hidden
         }
     });
 #endif

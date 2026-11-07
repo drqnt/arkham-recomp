@@ -219,12 +219,14 @@ static void cap_setup(void) {
 }
 #endif
 
-// The phone's camera swipes (ios/app/TouchControls.m) as the pointer's motion, in pixels, the way a Mac's mouse turns the camera: while the game holds
-// the cursor, what's added here is what it reads next through HIGetMousePosition. The game's own mouse bindings, smoothing and sensitivity then turn
-// it, and walking doesn't stop it (input_axis_as_pad).
+// The phone's camera swipes (ios/app/TouchControls.m) as a mouse's motion, in pixels: while the game holds the cursor, what's added here goes to the
+// engine at the next frame's reading of the pointer (touch_mouse_to_engine, below). Motion the game hasn't taken for a quarter of a second, as in a
+// film or a menu that still warps, is dropped rather than turned all at once later.
+static u64 cap_taken_ms;
 void rt_touch_mouse(double dx, double dy) {
     pthread_mutex_lock(&cap_mu);
     if (cap_active) {
+        if (now_ms() - cap_taken_ms > 250) cap_dx = cap_dy = 0;
         cap_dx += dx;
         cap_dy += dy;
     }
@@ -291,12 +293,16 @@ static u32 mouse_skip_counter(CPU *c) {
     u32 window = bp2 > 0x1000 ? G32(bp2 - 0xc8) : 0;
     return window ? window + 0x4d4 : 0;
 }
-// The game drops the pointer's motion while a pad's stick is held (walking holds one): Feral's input loop (F_19deea0) hands it to the engine as the
-// MouseX and MouseY axes, marked as not from a pad, and the engine ignores those while a pad is in use. On the phone, where the pointer is the
-// touch camera (rt_touch_mouse below), those two calls are marked as from a pad instead: the engine's own InputAxis, a virtual function of the
-// viewport client, is called through the dispatcher, so a host function in front of it at that address sees each call, and changes the last argument
-// (bGamepad) of only those two, known by where they return to. Then the camera turns as the mouse turns it, walking or not, through the game's own
-// mouse bindings and smoothing. ARKHAM_MOUSE_AS_PAD=1 does the same on the Mac, for scripted runs.
+// The game drops the pointer's motion while a pad is in use, twice over. Feral's input loop (F_19deea0) hands the motion to the engine as the MouseX
+// and MouseY axes, marked as not from a pad, and the engine ignores those while a pad is in use. And before that, the loop throws the motion away
+// while the counter above is raised, which every event of a pad's stick does (they're handled inside the loop, after the pointer is read), so a thumb
+// on the touch controls' stick, never quite still, kept it raised.
+// On the phone the touch camera's motion therefore never goes through the pointer: at the loop's reading of it, the runtime calls the engine's
+// InputAxis itself, with what the loop would pass (its viewport client, window and frame time, the names MouseX and MouseY) and marked as from a pad,
+// and the pointer stays where the game put it. Then the camera turns through the game's own mouse bindings and sensitivity, walking or not.
+// ARKHAM_MOUSE_AS_PAD=1, for the Mac's own mouse, marks the loop's two calls as from a pad instead: the engine's InputAxis, a virtual function of the
+// viewport client, is called through the dispatcher, so a host function in front of it at that address sees each call and changes the last argument
+// (bGamepad) of only those two, known by where they return to. That fixes the engine's half only.
 guest_fn rt_guest_fn(u32 addr);           // rt.c: the translated function at a guest address
 void rt_ht_add(u32 addr, guest_fn fn);  // rt.c: a host function in front of it for calls through the dispatcher
 static guest_fn input_axis_orig;
@@ -309,11 +315,7 @@ static void input_axis_as_pad(CPU *c) {
 }
 static int mouse_as_pad(void) {
     static int on = -1;
-#if TARGET_OS_IPHONE
-    if (on < 0) on = !getenv("ARKHAM_MOUSE_NOT_PAD");
-#else
     if (on < 0) on = getenv("ARKHAM_MOUSE_AS_PAD") != NULL;
-#endif
     return on;
 }
 static void install_mouse_as_pad(u32 bp2) {
@@ -328,20 +330,50 @@ static void install_mouse_as_pad(u32 bp2) {
     rt_ht_add(fn, input_axis_as_pad);
     fprintf(stderr, "[mouse] the pointer's motion reaches the engine as a pad's (its InputAxis at %08x)\n", fn);
 }
+#if TARGET_OS_IPHONE
+// The touch camera's motion to the engine, as Feral's input loop would hand a mouse's, from inside that loop's reading of the pointer. bp2 is the loop's
+// frame: [-0xc0] its viewport client, [-0xc8] its window object (the viewport is 4 bytes in), [+0xc] the frame's time, and [-0xbc] the address its
+// code takes its globals from (0x19deeb1), where the names MouseX and MouseY are at +0x1aaf027 and +0x1aaf02b.
+static void touch_mouse_to_engine(CPU *c, u32 bp2, double dx, double dy) {
+    static u64 sent_frames, told_frames, told_ms;
+    static double sent_x, sent_y;
+    u32 client = G32(bp2 - 0xc0), window = G32(bp2 - 0xc8), base = G32(bp2 - 0xbc);
+    u32 vtable = client ? G32(client) : 0, fn = vtable ? G32(vtable + 0x10) : 0;
+    if (!fn || base != 0x19deeb1u) {
+        static int warned;
+        if (!warned++) fprintf(stderr, "[mouse] the touch camera can't reach the engine: client %08x, globals at %08x\n", client, base);
+        return;
+    }
+    const u32 names[2] = {G32(base + 0x1aaf027u), G32(base + 0x1aaf02bu)};
+    const double d[2] = {dx, dy};
+    for (int k = 0; k < 2; k++) {
+        if (d[k] == 0 || !names[k]) continue;
+        float f = (float)d[k];
+        u32 bits;
+        memcpy(&bits, &f, 4);
+        u32 args[8] = {client, window ? window + 4 : 0, 0, G32(names[k]), G32(names[k] + 4), bits, G32(bp2 + 0xc), 1};
+        rt_call_guest(c, fn, 8, args);
+    }
+    sent_frames++;
+    sent_x += fabs(dx);
+    sent_y += fabs(dy);
+    if (now_ms() - told_ms > 10000 && sent_frames != told_frames) {
+        told_ms = now_ms();
+        told_frames = sent_frames;
+        fprintf(stderr, "[mouse] touch camera: %llu frames with motion, %.0f px across and %.0f px up and down so far, straight to the engine\n", sent_frames, sent_x, sent_y);
+    }
+}
+#endif
 SHIM(HIGetMousePosition) {
     u32 out = ARG(2);
+    u32 bp2 = 0;  // Feral's input loop's frame, when the pointer is read from there (see mouse_skip_counter)
     {
-        // Called from Feral's input loop: the place to put the hook in, and the counter that drops the first moves after start (see mouse_skip_counter).
         u32 bp = c->ebp;
         if (bp > 0x1000 && G32(bp + 4) == 0x48c4bu) {
             u32 bp1 = G32(bp);
-            if (bp1 > 0x1000 && G32(bp1 + 4) == 0x19df02fu) install_mouse_as_pad(G32(bp1));
+            if (bp1 > 0x1000 && G32(bp1 + 4) == 0x19df02fu) bp2 = G32(bp1);
         }
-#if TARGET_OS_IPHONE
-        // The first moves after start, or after the window came back, are dropped by that counter: on the phone a swipe is never a stray move.
-        u32 skip = mouse_skip_counter(c);
-        if (skip && G32(skip)) G32(skip) = 0;
-#endif
+        if (bp2) install_mouse_as_pad(bp2);
     }
     {
         static int trace = -1;
@@ -359,6 +391,7 @@ SHIM(HIGetMousePosition) {
     }
     CGPoint p = CGPointMake(scripted_x, scripted_y);
     int captured = 0;
+    double touch_dx = 0, touch_dy = 0;
     if (!scripted_mouse) {
         pthread_mutex_lock(&cap_mu);
 #if TARGET_OS_IPHONE
@@ -367,13 +400,13 @@ SHIM(HIGetMousePosition) {
 #endif
         if (cap_active) {
 #if TARGET_OS_IPHONE
-            // Whole points only: the game turns the motion into whole pixels (F_0048c10), so a fraction left here would be lost at its next warp;
-            // kept, it adds up, and a slow swipe still turns the camera.
-            double ix = trunc(cap_dx), iy = trunc(cap_dy);
-            cap_x += ix;
-            cap_y += iy;
-            cap_dx -= ix;
-            cap_dy -= iy;
+            // The touch camera's motion goes to the engine below, from the input loop's reading only, and the pointer stays where the game put it.
+            if (bp2) {
+                touch_dx = cap_dx;
+                touch_dy = cap_dy;
+                cap_dx = cap_dy = 0;
+                cap_taken_ms = now_ms();
+            }
 #else
             cap_x += cap_dx;
             cap_y += cap_dy;
@@ -398,8 +431,10 @@ SHIM(HIGetMousePosition) {
             CFRelease(e);
         }
     }
+    (void)touch_dx, (void)touch_dy;
 #else
     (void)captured;
+    if (bp2 && (touch_dx != 0 || touch_dy != 0)) touch_mouse_to_engine(c, bp2, touch_dx, touch_dy);
 #endif
     if (out) {
         *(f32a *)GP(out) = (float)p.x;
