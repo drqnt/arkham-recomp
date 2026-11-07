@@ -20,5 +20,7 @@ int d3dsh_attribute_slot(unsigned usage, unsigned index);
 // Length of a shader in 32-bit words, 0 if it doesn't end properly.
 uint32_t d3dsh_words(const uint32_t *code, uint32_t limit);
 // Returns MSL source, to be freed, with a function named vs_main or ps_main. force_varyings adds outputs to a vertex shader for a pixel shader that reads more than it writes.
+// The device only ever asks for all of them, D3DSH_ALL_VARYINGS, so each vertex shader has at most two translations and both can be compiled ahead of play.
+#define D3DSH_ALL_VARYINGS 0x3FFu
 char *d3dsh_translate(const uint32_t *code, uint32_t force_varyings, D3dShaderInfo *info);
 #endif

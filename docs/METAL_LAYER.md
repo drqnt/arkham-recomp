@@ -11,8 +11,8 @@ From `tools/shader_census.py` over the game's shader caches, and `ARKHAM_D3D_CEN
 - Shaders: Shader Model 3 only. 29,869 pixel shaders, longest 325 instructions, and 1,593 vertex shaders, longest 250. No loops, no calls, no predicates, 203 `ifc` in all.
   Samplers are 2D and cube. Source modifiers are negate and abs. Relative addressing is on vertex constants only. Pixel inputs are texcoord, color and vPos.
 - No fixed function at all: no FVF, transforms, lights or texture stages. `SRGBWRITE` is always 0.
-- Draws: indexed triangle lists, strips and lists from memory. Streams 0-2, frequency always 1. Stride-0 streams become constant attributes.
-- Texture formats: DXT1, DXT5, A8R8G8B8, L8, and for targets A16B16G16R16F, G16R16F, R32F, A16B16G16R16 and D24X8, which is the shadow map. Depth surfaces are D24S8, 1x and 4x.
+- Draws: indexed triangle lists, strips and lists from memory. Streams 0-2, frequency always 1 so far, though hardware instancing is there in case. Stride-0 streams become constant attributes.
+- Texture formats: DXT1, DXT5 (DXT3 is there in case), A8R8G8B8, L8, and for targets A16B16G16R16F, G16R16F, R32F, A16B16G16R16 and D24X8, which is the shadow map. Depth surfaces are D24S8, 1x and 4x.
   Render targets are A16B16G16R16F and A8R8G8B8 at 4x. Cube textures exist, volume textures don't.
 - Buffers: all managed, locked once when created. Anything dynamic is drawn from memory.
 - Queries: occlusion (168 a frame) and event.
@@ -40,6 +40,10 @@ At 4x a pass that touches little still costs 0.55 ms, because it loads and store
   in the scene read what was made for that light. `[mtl]` says so if a pass sent ahead reads something the scene wrote this frame. `ARKHAM_MTL_NO_AHEAD=1` turns it off.
 - Targets bind lazily, so setting a target and setting it back with no draws costs nothing.
 - Resolves happen as the pass ends. A pass on a surface is told where that surface was resolved to last time, and the resolve costs nothing extra when it comes again.
+- After the translucency the engine sets another target, clears only depth and stencil, sets the scene back and averages it. Done at the switch, that clear ended the
+  scene's pass, and the average needed a pass of its own that loaded the whole 4x target again, about 0.55 ms a frame. A clear of only depth and stencil now waits across a
+  switch to a target of the same size, drawn into that target's pass if it's open, so the average happens as the scene's pass ends. In Instruments that took the GPU's fragment
+  work from 5.7 to 5.1 ms a frame in the first level.
 - Clears: a clear at the start of a pass is a load action. A clear of one attachment in the middle of a pass is a draw. A stencil-only clear covers only the box stencil was written to since
   the last clear, and is skipped when that's empty.
 - Occlusion answers don't wait for the frame. The command buffer goes to the GPU as soon as a pass with queries ends, so the engine's wait at the start of the next frame drops from about 6 ms to
@@ -65,6 +69,25 @@ On the same route that gives 175 FPS at 600-1200 draws, 173 at 1200-1600, 151 at
 typical second, and there were no sound gaps. A frame arrives about 21 ms after presenting, against 12-13 ms during the logos, when frames come too slowly to queue. The layer keeps 3 drawables,
 so 2 may shorten that, and whether it costs smoothness hasn't been measured in the game.
 
+### Where the GPU's time goes
+
+Instruments over 5 s of the first level at 2560x1600 4x, about 180 FPS, after the change above: fragment work 5.1 ms a frame and busy 93% of the time, vertex work 1.2 ms. So the
+GPU is the limit, and of its two halves the fragment side. A frame's fragment time:
+
+| pass | ms |
+|---|---|
+| lights, 260 draws with 60 queries | about 0.85 |
+| three passes on the scene after the lights, 1 to 4 draws each | about 1.7 |
+| depth first, 300 draws | 0.63 |
+| base pass, 430 draws | 0.62 |
+| a 4x mask target, 2 draws | 0.52 |
+| eight half-size passes | 0.28 |
+| bloom, shadow maps, the final picture | about 0.5 |
+
+The three short passes cost 0.5 to 0.7 ms each for 1 to 4 draws: that's loading and storing the 4x color and depth. Each ends because the engine averages the scene and then
+samples that texture in the next draws, for refraction, so they can't be one pass on a tile-based GPU. What's left to try there is not loading or storing depth in passes
+that don't use it.
+
 ## Shader compiling
 
 Text to library takes about 40 ms a shader in the game, and a pipeline about 10 ms, on the Direct3D thread at the first draw that needs them. Metal keeps both on disk, so the second time costs nothing:
@@ -74,8 +97,18 @@ Text to library takes about 40 ms a shader in the game, and a pipeline about 10 
 the executable, so another program with the same bundle identifier writes to the same file and the game never finds them. Renaming a copy of a program is enough to miss. Rebuilding the game at the same
 path keeps its entries. The first such build found 2009 of the 31,462 shaders already there, which is what the game had compiled itself, and that's the check that the key is the same.
 
-Pipelines depend on state and are only built when first seen, and vertex shaders that have to write more than their own code does are retranslated for that, so they aren't covered either. On iOS the
-libraries will have to be built on the Mac, because a compile on the phone costs more and the source has to be there.
+A pixel shader can read an output its vertex shader doesn't write, which Metal won't link. Such a vertex shader gets a second translation that writes all ten outputs, the missing ones as
+(0, 0, 0, 1), one for any pixel shader, and the prebuild compiles that too (`vsall_` files). Before, each combination had its own translation, which the prebuild couldn't know: those stayed
+in Metal's cache from earlier play at the same path, so moving the game into `Arkham.app` brought back 10 to 14 s of stalls in an 11-minute game, at places played many times before.
+Each shader that does compile in play is logged as `[mtl] vs_... compiled in N ms, not from the cache`, and the `[fps]` line counts them.
+
+**Apple's Metal HUD changes the cache's key.** With `MTL_HUD_ENABLED=1` the running game finds none of what the prebuild compiled: 0 of 30 in a test, 38 ms each, against 30 of 30 in
+1 ms in all without it, and 405 compiles in a 3-minute run. The prebuild runs without a window, where the HUD isn't attached, so it can't fill the HUD's side. The HUD's own drawing
+costs about 0.3 ms of GPU a frame besides. `ARKHAM_COMPILE_TEST=list` makes the game compile a list of files once its window is up, log each time and quit, which is how this
+was found.
+
+Pipelines depend on state and are only built when first seen, at about 10 ms, and Metal keeps those too. On iOS the libraries will have to be built on the Mac, because a compile on the phone
+costs more and the source has to be there.
 
 ## Depth bias
 
@@ -88,6 +121,17 @@ OpenGL uses a float depth format underneath, which hasn't been confirmed.
 
 The game's material effects are one full-screen strip through `DrawPrimitive`, at depth 0, with a viewport of -1,-1,2561,1601. That's the purple of the scanner at the start of the game and the lights going out in the elevator about 6 minutes in. Direct3D declares the origin as unsigned and OpenGL takes it as signed, so read as unsigned it put the whole strip about four billion pixels away, with no error anywhere.
 
+## Found by reading the code
+
+After those, the layer was read through for mistakes of the same kind, that go wrong with no error anywhere. Fixed, though none of them had been seen in play:
+
+- A constant a shader defines itself has to win over the engine's even when read through `a0`: SpeedTree leaves and terrain do that. Such reads go through a `crel()` that knows the shader's own values.
+- `SetStreamSourceFreq` was ignored, so instanced draws would have drawn one instance with the wrong data.
+- A frame that filled its 48 MB of upload space started again from the front, over data the GPU hadn't read yet. It now goes on in another buffer.
+- The pipeline cache was keyed on objects' addresses, which come back for the next object once one is freed, so a new shader could get an old one's pipeline. Keys are serials now.
+- Freed object ids were kept for only 1024 at a time, and the table could run over.
+- DXT3 textures had no format, and `Clear` read the viewport's origin as unsigned, like the strip above.
+
 ## Tools
 
 - `ARKHAM_TRACE_FRAME=seconds`: one frame after that long, with each pass alone on the GPU, as `[fmap]` lines. `ARKHAM_TRACE_BUSY=frames` does the same that many frames after the first with over 300 draws.
@@ -97,6 +141,10 @@ The game's material effects are one full-screen strip through `DrawPrimitive`, a
 - `ARKHAM_D3D_TRACE=from,step,count`: every call the engine makes to Direct3D during one frame, as `[d3d]` lines, in front of either renderer, so two runs show whether the engine asks for the same thing. With it, `ARKHAM_MTLSNAP` and `ARKHAM_GLSNAP` save only those frames.
 - `ARKHAM_RECORD=file` with `tools/walk.sh`: the keys pressed once a level has started. `ARKHAM_REPLAY=file` presses them again, counting from the first frame with over 300 draws, because loading times differ. A scripted run ignores the real mouse, so a route has to be walked with keys. Stalls early in a replay leave Batman behind his route, so keep traces to the part being looked at.
 - A scripted run reads `logs/saves/frozen/SaveN.sgd` if it exists, and a played game keeps each save in `logs/saves/history`.
+- `ARKHAM_MTL_LABELS=1` names every pass, and Instruments' Metal System Trace then shows what each costs in a normal frame, unlike `[fmap]`, where each pass waits alone:
+  `xcrun xctrace record --template 'Metal System Trace' --attach <pid> --time-limit 5s --output file.trace` with the full Xcode as `DEVELOPER_DIR`, then `xctrace export` of the
+  `metal-gpu-intervals` table.
+- `ARKHAM_TRACE_RESOLVE=1`: why an average of a 4x target needed a pass of its own.
 - `ARKHAM_FPS_CAP=n`: a frame limit, as on OpenGL.
 - `ARKHAM_MTLSNAP=dir`: the back buffer at frames 30, 120 and every 600th. It stalls those frames.
 - `MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_ERROR_MODE=nslog MTL_DEBUG_LAYER_WARNING_MODE=ignore`: Metal's own checking. Clean so far.

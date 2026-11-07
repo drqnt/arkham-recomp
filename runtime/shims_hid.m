@@ -10,6 +10,7 @@
 #include "shim_reg.h"
 #include <mach/mach_time.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -382,46 +383,88 @@ static float rumble_now(void) {
     if (motors > total) total = motors;
     return total > 1 ? 1 : total;
 }
-static void haptics_send(float v) {
+// The engine is made at the first rumble, not when the controller connects: one made then, for the game's first "nothing", failed with "Couldn't communicate with a helper
+// application" and nothing tried again for the whole game. A failure is now tried again every 2 seconds, and an engine the system stops or resets is made again.
+static double engine_retry_at;
+static _Atomic int engine_lost;
+static void haptics_drop(void) API_AVAILABLE(macos(11.0), ios(14.0)) {
+    [player cancelAndReturnError:nil];
+    player = nil;
+    [engine stopWithCompletionHandler:nil];
+    engine = nil;
+    engine_pad = nil;
+}
+static void haptics_failed(const char *step, NSError *err) API_AVAILABLE(macos(11.0), ios(14.0)) {
+    static int told;
+    if (told++ < 5)
+        fprintf(stderr, "[pad] this controller's haptics didn't %s: %s (%s %ld), trying again in 2 s\n", step, err ? err.localizedDescription.UTF8String : "no reason given", err ? err.domain.UTF8String : "", (long)err.code);
+    haptics_drop();
+    engine_retry_at = CFAbsoluteTimeGetCurrent() + 2;
+}
+static int haptics_ready(void) API_AVAILABLE(macos(11.0), ios(14.0)) {
+    if (atomic_exchange(&engine_lost, 0)) haptics_drop();
+    if (engine_pad == pad && player) return 1;
+    if (CFAbsoluteTimeGetCurrent() < engine_retry_at) return 0;
+    haptics_drop();
+    engine = [pad.haptics createEngineWithLocality:GCHapticsLocalityDefault];
+    if (!engine) {
+        haptics_failed("make an engine", nil);
+        return 0;
+    }
+    engine.stoppedHandler = ^(CHHapticEngineStoppedReason reason) {
+        if (trace_rumble) fprintf(stderr, "[pad] haptics stopped, reason %ld\n", (long)reason);
+        atomic_store(&engine_lost, 1);
+    };
+    engine.resetHandler = ^{
+        atomic_store(&engine_lost, 1);
+    };
+    NSError *err = nil;
+    if (![engine startAndReturnError:&err]) {
+        haptics_failed("start", err);
+        return 0;
+    }
+    CHHapticEvent *ev = [[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticContinuous
+                                                      parameters:@[ [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticIntensity value:1],
+                                                                    [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticSharpness value:0.3] ]
+                                                    relativeTime:0
+                                                        duration:30];
+    CHHapticPattern *pattern = [[CHHapticPattern alloc] initWithEvents:@[ ev ] parameters:@[] error:&err];
+    player = pattern ? [engine createAdvancedPlayerWithPattern:pattern error:&err] : nil;
+    if (!player) {
+        haptics_failed("make a player", err);
+        return 0;
+    }
+    player.loopEnabled = YES;
+    engine_pad = pad;
+    fprintf(stderr, "[pad] rumble goes to the controller's haptics\n");
+    return 1;
+}
+// Returns whether the controller got it, so a rumble that couldn't be played is sent again.
+static int haptics_send(float v) {
     if (trace_rumble < 0) trace_rumble = getenv("ARKHAM_TRACE_RUMBLE") != NULL;
     if (trace_rumble) fprintf(stderr, "[pad] rumble %.2f\n", v);
     if (@available(macOS 11.0, iOS 14.0, *)) {
-        if (!pad || !pad.haptics) return;
-        if (engine_pad != pad) {
-            [player cancelAndReturnError:nil];
-            player = nil;
-            [engine stopWithCompletionHandler:nil];
-            engine = [pad.haptics createEngineWithLocality:GCHapticsLocalityDefault];
-            engine_pad = pad;
-            NSError *err = nil;
-            [engine startAndReturnError:&err];
-            CHHapticEvent *ev = [[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticContinuous
-                                                              parameters:@[ [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticIntensity value:1],
-                                                                            [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticSharpness value:0.3] ]
-                                                            relativeTime:0
-                                                                duration:30];
-            CHHapticPattern *pattern = [[CHHapticPattern alloc] initWithEvents:@[ ev ] parameters:@[] error:&err];
-            player = pattern ? [engine createAdvancedPlayerWithPattern:pattern error:&err] : nil;
-            player.loopEnabled = YES;
-            if (!player) fprintf(stderr, "[pad] this controller's haptics didn't start: %s\n", err.localizedDescription.UTF8String);
-            else fprintf(stderr, "[pad] rumble goes to the controller's haptics\n");
-        }
-        if (!player) return;
+        if (!pad || !pad.haptics) return 1;
         if (v <= 0.01f) {
-            [player stopAtTime:0 error:nil];
-        } else {
-            [player startAtTime:0 error:nil];
-            [player sendParameters:@[ [[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticIntensityControl value:v relativeTime:0] ]
-                            atTime:0
-                             error:nil];
+            if (player && engine_pad == pad) [player stopAtTime:0 error:nil];
+            return 1;
+        }
+        if (!haptics_ready()) return 0;
+        NSError *err = nil;
+        if (![player startAtTime:0 error:&err] ||
+            ![player sendParameters:@[ [[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticIntensityControl value:v relativeTime:0] ]
+                             atTime:0
+                              error:&err]) {
+            haptics_failed("play", err);
+            return 0;
         }
     }
+    return 1;
 }
 static void rumble_tick(void) {
     float v = rumble_now();
     if (fabsf(v - sent) < 0.03f && !(v == 0 && sent > 0)) return;
-    sent = v;
-    haptics_send(v);
+    sent = haptics_send(v) ? v : -1;
 }
 static void read_effect(Effect *e, u32 p, u32 flags) {
     if (!p) return;

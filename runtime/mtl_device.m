@@ -69,23 +69,34 @@ struct Obj {
     u32 slots;
     // shaders
     id<MTLLibrary> lib;
-    id<MTLLibrary> forced[4];
-    u32 forced_mask[4];
+    id<MTLLibrary> all_outputs;  // vertex shaders: the translation that writes every output, for pixel shaders that read more than this one writes
     D3dShaderInfo info;
     u32 *code;
     char *msl;  // until the first draw that needs it: most shaders the game creates are never drawn with
     // queries
     u32 query_type, slot;
     u64 serial;
+    u64 uid;  // never reused, unlike the object's address and its id: caches key on this
 };
 #define MAX_OBJS (1u << 18)
 static Obj *objs[MAX_OBJS];
-static u32 n_objs = 1, free_list[1024], n_free;
+// Every freed id goes back on the list: a list shorter than what the game frees at once lost ids for good, and enough of them would run past the table.
+static u32 n_objs = 1, free_list[MAX_OBJS], n_free;
+static u64 next_uid = 1;
 
 static Obj *obj_new(Kind kind, u32 vtable) {
+    u32 id;
+    if (n_free) {
+        id = free_list[--n_free];
+    } else if (n_objs < MAX_OBJS) {
+        id = n_objs++;
+    } else {
+        fprintf(stderr, "[mtl] more than %u Direct3D objects alive at once\n", MAX_OBJS);
+        abort();
+    }
     Obj *o = calloc(1, sizeof *o);
-    u32 id = n_free ? free_list[--n_free] : n_objs++;
     objs[id] = o;
+    o->uid = next_uid++;
     o->kind = kind;
     o->refs = 1;
     o->guest = rt_guest_calloc(1, 16);
@@ -106,13 +117,13 @@ static void obj_free(Obj *o) {
     }
     [o->buffer release];
     [o->lib release];
-    for (int i = 0; i < 4; i++) [o->forced[i] release];
+    [o->all_outputs release];
     free(o->code);
     free(o->msl);
     rt_guest_free(o->guest);
     free(o);
     objs[id] = NULL;
-    if (n_free < 1024) free_list[n_free++] = id;
+    free_list[n_free++] = id;
 }
 
 // ---------- the device's state ----------
@@ -151,8 +162,10 @@ static struct {
 // Upload space for constants and for draws from memory, one per frame in flight.
 #define TRANSIENT_FRAMES 3
 #define TRANSIENT_SIZE (48u << 20)
-static id<MTLBuffer> transient[TRANSIENT_FRAMES];
-static u32 transient_frame, transient_at;
+#define TRANSIENT_CHAIN 8
+static id<MTLBuffer> transient[TRANSIENT_FRAMES][TRANSIENT_CHAIN];
+static u32 transient_frame, transient_link, transient_at;
+static id<MTLBuffer> vs_const_buf, ps_const_buf;
 static id<MTLBuffer> visibility;
 #define VIS_SLOTS (1u << 15)
 static u32 vis_next;
@@ -186,6 +199,12 @@ typedef struct {
 } EncState;
 static EncState e;
 
+// ARKHAM_MTL_LABELS=1 names each pass for Instruments' Metal System Trace, which then shows what every pass costs on the GPU in a normal frame.
+static int labels_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("ARKHAM_MTL_LABELS") != NULL;
+    return on;
+}
 static void complain(const char *what) {
     static const char *seen[64];
     for (int i = 0; i < 64; i++) {
@@ -200,6 +219,7 @@ static void complain(const char *what) {
 
 // ---------- formats ----------
 #define FMT_DXT1 0x31545844u
+#define FMT_DXT3 0x33545844u
 #define FMT_DXT5 0x35545844u
 typedef struct {
     MTLPixelFormat pf, srgb;
@@ -212,6 +232,7 @@ static FormatInfo format_info(u32 f) {
     FormatInfo i = {MTLPixelFormatInvalid, MTLPixelFormatInvalid, 1, 4, 0, 0, same};
     switch (f) {
         case FMT_DXT1: i.pf = MTLPixelFormatBC1_RGBA; i.srgb = MTLPixelFormatBC1_RGBA_sRGB; i.block = 4; i.bytes = 8; break;
+        case FMT_DXT3: i.pf = MTLPixelFormatBC2_RGBA; i.srgb = MTLPixelFormatBC2_RGBA_sRGB; i.block = 4; i.bytes = 16; break;
         case FMT_DXT5: i.pf = MTLPixelFormatBC3_RGBA; i.srgb = MTLPixelFormatBC3_RGBA_sRGB; i.block = 4; i.bytes = 16; break;
         case 21: case 22: i.pf = MTLPixelFormatBGRA8Unorm; i.srgb = MTLPixelFormatBGRA8Unorm_sRGB; break;
         case 50:
@@ -440,6 +461,8 @@ int rt_mtl_prebuild(const char *list) {
     NSArray<NSString *> *files = [text componentsSeparatedByString:@"\n"];
     MTLCompileOptions *opt = compile_options();
     static _Atomic long fine, known, failed;
+    // The first compile in a process waits for Metal's compiler service, tens of milliseconds even from the cache. Without this, a short list counts as not cached at all.
+    [[dev newLibraryWithSource:@"#include <metal_stdlib>\nfragment float4 warm_up() { return float4(1.0); }\n" options:opt error:nil] release];
     double start = CACurrentMediaTime();
     dispatch_apply(files.count, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
         if (!files[i].length) return;
@@ -474,10 +497,22 @@ static void create_shader(CPU *c, Kind kind, u32 vtable) {  // this, code, out
     G32(ARG(2)) = o->guest;
     RET(0);
 }
-static u64 n_compiled;
+static u64 n_compiled, n_uncached;
+static u64 code_hash(Obj *o);
+// A shader from Metal's cache takes well under a millisecond, and one compiled now about 40. Those are named, as the files in logs/msl are, to see what the prebuild missed.
+static id<MTLLibrary> compile_shader(Obj *o, const char *src, int all_outputs) {
+    u64 t0 = mach_absolute_time();
+    id<MTLLibrary> lib = compile_msl(src);
+    double ms = (double)(mach_absolute_time() - t0) * 125.0 / 3.0 / 1e6;
+    if (ms > 5) {
+        n_uncached++;
+        fprintf(stderr, "[mtl] %s_%016llx%s compiled in %.0f ms, not from the cache\n", o->kind == O_PS ? "ps" : "vs", (unsigned long long)code_hash(o), all_outputs ? " with all outputs" : "", ms);
+    }
+    return lib;
+}
 static id<MTLLibrary> library_of(Obj *o) {
     if (!o->lib && o->msl) {
-        o->lib = compile_msl(o->msl);
+        o->lib = compile_shader(o, o->msl, 0);
         n_compiled++;
         free(o->msl);
         o->msl = NULL;
@@ -703,6 +738,7 @@ static void dump_target(Obj *rt);
 static void close_enc(void) {
     if (!enc) return;
     Obj *dump_rt = enc_rt;
+    if (__builtin_expect(labels_on(), 0)) enc.label = [enc.label stringByAppendingFormat:@" draws=%u", pass_draws];
     if (enc_unknown_store) [enc setColorStoreAction:MTLStoreActionStore atIndex:0];
     enc_unknown_store = 0;
     [enc endEncoding];
@@ -860,11 +896,12 @@ static void open_encoder(int hoisted) {
     d.renderTargetWidth = w;
     d.renderTargetHeight = h;
     if (!hoisted) d.visibilityResultBuffer = visibility;
-    if (__builtin_expect(fmap_on, 0))
-        snprintf(fmap_pass, sizeof fmap_pass, "pass %ux%u x%d color=%x depth=%x clear=%c%c%c", w, h, rt_surface ? rt_surface->samples : ds_surface ? ds_surface->samples : 1, rt_surface ? rt_surface->format : 0,
-                 ds_surface ? ds_surface->format : 0, pending_clear.color ? 'C' : '-', pending_clear.depth ? 'D' : '-', pending_clear.stencil ? 'S' : '-');
+    if (__builtin_expect(fmap_on || labels_on(), 0))
+        snprintf(fmap_pass, sizeof fmap_pass, "pass %ux%u x%d color=%x depth=%x clear=%c%c%c%s", w, h, rt_surface ? rt_surface->samples : ds_surface ? ds_surface->samples : 1, rt_surface ? rt_surface->format : 0,
+                 ds_surface ? ds_surface->format : 0, pending_clear.color ? 'C' : '-', pending_clear.depth ? 'D' : '-', pending_clear.stencil ? 'S' : '-', hoisted ? " ahead" : "");
     pending_clear.color = pending_clear.depth = pending_clear.stencil = 0;
     enc = [[where renderCommandEncoderWithDescriptor:d] retain];
+    if (__builtin_expect(labels_on(), 0)) enc.label = @(fmap_pass);
     enc_rt = rt_surface;
     enc_ds = ds_surface;
     enc_hoisted = hoisted;
@@ -918,6 +955,7 @@ static void begin_pass(void) {
 static void flush_clears(void) {
     if (pending_clear.color || pending_clear.depth || pending_clear.stencil) begin_pass();
 }
+static void clear_by_drawing(u32 flags, const u32 *area, const float *rgba, float z, u32 stencil, u32 n_rects, u32 rects);
 static void m_SetRenderTarget(CPU *c) {  // this, index, surface
     if (ARG(1) != 0) {
         RET(0);
@@ -925,8 +963,30 @@ static void m_SetRenderTarget(CPU *c) {  // this, index, surface
     }
     Obj *s = obj_of(ARG(2));
     if (s != rt_surface) {
-        flush_clears();
-        rt_surface = s;
+        // A clear of only depth and stencil doesn't depend on the color target. The engine sets another target, clears depth and stencil, and sets the scene back before
+        // averaging it: done here, that clear ended the scene's pass, and the average then needed a pass of its own that loads the whole 4x target again. So when the new
+        // target is the same size, the clear waits for it: drawn into its pass if that's open, or as that pass's load action.
+        int ds_only = !pending_clear.color && (pending_clear.depth || pending_clear.stencil);
+        int parked_here = parked && parked_rt == s && parked_ds == ds_surface;
+        if (ds_only && s && rt_surface && ds_surface && !parked_here && s->width == rt_surface->width && s->height == rt_surface->height && s->samples == rt_surface->samples) {
+            rt_surface = s;
+            if (target_is_current()) {
+                u32 area[4] = {0, 0, s->width, s->height};
+                float none[4] = {0, 0, 0, 0};
+                u32 flags = (pending_clear.depth ? 2u : 0u) | (pending_clear.stencil && ds_surface->has_stencil ? 4u : 0u);
+                if (flags) clear_by_drawing(flags, area, none, pending_clear.z, pending_clear.s, 0, 0);
+                n_quad_clears++;
+                if (flags & 4) {
+                    ds_surface->s_known = 1;
+                    ds_surface->s_value = pending_clear.s;
+                    memset(ds_surface->s_box, 0, 16);
+                }
+                pending_clear.depth = pending_clear.stencil = 0;
+            }
+        } else {
+            flush_clears();
+            rt_surface = s;
+        }
     }
     // Setting a render target resets the viewport to all of it, and scissoring with it.
     if (s) {
@@ -1022,15 +1082,21 @@ static void m_SetStreamSource(CPU *c) {  // this, stream, buffer, offset, stride
     RET(0);
 }
 static void m_Nothing(CPU *c) { RET(0); }
+static u32 stream_freq[16];
+static void m_SetStreamSourceFreq(CPU *c) {  // this, stream, setting
+    if (ARG(1) < 16) stream_freq[ARG(1)] = ARG(2) == 1 ? 0 : ARG(2);
+    RET(0);
+}
 static void m_SetIndices(CPU *c) {
     cur_ib = obj_of(ARG(1));
     RET(0);
 }
 
 // ---------- pipelines ----------
+// Shaders and declarations are in the key by uid: a freed object's address comes back for the next one, and the key would then find a pipeline built from the old one.
 typedef struct {
-    Obj *vs, *ps, *decl;
-    u32 strides[3];
+    u64 vs, ps, decl;
+    u32 strides[3], instance_rate[3];
     u32 color, depth, samples;
     u32 blend, src, dst, op, src_a, dst_a, op_a, mask;
     u8 alpha, clip;
@@ -1076,30 +1142,26 @@ static MTLBlendOperation blend_op(u32 v) {
         default: return MTLBlendOperationAdd;
     }
 }
+// A pixel shader can read an output its vertex shader doesn't write, and Metal won't link that. Such a vertex shader gets a second translation that writes all ten, the extra ones as
+// (0, 0, 0, 1), and one is enough for any pixel shader, since a vertex shader may write more than is read. Before, each combination got its own, which tools/prebuild_shaders.sh
+// couldn't know about, and those were most of what stalled in play.
 static id<MTLLibrary> vs_library_for(Obj *vs, u32 needs) {
-    u32 extra = needs & ~vs->info.varyings;
-    if (!extra) return library_of(vs);
-    for (int i = 0; i < 4; i++) {
-        if (vs->forced[i] && vs->forced_mask[i] == extra) return vs->forced[i];
-        if (!vs->forced[i]) {
-            D3dShaderInfo info;
-            char *msl = d3dsh_translate(vs->code, extra, &info);
-            vs->forced[i] = msl ? compile_msl(msl) : nil;
-            vs->forced_mask[i] = extra;
-            free(msl);
-            return vs->forced[i];
-        }
+    if (!(needs & ~vs->info.varyings)) return library_of(vs);
+    if (!vs->all_outputs) {
+        D3dShaderInfo info;
+        char *msl = d3dsh_translate(vs->code, D3DSH_ALL_VARYINGS, &info);
+        vs->all_outputs = msl ? compile_shader(vs, msl, 1) : nil;
+        free(msl);
     }
-    return library_of(vs);
+    return vs->all_outputs;
 }
-static id<MTLRenderPipelineState> pipeline_for(const PipeKey *k) {
+static id<MTLRenderPipelineState> pipeline_for(const PipeKey *k, Obj *vs, Obj *ps, Obj *decl) {
     if (!pipes) pipes = calloc(PIPES, sizeof *pipes);
     u64 h = hash_bytes(k, sizeof *k);
     for (u32 i = (u32)h % PIPES, tries = 0; tries < PIPES; i = (i + 1) % PIPES, tries++) {
         if (!pipes[i].state && !pipes[i].key.vs) {
             // Not built yet.
-            Obj *vs = k->vs, *ps = k->ps;
-            if (!vs || !k->decl) return nil;
+            if (!vs || !decl) return nil;
             MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues new] autorelease];
             bool clip = k->clip, alpha = k->alpha;
             [cv setConstantValue:&clip type:MTLDataTypeBool atIndex:0];
@@ -1114,7 +1176,6 @@ static id<MTLRenderPipelineState> pipeline_for(const PipeKey *k) {
                 if (!d.fragmentFunction) fprintf(stderr, "[mtl] fragment function: %s\n", err.localizedDescription.UTF8String);
             }
             MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
-            Obj *decl = k->decl;
             u32 buffers_used = 0;
             for (int n = 0; n < decl->n_elements; n++) {
                 const Element *el = &decl->elements[n];
@@ -1128,8 +1189,16 @@ static id<MTLRenderPipelineState> pipeline_for(const PipeKey *k) {
             for (int s = 0; s < 3; s++) {
                 if (!(buffers_used >> s & 1)) continue;
                 vd.layouts[s].stride = k->strides[s] ? k->strides[s] : 16;
-                vd.layouts[s].stepFunction = k->strides[s] ? MTLVertexStepFunctionPerVertex : MTLVertexStepFunctionConstant;
-                vd.layouts[s].stepRate = k->strides[s] ? 1 : 0;
+                if (!k->strides[s]) {
+                    vd.layouts[s].stepFunction = MTLVertexStepFunctionConstant;
+                    vd.layouts[s].stepRate = 0;
+                } else if (k->instance_rate[s]) {
+                    vd.layouts[s].stepFunction = MTLVertexStepFunctionPerInstance;
+                    vd.layouts[s].stepRate = k->instance_rate[s];
+                } else {
+                    vd.layouts[s].stepFunction = MTLVertexStepFunctionPerVertex;
+                    vd.layouts[s].stepRate = 1;
+                }
             }
             // A shader may read what the declaration doesn't have: it gets (0, 0, 0, 1).
             for (int slot = 0; slot < 16; slot++) {
@@ -1332,14 +1401,34 @@ typedef struct {
     float pad[2];
 } PsExtra;
 
-static u32 transient_alloc(u32 size, void **out) {
+// Space for this frame's constants and draws from memory. A frame that fills its buffer goes on in another of the same size, kept for the next time this frame's turn comes: starting
+// again from the front would overwrite what the GPU hasn't read yet. Command buffers keep what they use alive, so a draw too big for any of them gets a buffer of its own.
+static u32 transient_alloc(u32 size, void **out, id<MTLBuffer> *buf) {
+    if (size > TRANSIENT_SIZE) {
+        complain("a draw from memory bigger than the upload space");
+        id<MTLBuffer> b = [[dev newBufferWithLength:size options:MTLResourceStorageModeShared] autorelease];
+        *buf = b;
+        *out = b.contents;
+        return 0;
+    }
     u32 at = (transient_at + 255u) & ~255u;
     if (at + size > TRANSIENT_SIZE) {
-        complain("ran out of upload space in a frame");
+        if (transient_link + 1 < TRANSIENT_CHAIN) {
+            transient_link++;
+            if (!transient[transient_frame][transient_link]) {
+                transient[transient_frame][transient_link] = [dev newBufferWithLength:TRANSIENT_SIZE options:MTLResourceStorageModeShared];
+                fprintf(stderr, "[mtl] a frame needed more upload space: %u MB\n", (transient_link + 1) * (TRANSIENT_SIZE >> 20));
+            }
+        } else {
+            complain("ran out of upload space in a frame");
+            transient_link = 0;
+        }
         at = 0;
     }
     transient_at = at + size;
-    *out = (u8 *)transient[transient_frame].contents + at;
+    id<MTLBuffer> b = transient[transient_frame][transient_link];
+    *buf = b;
+    *out = (u8 *)b.contents + at;
     return at;
 }
 static inline void stencil_touch(Obj *ds, const u32 *a) {
@@ -1355,7 +1444,25 @@ static inline void stencil_touch(Obj *ds, const u32 *a) {
     if (a[3] > b[3]) b[3] = a[3];
 }
 static void trace_draw(u32 type, u32 count);
-static int prepare_draw(u32 *strides_used) {
+// Hardware instancing, as SetStreamSourceFreq sets it up: the stream marked as indexed data says how many instances, and a stream marked as instance data moves on once every so many
+// instances instead of once a vertex. Only indexed draws can do it.
+#define FREQ_INDEXED 0x40000000u
+#define FREQ_INSTANCE 0x80000000u
+static int instancing(void) {
+    for (int s = 0; s < 3; s++)
+        if (stream_freq[s] & (FREQ_INDEXED | FREQ_INSTANCE)) return 1;
+    return 0;
+}
+static u32 instance_count(void) {
+    for (int s = 0; s < 3; s++)
+        if (stream_freq[s] & FREQ_INDEXED) return (stream_freq[s] & 0x3FFFFFFFu) ? stream_freq[s] & 0x3FFFFFFFu : 1;
+    return 1;
+}
+static u32 instance_rate(int s) {
+    if (!(stream_freq[s] & FREQ_INSTANCE)) return 0;
+    return (stream_freq[s] & 0x3FFFFFFFu) ? stream_freq[s] & 0x3FFFFFFFu : 1;
+}
+static int prepare_draw(u32 *strides_used, int instanced) {
     if (!cur_vs || !cur_decl) {
         complain("a draw without a vertex shader or declaration");
         return 0;
@@ -1368,10 +1475,13 @@ static int prepare_draw(u32 *strides_used) {
     pass_draws++;
     PipeKey k;
     memset(&k, 0, sizeof k);
-    k.vs = cur_vs;
-    k.ps = cur_ps;
-    k.decl = cur_decl;
-    for (int s = 0; s < 3; s++) k.strides[s] = strides_used[s];
+    k.vs = cur_vs->uid;
+    k.ps = cur_ps ? cur_ps->uid : 0;
+    k.decl = cur_decl->uid;
+    for (int s = 0; s < 3; s++) {
+        k.strides[s] = strides_used[s];
+        k.instance_rate[s] = instanced ? instance_rate(s) : 0;
+    }
     k.color = rt_surface ? (u32)rt_surface->tex.pixelFormat : 0;
     k.depth = ds_surface ? (u32)ds_surface->tex.pixelFormat : 0;
     k.samples = rt_surface ? (u32)rt_surface->samples : ds_surface ? (u32)ds_surface->samples : 1;
@@ -1387,7 +1497,7 @@ static int prepare_draw(u32 *strides_used) {
     k.mask = rs[168] & 15;
     k.alpha = rs[15] != 0 && rs[25] != 8;
     k.clip = (rs[152] & 3) != 0;
-    id<MTLRenderPipelineState> p = pipeline_for(&k);
+    id<MTLRenderPipelineState> p = pipeline_for(&k, cur_vs, cur_ps, cur_decl);
     if (!p) return 0;
     if (p != e.pipeline) {
         [enc setRenderPipelineState:p];
@@ -1454,39 +1564,30 @@ static int prepare_draw(u32 *strides_used) {
         e.have_sc = 1;
     }
     // Constants.
-    id<MTLBuffer> up = transient[transient_frame];
-    if (vs_const_dirty || !e.vs_buf) {
-        if (vs_const_dirty) {
-            void *mem;
-            vs_const_at = transient_alloc(256 * 16, &mem);
-            memcpy(mem, vs_const, 256 * 16);
-            vs_const_dirty = 0;
-        }
-        if (e.vs_buf != up) {
-            [enc setVertexBuffer:up offset:vs_const_at atIndex:16];
-            e.vs_buf = up;
-        } else {
-            [enc setVertexBufferOffset:vs_const_at atIndex:16];
-        }
+    if (vs_const_dirty) {
+        void *mem;
+        vs_const_at = transient_alloc(256 * 16, &mem, &vs_const_buf);
+        memcpy(mem, vs_const, 256 * 16);
+        vs_const_dirty = 0;
+    }
+    if (e.vs_buf != vs_const_buf) {
+        [enc setVertexBuffer:vs_const_buf offset:vs_const_at atIndex:16];
+        e.vs_buf = vs_const_buf;
         e.vs_off = vs_const_at;
     } else if (e.vs_off != vs_const_at) {
         [enc setVertexBufferOffset:vs_const_at atIndex:16];
         e.vs_off = vs_const_at;
     }
     if (cur_ps) {
-        if (ps_const_dirty || !e.ps_buf) {
-            if (ps_const_dirty) {
-                void *mem;
-                ps_const_at = transient_alloc(224 * 16, &mem);
-                memcpy(mem, ps_const, 224 * 16);
-                ps_const_dirty = 0;
-            }
-            if (e.ps_buf != up) {
-                [enc setFragmentBuffer:up offset:ps_const_at atIndex:0];
-                e.ps_buf = up;
-            } else {
-                [enc setFragmentBufferOffset:ps_const_at atIndex:0];
-            }
+        if (ps_const_dirty) {
+            void *mem;
+            ps_const_at = transient_alloc(224 * 16, &mem, &ps_const_buf);
+            memcpy(mem, ps_const, 224 * 16);
+            ps_const_dirty = 0;
+        }
+        if (e.ps_buf != ps_const_buf) {
+            [enc setFragmentBuffer:ps_const_buf offset:ps_const_at atIndex:0];
+            e.ps_buf = ps_const_buf;
             e.ps_off = ps_const_at;
         } else if (e.ps_off != ps_const_at) {
             [enc setFragmentBufferOffset:ps_const_at atIndex:0];
@@ -1578,7 +1679,7 @@ static void bind_streams(void) {
 static u64 n_draws;
 static void m_DrawPrimitive(CPU *c) {  // this, type, start, primitives
     u32 st[3] = {streams[0].stride, streams[1].stride, streams[2].stride};
-    if (!prepare_draw(st)) {
+    if (!prepare_draw(st, 0)) {
         RET(0);
         return;
     }
@@ -1590,13 +1691,16 @@ static void m_DrawPrimitive(CPU *c) {  // this, type, start, primitives
 }
 static void m_DrawIndexedPrimitive(CPU *c) {  // this, type, base vertex, min index, vertices, start index, primitives
     u32 st[3] = {streams[0].stride, streams[1].stride, streams[2].stride};
-    if (!cur_ib || !prepare_draw(st)) {
+    int instanced = instancing();
+    if (!cur_ib || !prepare_draw(st, instanced)) {
         RET(0);
         return;
     }
     bind_streams();
     int wide = cur_ib->index_format == 102;
-    [enc drawIndexedPrimitives:prim_type(ARG(1)) indexCount:prim_verts(ARG(1), ARG(6)) indexType:wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16 indexBuffer:cur_ib->buffer indexBufferOffset:ARG(5) * (wide ? 4u : 2u) instanceCount:1 baseVertex:(NSInteger)(int)ARG(2) baseInstance:0];
+    u32 n = instanced ? instance_count() : 1;
+    if (instanced) complain("the game draws with hardware instancing");
+    [enc drawIndexedPrimitives:prim_type(ARG(1)) indexCount:prim_verts(ARG(1), ARG(6)) indexType:wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16 indexBuffer:cur_ib->buffer indexBufferOffset:ARG(5) * (wide ? 4u : 2u) instanceCount:n baseVertex:(NSInteger)(int)ARG(2) baseInstance:0];
     n_draws++;
     if (__builtin_expect(fmap_on, 0)) trace_draw(ARG(1), ARG(6));
     RET(0);
@@ -1604,14 +1708,15 @@ static void m_DrawIndexedPrimitive(CPU *c) {  // this, type, base vertex, min in
 static void m_DrawPrimitiveUP(CPU *c) {  // this, type, primitives, data, stride
     u32 stride = ARG(4), verts = prim_verts(ARG(1), ARG(2));
     u32 st[3] = {stride, streams[1].stride, streams[2].stride};
-    if (!prepare_draw(st)) {
+    if (!prepare_draw(st, 0)) {
         RET(0);
         return;
     }
     void *mem;
-    u32 at = transient_alloc(verts * stride, &mem);
+    id<MTLBuffer> vb;
+    u32 at = transient_alloc(verts * stride, &mem, &vb);
     memcpy(mem, GP(ARG(3)), (size_t)verts * stride);
-    [enc setVertexBuffer:transient[transient_frame] offset:at atIndex:0];
+    [enc setVertexBuffer:vb offset:at atIndex:0];
     e.vb[0] = nil;
     [enc drawPrimitives:prim_type(ARG(1)) vertexStart:0 vertexCount:verts];
     n_draws++;
@@ -1622,19 +1727,20 @@ static void m_DrawIndexedPrimitiveUP(CPU *c) {  // this, type, min index, vertic
     u32 stride = ARG(8), verts = ARG(2) + ARG(3), count = prim_verts(ARG(1), ARG(4));
     int wide = ARG(6) == 102;
     u32 st[3] = {stride, streams[1].stride, streams[2].stride};
-    if (!prepare_draw(st)) {
+    if (!prepare_draw(st, 0)) {
         RET(0);
         return;
     }
     void *vm, *im;
-    u32 vat = transient_alloc(verts * stride, &vm);
+    id<MTLBuffer> vb, ib;
+    u32 vat = transient_alloc(verts * stride, &vm, &vb);
     memcpy(vm, GP(ARG(7)), (size_t)verts * stride);
     u32 ibytes = count * (wide ? 4u : 2u);
-    u32 iat = transient_alloc(ibytes, &im);
+    u32 iat = transient_alloc(ibytes, &im, &ib);
     memcpy(im, GP(ARG(5)), ibytes);
-    [enc setVertexBuffer:transient[transient_frame] offset:vat atIndex:0];
+    [enc setVertexBuffer:vb offset:vat atIndex:0];
     e.vb[0] = nil;
-    [enc drawIndexedPrimitives:prim_type(ARG(1)) indexCount:count indexType:wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16 indexBuffer:transient[transient_frame] indexBufferOffset:iat];
+    [enc drawIndexedPrimitives:prim_type(ARG(1)) indexCount:count indexType:wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16 indexBuffer:ib indexBufferOffset:iat];
     n_draws++;
     if (__builtin_expect(fmap_on, 0)) trace_draw(ARG(1), ARG(4));
     RET(0);
@@ -1746,8 +1852,9 @@ static void m_Clear(CPU *c) {  // this, rect count, rects, flags, color, z, sten
         return;
     }
     u32 tw = rt_surface ? rt_surface->width : ds_surface->width, th = rt_surface ? rt_surface->height : ds_surface->height;
-    // Direct3D clears what's inside the viewport, and inside the scissor when that's on.
-    u32 area[4] = {vp[0], vp[1], vp[0] + vp[2], vp[1] + vp[3]};
+    // Direct3D clears what's inside the viewport, and inside the scissor when that's on. The viewport's origin can be -1, as for the full-screen effects, so it's signed here too.
+    long x0 = (int)vp[0], y0 = (int)vp[1], x1 = x0 + (long)vp[2], y1 = y0 + (long)vp[3];
+    u32 area[4] = {x0 > 0 ? (u32)x0 : 0, y0 > 0 ? (u32)y0 : 0, x1 > 0 ? (u32)x1 : 0, y1 > 0 ? (u32)y1 : 0};
     if (rs[174]) {
         if (scissor[0] > area[0]) area[0] = scissor[0];
         if (scissor[1] > area[1]) area[1] = scissor[1];
@@ -1865,6 +1972,7 @@ static void resolve_into(Obj *s, id<MTLTexture> into, u32 level, u32 slice) {
     a.resolveLevel = level;
     a.resolveSlice = slice;
     id<MTLRenderCommandEncoder> r = [cb renderCommandEncoderWithDescriptor:p];
+    if (__builtin_expect(labels_on(), 0)) r.label = [NSString stringWithFormat:@"resolve pass %lux%lu x%lu", (unsigned long)s->tex.width, (unsigned long)s->tex.height, (unsigned long)s->tex.sampleCount];
     [r endEncoding];
 }
 static void stretch(CPU *c, Obj *s, Obj *d);
@@ -1888,10 +1996,37 @@ static void stretch(CPU *c, Obj *s, Obj *d) {
     u32 sw = sr[2] - sr[0], sh = sr[3] - sr[1], dw = dr[2] - dr[0], dh = dr[3] - dr[1];
     int whole_d = !dr[0] && !dr[1] && dw == d->width && dh == d->height;
     int same_size = sw == dw && sh == dh;
+    int plain_resolve = s->samples > 1 && d->samples <= 1 && whole_d && same_size && !sr[0] && !sr[1] && sw == s->width && sh == s->height && s->tex.pixelFormat == d->tex.pixelFormat;
+    // ARKHAM_TRACE_RESOLVE=1: why an average needs a pass of its own, from the state as the copy comes.
+    static int trace_resolve = -1, resolve_told;
+    if (trace_resolve < 0) trace_resolve = getenv("ARKHAM_TRACE_RESOLVE") != NULL;
+    char why[200] = "";
+    if (__builtin_expect(trace_resolve, 0) && plain_resolve && !s->is_depth && resolve_told < 40)
+        snprintf(why, sizeof why, "open pass on %s, store %s, averaged into %s, target set now %s, clear waiting %c%c%c, parked %s, draws in pass %u",
+                 !enc ? "nothing" : enc_rt == s ? "it" : "another surface", enc_unknown_store ? "undecided" : "decided", s->resolve_tex == d->tex ? "the same texture" : s->resolve_tex ? "another texture" : "nothing yet",
+                 rt_surface == s ? "it" : rt_surface == d ? "the destination" : "another surface", pending_clear.color ? 'C' : '-', pending_clear.depth ? 'D' : '-', pending_clear.stencil ? 'S' : '-',
+                 !parked ? "nothing" : parked_rt == s ? "it" : "another surface", pass_draws);
+    // A clear that waits for the next pass is on the target now set, so when that's neither surface of this copy, the clear can just as well come after it, and the pass on
+    // the source stays open to average as it ends.
+    if (plain_resolve && !s->is_depth && rt_surface != s && rt_surface != d) {
+        if (parked && parked_rt == s) {
+            close_enc();
+            resume_parked();
+        }
+        if (enc && enc_rt == s && enc_unknown_store && s->resolve_tex == d->tex && s->resolve_level == d->level && s->resolve_slice == d->slice) {
+            if (d->parent) d->parent->written_cb = cb_serial;
+            [enc setColorStoreAction:MTLStoreActionStoreAndMultisampleResolve atIndex:0];
+            if (__builtin_expect(labels_on(), 0)) enc.label = [enc.label stringByAppendingString:@" +resolve"];
+            enc_unknown_store = 0;
+            n_resolves_in_pass++;
+            end_pass();
+            RET(0);
+            return;
+        }
+    }
     flush_clears();
     if (d->parent) d->parent->written_cb = cb_serial;
     if (d->is_depth) d->s_known = 0;
-    int plain_resolve = s->samples > 1 && d->samples <= 1 && whole_d && same_size && !sr[0] && !sr[1] && sw == s->width && sh == s->height && s->tex.pixelFormat == d->tex.pixelFormat;
     if (plain_resolve && !s->is_depth) {
         if (parked && parked_rt == s) {
             close_enc();
@@ -1919,6 +2054,10 @@ static void stretch(CPU *c, Obj *s, Obj *d) {
     u32 from_level = s->level, from_slice = s->slice;
     if (s->samples > 1 && d->samples <= 1) {
         if (plain_resolve) {
+            if (why[0]) {
+                resolve_told++;
+                fprintf(stderr, "[resolve] a pass of its own for %ux%u x%d at frame %llu: %s\n", s->width, s->height, s->samples, (unsigned long long)frame_no, why);
+            }
             resolve_into(s, d->tex, d->level, d->slice);
             RET(0);
             return;
@@ -2350,9 +2489,9 @@ static void note_frame(u64 draws) {
         double secs = (double)(now - fps_start) / 1e9, fps = (double)fps_frames / secs;
         double per_frame = 125.0 / 3.0 / 1e6 / (double)fps_frames;
         u64 shown = atomic_exchange(&n_shown, 0);
-        fprintf(stderr, "[fps] %.1f, worst frame %.1f ms, %llu draws, %llu passes; ms a frame: thread busy %.1f, gpu %.1f, drawable %.2f, waiting for gpu %.2f, engine waiting for queries %.1f; %llu quad clears, %llu not needed, %llu resolves in pass; %llu of %llu shaders compiled in %.0f ms, %u pipelines in %.0f ms; on screen %.1f a second, %llu dropped, longest gap %.1f ms, %.1f ms from present\n",
+        fprintf(stderr, "[fps] %.1f, worst frame %.1f ms, %llu draws, %llu passes; ms a frame: thread busy %.1f, gpu %.1f, drawable %.2f, waiting for gpu %.2f, engine waiting for queries %.1f; %llu quad clears, %llu not needed, %llu resolves in pass; %llu of %llu shaders compiled in %.0f ms, %llu not from the cache, %u pipelines in %.0f ms; on screen %.1f a second, %llu dropped, longest gap %.1f ms, %.1f ms from present\n",
                 fps, (double)fps_worst / 1e6, draws_seen, n_passes / fps_frames, (double)rt_d3dq_busy_ticks * per_frame, (double)atomic_exchange(&gpu_ns, 0) / 1e6 / (double)fps_frames, (double)ticks_drawable * per_frame,
-                (double)ticks_inflight * per_frame, (double)ticks_query_wait * per_frame, n_quad_clears / fps_frames, n_skipped_clears / fps_frames, n_resolves_in_pass / fps_frames, n_compiled, n_created, (double)compile_ticks * 125.0 / 3.0 / 1e6, n_pipes, (double)pipe_ticks * 125.0 / 3.0 / 1e6,
+                (double)ticks_inflight * per_frame, (double)ticks_query_wait * per_frame, n_quad_clears / fps_frames, n_skipped_clears / fps_frames, n_resolves_in_pass / fps_frames, n_compiled, n_created, (double)compile_ticks * 125.0 / 3.0 / 1e6, n_uncached, n_pipes, (double)pipe_ticks * 125.0 / 3.0 / 1e6,
                 (double)shown / secs, atomic_exchange(&n_not_shown, 0), (double)atomic_exchange(&shown_worst_us, 0) / 1e3, shown ? (double)atomic_exchange(&shown_wait_us, 0) / 1e3 / (double)shown : 0.0);
         rt_d3dq_busy_ticks = ticks_drawable = ticks_inflight = ticks_query_wait = 0;
         n_passes = n_quad_clears = n_skipped_clears = n_resolves_in_pass = 0;
@@ -2363,7 +2502,31 @@ static void note_frame(u64 draws) {
     }
     rt_hitch_tick();
 }
+// ARKHAM_COMPILE_TEST=list: once the window and its layer are up, compiles each file of the list one after another as the game would, logs each one's time and quits. One from Metal's
+// cache takes well under a millisecond, so this shows whether the running game finds what tools/prebuild_shaders.sh compiled.
+static void compile_test(const char *list) {
+    NSString *text = [NSString stringWithContentsOfFile:@(list) encoding:NSUTF8StringEncoding error:nil];
+    [[dev newLibraryWithSource:@"#include <metal_stdlib>\nfragment float4 warm_up() { return float4(1.0); }\n" options:compile_options() error:nil] release];
+    int n = 0, cached = 0;
+    double total = 0;
+    for (NSString *path in [text componentsSeparatedByString:@"\n"]) {
+        if (!path.length) continue;
+        NSString *src = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+        double t0 = CACurrentMediaTime();
+        [[dev newLibraryWithSource:src options:compile_options() error:nil] release];
+        double ms = (CACurrentMediaTime() - t0) * 1e3;
+        fprintf(stderr, "[compile-test] %s %.1f ms\n", path.lastPathComponent.UTF8String, ms);
+        n++;
+        cached += ms < 2;
+        total += ms;
+    }
+    fprintf(stderr, "[compile-test] %d shaders, %d from the cache, %.0f ms in all, Metal HUD %s\n", n, cached, total, getenv("MTL_HUD_ENABLED") ? "on" : "off");
+    _exit(0);
+}
 static void m_Present(CPU *c) {
+    static const char *ctest = (const char *)1;
+    if (ctest == (const char *)1) ctest = getenv("ARKHAM_COMPILE_TEST");
+    if (__builtin_expect(ctest != NULL, 0) && atomic_load(&layer_ready) && frame_no >= 60) compile_test(ctest);
     flush_clears();
     end_pass();
     ensure_cb();
@@ -2483,6 +2646,7 @@ static void m_Present(CPU *c) {
         }
     }
     transient_frame = (transient_frame + 1) % TRANSIENT_FRAMES;
+    transient_link = 0;
     transient_at = 0;
     vs_const_dirty = ps_const_dirty = 1;
     if (frame_pool) objc_autoreleasePoolPop(frame_pool);
@@ -2504,7 +2668,7 @@ static void start_device(void) {
     dev = MTLCreateSystemDefaultDevice();
     queue = [dev newCommandQueueWithMaxCommandBufferCount:64];
     frames_in_flight = dispatch_semaphore_create(TRANSIENT_FRAMES - 1);
-    for (int i = 0; i < TRANSIENT_FRAMES; i++) transient[i] = [dev newBufferWithLength:TRANSIENT_SIZE options:MTLResourceStorageModeShared];
+    for (int i = 0; i < TRANSIENT_FRAMES; i++) transient[i][0] = [dev newBufferWithLength:TRANSIENT_SIZE options:MTLResourceStorageModeShared];
     visibility = [dev newBufferWithLength:VIS_SLOTS * 8 options:MTLResourceStorageModeShared];
     static const float zero_one[4] = {0, 0, 0, 1};
     dummy_attr = [dev newBufferWithBytes:zero_one length:16 options:MTLResourceStorageModeShared];
@@ -2601,7 +2765,7 @@ static const struct {
     {"Device.SetViewport", m_SetViewport}, {"Device.SetScissorRect", m_SetScissorRect}, {"Device.SetClipPlane", m_SetClipPlane}, {"Device.SetRenderState", m_SetRenderState},
     {"Device.SetSamplerState", m_SetSamplerState}, {"Device.SetTexture", m_SetTexture}, {"Device.SetVertexShader", m_SetVertexShader}, {"Device.SetPixelShader", m_SetPixelShader},
     {"Device.SetVertexShaderConstantF", m_SetVSConst}, {"Device.SetPixelShaderConstantF", m_SetPSConst}, {"Device.SetVertexDeclaration", m_SetVertexDeclaration},
-    {"Device.SetStreamSource", m_SetStreamSource}, {"Device.SetStreamSourceFreq", m_Nothing}, {"Device.SetIndices", m_SetIndices}, {"Device.DrawPrimitive", m_DrawPrimitive},
+    {"Device.SetStreamSource", m_SetStreamSource}, {"Device.SetStreamSourceFreq", m_SetStreamSourceFreq}, {"Device.SetIndices", m_SetIndices}, {"Device.DrawPrimitive", m_DrawPrimitive},
     {"Device.DrawIndexedPrimitive", m_DrawIndexedPrimitive}, {"Device.DrawPrimitiveUP", m_DrawPrimitiveUP}, {"Device.DrawIndexedPrimitiveUP", m_DrawIndexedPrimitiveUP},
     {"Device.StretchRect", m_StretchRect}, {"Device.Present", m_Present}, {"Query.Issue", m_QueryIssue}, {"Query.GetData", m_QueryGetData}, {"Texture.GetSurfaceLevel", m_GetSurfaceLevel},
     {"Texture.LockRect", m_TexLock}, {"Texture.UnlockRect", m_TexUnlock}, {"CubeTexture.LockRect", m_CubeLock}, {"CubeTexture.UnlockRect", m_CubeUnlock},

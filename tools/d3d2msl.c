@@ -63,6 +63,17 @@ int main(int argc, char **argv) {
                     fclose(o);
                 }
                 free(msl);
+                // The device's second translation of a vertex shader, for pixel shaders that read more than it writes: the same text, so the prebuild puts it in the cache.
+                if (!info.is_pixel && (info.varyings & D3DSH_ALL_VARYINGS) != D3DSH_ALL_VARYINGS) {
+                    D3dShaderInfo all;
+                    char *more = d3dsh_translate(code, D3DSH_ALL_VARYINGS, &all);
+                    snprintf(path, sizeof path, "%s/vsall_%016llx.metal", out, (unsigned long long)h);
+                    if (more && (o = fopen(path, "w"))) {
+                        fputs(more, o);
+                        fclose(o);
+                    }
+                    free(more);
+                }
             }
             n++;
             i += (size_t)words * 4 - 1;

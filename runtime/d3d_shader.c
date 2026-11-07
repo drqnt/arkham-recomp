@@ -70,6 +70,7 @@ typedef struct {
     D3dShaderInfo *info;
     float defs[256][4];
     unsigned char is_def[256];
+    int any_def, uses_crel;
     // what each input and output register means
     signed char input_usage[32], input_index[32];
     signed char output_usage[16], output_index[16];
@@ -125,8 +126,11 @@ static const u32 *source(Ctx *x, const u32 *p, char *out, size_t cap) {
             break;
         case R_CONST:
             if (relative) {
+                // Registers the shader defines itself win over the ones the engine sets, even when read through a0, as in Direct3D. SpeedTree leaves keep
+                // their card corners that way, and terrain its morph constants.
                 static const char n[] = "xyzw";
-                snprintf(name, sizeof name, "c[a0.%c + %u]", n[(rel >> 16) & 3], num);
+                if (x->any_def) x->uses_crel = 1;
+                snprintf(name, sizeof name, x->any_def ? "crel(c, a0.%c + %u)" : "c[a0.%c + %u]", n[(rel >> 16) & 3], num);
             } else if (num < 256 && x->is_def[num]) {
                 snprintf(name, sizeof name, "k%u", num);
             } else {
@@ -282,6 +286,7 @@ char *d3dsh_translate(const uint32_t *code, uint32_t force_varyings, D3dShaderIn
             u32 num = reg_num(code[i + 1]);
             if (num < 256) {
                 x.is_def[num] = 1;
+                x.any_def = 1;
                 memcpy(x.defs[num], code + i + 2, 16);
             }
         } else {
@@ -466,6 +471,12 @@ char *d3dsh_translate(const uint32_t *code, uint32_t force_varyings, D3dShaderIn
     }
     // The whole function.
     add(&b, "%s%s", prelude_common, x.pixel ? prelude_ps : prelude_vs);
+    if (x.uses_crel) {
+        add(&b, "inline float4 crel(constant float4 *c, int i) {\n    switch (i) {\n");
+        for (int r = 0; r < 256; r++)
+            if (x.is_def[r]) add(&b, "        case %d: return float4(%.9g, %.9g, %.9g, %.9g);\n", r, x.defs[r][0], x.defs[r][1], x.defs[r][2], x.defs[r][3]);
+        add(&b, "        default: return c[i];\n    }\n}\n");
+    }
     if (x.pixel) {
         add(&b, "struct PsIn {\n    float4 pos [[position]];\n");
         if (uses_vface) add(&b, "    bool front [[front_facing]];\n");
