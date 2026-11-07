@@ -962,7 +962,7 @@ static int input_ini_file(const char *path) {
             }
         }
         static int told;
-        if (fd >= 0 && told++ < 8)
+        if (fd >= 0 && (told++ < 8 || strstr(path, "Camera.ini")))
             fprintf(stderr, "[input] the engine reads %s with %d settings changed for the touch camera%s\n", strrchr(path, '/') ? strrchr(path, '/') + 1 : path, changed,
                     strstr(path, "Camera.ini") ? (getenv("ARKHAM_CAMERA_ASSIST") && *getenv("ARKHAM_CAMERA_ASSIST") == '1' ? ", camera assist on" : ", camera assist off") : "");
     }

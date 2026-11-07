@@ -428,6 +428,8 @@ static void eh_report(void) {
     fprintf(stderr, "[eh] %llu throws so far: %.0f ms finding handlers, %.0f ms finding their native frames in %llu steps\n", n,
             (double)atomic_load(&eh_ns_find) / 1e6, (double)atomic_load(&eh_ns_native) / 1e6, atomic_load(&eh_steps));
 }
+// Also once a second from the frame rate line (mtl_device.m), since the game may throw a burst at startup and then none for a long time.
+void rt_eh_report(void) { eh_report(); }
 // Native frames mirror guest frames, so the k-th native frame of the handler's function is the handler's frame.
 static int find_native_caller(unw_cursor_t *out, u32 identity, int occurrence) {
     unw_context_t uc;

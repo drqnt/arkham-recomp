@@ -1214,7 +1214,13 @@ static void script_key(int code) {
 }
 // Relative mouse motion, which is what steers the camera in play.
 void rt_scripted_mouse_get(double *x, double *y);
+int rt_scripted_direct_look(double dx, double dy);  // shims_sys.c: with ARKHAM_MOUSE_DIRECT, straight to the engine as the touch camera does
+void rt_fake_pad_jitter(int n);                    // shims_hid.m
 static void script_look(double dx, double dy) {
+    if (rt_scripted_direct_look(dx, dy)) {
+        fprintf(stderr, "[input] look %.0f %.0f, straight to the engine\n", dx, dy);
+        return;
+    }
     // The engine turns the camera by how far the pointer is from where it last warped it.
     double x = 0, y = 0;
     rt_scripted_mouse_get(&x, &y);
@@ -1261,7 +1267,7 @@ static void script_press(void) {
 typedef struct { mach_vm_address_t at; mach_vm_size_t size; u32 *copy; u8 *still; } MemRegion;
 static MemRegion *mregions;
 static int n_mregions;
-typedef struct { u32 guest; i32 base, changed; } MemHit;
+typedef struct { u32 guest; i32 base, changed; int back; } MemHit;
 static MemHit *mhits;
 static size_t n_mhits;
 static void mscan(const char *what) {
@@ -1329,9 +1335,22 @@ static void mscan(const char *what) {
             long moved = (long)mhits[j].changed - mhits[j].base, back = (long)now - mhits[j].base;
             if (labs(back) * 4 > labs(moved)) continue;
             fprintf(stderr, "[mscan] %08x: %d -> %d -> %d\n", mhits[j].guest, mhits[j].base, mhits[j].changed, now);
+            mhits[j].back = 1;
             shown++;
         }
         fprintf(stderr, "[mscan] %d came back\n", shown);
+    } else if (!strcmp(what, "mpeek")) {
+        // The values that came back (mback) as they are now: a watch on what the scan found, e.g. the camera's angle while walking.
+        char line[1200];
+        size_t len = 0;
+        int shown = 0;
+        for (size_t j = 0; j < n_mhits && shown < 24; j++) {
+            if (!mhits[j].back) continue;
+            len += (size_t)snprintf(line + len, sizeof line - len, " %08x=%d", mhits[j].guest, (i32)G32(mhits[j].guest));
+            shown++;
+        }
+        unsigned rt_frames_presented(void);
+        fprintf(stderr, "[mscan] peek at frame %u:%s\n", rt_frames_presented(), line);
     }
 }
 #endif
@@ -1348,8 +1367,8 @@ static void input_schedule(void) {
         if (sscanf(item, "%lf:%15[a-z]:%lf:%lf", &secs, kind, &x, &y) < 3) continue;
         int is_key = !strcmp(kind, "key"), is_click = !strcmp(kind, "click");
         int is_down = !strcmp(kind, "down"), is_up = !strcmp(kind, "up"), is_look = !strcmp(kind, "look"), is_quit = !strcmp(kind, "quit"), is_press = !strcmp(kind, "press"), is_cmdq = !strcmp(kind, "cmdq");
-        int is_shot = !strcmp(kind, "shot"), is_pad = !strcmp(kind, "pad");
-        int is_mscan = !strcmp(kind, "mbase") || !strcmp(kind, "mstable") || !strcmp(kind, "mchange") || !strcmp(kind, "mback"), is_mpoke = !strcmp(kind, "mpoke");
+        int is_shot = !strcmp(kind, "shot"), is_pad = !strcmp(kind, "pad"), is_jit = !strcmp(kind, "jit");
+        int is_mscan = !strcmp(kind, "mbase") || !strcmp(kind, "mstable") || !strcmp(kind, "mchange") || !strcmp(kind, "mback") || !strcmp(kind, "mpeek"), is_mpoke = !strcmp(kind, "mpoke");
         int is_mdump = !strcmp(kind, "mdump");
         char *kind_copy = is_mscan ? strdup(kind) : NULL;  // the block can't take an array
         CFRunLoopTimerRef t = CFRunLoopTimerCreateWithHandler(NULL, start + secs, 0, 0, 0, ^(CFRunLoopTimerRef tt) {
@@ -1364,6 +1383,8 @@ static void input_schedule(void) {
             } else if (is_mpoke) {
                 G32((u32)x) += (u32)(i32)y;
                 fprintf(stderr, "[mscan] poked %08x by %d: now %d\n", (u32)x, (int)y, (i32)G32((u32)x));
+            } else if (is_jit) {
+                rt_fake_pad_jitter((int)x);
             } else if (is_pad) {
                 rt_fake_pad_set(1, (int)x, (int)y);
             } else if (is_shot) {

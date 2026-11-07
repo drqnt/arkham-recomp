@@ -306,6 +306,25 @@ static void show_text(UIViewController *vc, NSString *text) {
     AVAudioSession *audio = AVAudioSession.sharedInstance;
     if (![audio setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:&err] || ![audio setActive:YES error:&err])
         fprintf(stderr, "[ios] sound session: %s\n", err.localizedDescription.UTF8String);
+    // iOS stops the app's sound while it's away, and after an interruption (a call, another app's sound); nothing starts it again by itself.
+    // So on coming back, and when an interruption ends, the session is made active again and the output unit started (shims_audio.c).
+    void rt_audio_resume(const char *why);
+    void (^resume)(const char *) = ^(const char *why) {
+        NSError *e = nil;
+        if (![AVAudioSession.sharedInstance setActive:YES error:&e]) fprintf(stderr, "[audio] the sound session again (%s): %s\n", why, e.localizedDescription.UTF8String);
+        rt_audio_resume(why);
+    };
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+        resume("the app is back");
+    }];
+    [NSNotificationCenter.defaultCenter addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+        NSUInteger type = [n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
+        fprintf(stderr, "[audio] interruption %s\n", type == AVAudioSessionInterruptionTypeBegan ? "began" : "ended");
+        if (type == AVAudioSessionInterruptionTypeEnded) resume("an interruption ended");
+    }];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+        fprintf(stderr, "[ios] the app went to the background\n");
+    }];
     // How warm the phone gets, in the log as it changes.
     [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
         fprintf(stderr, "[ios] thermal state: %s\n", thermal_name(NSProcessInfo.processInfo.thermalState).UTF8String);

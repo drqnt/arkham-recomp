@@ -161,6 +161,16 @@ static void mix_start(void) {
     OSStatus r = AudioOutputUnitStart(mix_unit);
     fprintf(stderr, "[audio] the phone's output: %.0f Hz stereo, one RemoteIO for everything: %d\n", MIX_RATE, (int)r);
 }
+// The phone's output again after iOS stopped it: the app sent away and back, or an interruption that ended (ios/app/main.m). Starting a unit that
+// runs already does nothing.
+void rt_audio_resume(const char *why) {
+    pthread_mutex_lock(&mix_mu);
+    if (mix_unit) {
+        OSStatus r = AudioOutputUnitStart(mix_unit);
+        fprintf(stderr, "[audio] the phone's output started again (%s): %d\n", why, (int)r);
+    }
+    pthread_mutex_unlock(&mix_mu);
+}
 static void mix_add(Ring *r, double rate) {
     pthread_mutex_lock(&mix_mu);
     mix_start();

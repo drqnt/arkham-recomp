@@ -2896,8 +2896,9 @@ static void note_frame(u64 draws) {
         double per_frame = 125.0 / 3.0 / 1e6 / (double)fps_frames;
         u64 shown = atomic_exchange(&n_shown, 0);
         char threads[96];
-        void rt_thread_cpu_report(char *out, size_t cap, double frames);
+        void rt_thread_cpu_report(char *out, size_t cap, double frames), rt_eh_report(void);
         rt_thread_cpu_report(threads, sizeof threads, (double)fps_frames);
+        rt_eh_report();
         double gpu_ms = (double)atomic_exchange(&gpu_ns, 0) / 1e6 / (double)fps_frames;
         fprintf(stderr, "[fps] %.1f, worst frame %.1f ms, %llu draws, %llu passes; ms a frame: thread busy %.1f, gpu %.1f, drawable %.2f, waiting for gpu %.2f, engine waiting for queries %.1f; %llu quad clears, %llu not needed, %llu resolves in pass; %llu of %llu shaders compiled in %.0f ms, %llu not from the cache, %llu built ahead, %u pipelines in %.0f ms (%llu draws left out waiting for one); on screen %.1f a second, %llu dropped, longest gap %.1f ms, %.1f ms from present; guest threads, CPU ms a frame: %s\n",
                 fps, (double)fps_worst / 1e6, draws_seen, n_passes / fps_frames, (double)rt_d3dq_busy_ticks * per_frame, gpu_ms, (double)ticks_drawable * per_frame,

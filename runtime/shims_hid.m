@@ -210,6 +210,13 @@ static void fake_events(Profile *f) {
             if (f->controls[i].page == items[j].page && f->controls[i].usage == items[j].usage) f->controls[i].fake = items[j].value;
     }
 }
+// A scripted run's "jit:n" step: the pad with no hardware's sticks, wherever they're held off the middle, wander by up to n steps each tick from then
+// on, as a thumb on the touch controls' stick does. 0 holds them still again.
+static int fake_jitter;
+void rt_fake_pad_jitter(int n) {
+    fake_jitter = n;
+    fprintf(stderr, "[pad] scripted sticks wander by %d\n", n);
+}
 // A scripted run's "pad" step: one control of the pad with no hardware set now.
 unsigned rt_frames_presented(void);  // mtl_device.m
 void rt_fake_pad_set(int page, int usage, int value) {
@@ -308,6 +315,11 @@ static void tick(void) {
     for (int i = 0; i < want->n && i < 64; i++) {
         Control *k = &want->controls[i];
         vals[i] = fake_pad ? k->fake : touching ? read_touch(want, k) : read_control(want, g, k);
+        if (fake_pad && fake_jitter && (k->what == LX || k->what == LY || k->what == RX || k->what == RY) && k->fake != stick(want, 0)) {
+            static unsigned seed = 12345;
+            seed = seed * 1103515245u + 12345u;
+            vals[i] = clamp(k->fake + (int)((seed >> 16) % (unsigned)(2 * fake_jitter + 1)) - fake_jitter, want->signed_sticks ? -32768 : 0, want->signed_sticks ? 32767 : 255);
+        }
         any |= vals[i] != k->last;
     }
     if (!any) return;
