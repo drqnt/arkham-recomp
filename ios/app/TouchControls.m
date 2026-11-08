@@ -46,7 +46,7 @@ void rt_ios_overlay_hidden(int hidden);
 CGRect rt_ios_game_rect(void);       // main.m: where the game's picture is
 
 // The runtime's numbers for the controls (the enum in shims_hid.m), and the wheel's own.
-enum { C_LT = 4, C_RT = 5, B_SOUTH = 7, B_EAST, B_WEST, B_NORTH, B_LB, B_RB, B_START, B_BACK, B_L3, B_R3, B_HOME, D_UP, D_DOWN, D_LEFT, D_RIGHT, C_WHEEL = 100, C_PHOTO, C_TWOSTICKS };
+enum { C_LT = 4, C_RT = 5, B_SOUTH = 7, B_EAST, B_WEST, B_NORTH, B_LB, B_RB, B_START, B_BACK, B_L3, B_R3, B_HOME, D_UP, D_DOWN, D_LEFT, D_RIGHT, C_WHEEL = 100, C_PHOTO, C_TWOSTICKS, C_COMBO_TD, C_COMBO_THROW, C_COMBO_GROUND };
 enum { STYLE_PS, STYLE_XBOX, STYLE_ICONS };
 enum { SH_NONE, SH_CROSS, SH_CIRCLE, SH_SQUARE, SH_TRIANGLE };
 enum { SIDE_UP, SIDE_RIGHT, SIDE_DOWN, SIDE_LEFT };
@@ -121,6 +121,11 @@ static const Def defs[] = {
     // A second throw, on the left, shown only while a gadget is aimed (L2 held): with everything under the right thumb, holding the aim leaves no
     // finger for R2 (the owner, 2026-11-08). The pad's R2 like the other; drawn as the batarang, as R2 is while aiming.
     {"r2aim", C_RT, {BL, 120, -170, 34}, {BL, 75, -215, 38}, "R2", "RT", "batarang", "Бросок слева (видна только при прицеле)", SH_NONE, 0xFFFFFF, 0xFFFFFF},
+    // The moves that take two buttons at once, one touch each, since one thumb can't press two (the owner, 2026-11-08): Special Combo
+    // Takedown (triangle and circle, after a combo of 8), Special Combo Throw (circle and cross), Ground Takedown (R2 and triangle).
+    {"combo_td", C_COMBO_TD, {BR, -290, -50, 24}, {TR, -185, 125, 24}, "△○", "Y+B", "bolt.fill", "Особое добивание (△ и ○ вместе), после серии ×8", SH_NONE, 0xFFFFFF, 0xFFFFFF},
+    {"combo_throw", C_COMBO_THROW, {BR, -345, -50, 24}, {TR, -130, 125, 24}, "○✕", "B+A", "arrow.uturn.down", "Особый бросок (○ и ✕ вместе), после серии ×8", SH_NONE, 0xFFFFFF, 0xFFFFFF},
+    {"combo_ground", C_COMBO_GROUND, {BR, -290, -105, 24}, {TR, -75, 125, 24}, "R2△", "RT+Y", "arrow.down.to.line", "Добивание лежачего (R2 и △ вместе)", SH_NONE, 0xFFFFFF, 0xFFFFFF},
 };
 #define N_DEFS (sizeof defs / sizeof defs[0])
 // Outside play the only one: backs out of menus, closes the map, skips a cutscene. It stays at the top left, as the gear does at the right.
@@ -289,6 +294,16 @@ static void open_settings(void);
     unsigned pulse_bits;  // the wheel's choice, held for a moment
     CFTimeInterval pulse_until;
     CAShapeLayer *stick_base, *stick_knob;
+    // Crouch by a tap: R2 latched down until tapped again (the setting "Присед нажатием"), so the thumb is free for the camera. R2 is the throw
+    // while a gadget is aimed, and its release ends the crouch and releases a gadget (DefaultInput.ini: StealthOrGadget), so the latch steps
+    // aside while L2 is held: the game is shown R2 let go for 30 ms before it sees L2, and R2 again only 30 ms after L2 is let go. The game
+    // reads the pad every 4 ms, so the two never land in one reading.
+    BOOL crouch_latched, latch_shown;
+    CFTimeInterval latch_changed_at, l2_up_at;
+    // R2 tapped twice quickly is the game's quick Batclaw ("Double Tap to Quick Fire Batclaw"): the second tap lets the latch go and presses R2
+    // once more, briefly, so the game sees the double tap it expects.
+    CFTimeInterval crouch_tapped_at, rt_pulse_from, rt_pulse_until;
+    float lt_sent;
     // Two sticks (the cryptographic sequencer): the second one, where the camera's swipe would be, as the pad's right stick.
     BOOL twosticks;
     UITouch *rstick_touch;
@@ -610,9 +625,10 @@ static void open_settings(void);
                 b.badge_symbol.lineCap = kCALineCapRound;
                 b.badge_symbol.lineJoin = kCALineJoinRound;
             } else {
-                CGFloat font = strlen(d->ps) > 1 ? br * 0.95 : br * 1.1;
+                NSString *badge = @(d->ps);  // in characters: the combos' symbols take several bytes each
+                CGFloat font = badge.length > 2 ? br * 0.72 : badge.length > 1 ? br * 0.95 : br * 1.1;
                 b.badge_text.hidden = NO;
-                b.badge_text.string = @(d->ps);
+                b.badge_text.string = badge;
                 b.badge_text.fontSize = font;
                 b.badge_text.font = (__bridge CFTypeRef)[UIFont systemFontOfSize:font weight:UIFontWeightHeavy];
                 b.badge_text.foregroundColor = UIColor.whiteColor.CGColor;
@@ -636,10 +652,11 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
     BOOL down = b.holders > 0;
     float ink = b.ink;
     BOOL lit = (b.def->control == C_RT && b.kind == KIND_BAT)     // R2 while aiming: lit up, to show where to throw
-               || (b.def->control == C_TWOSTICKS && twosticks);  // the two sticks, while they're on
+               || (b.def->control == C_TWOSTICKS && twosticks)   // the two sticks, while they're on
+               || (b.def->control == C_RT && crouch_latched && !aim_only(b.def));  // crouching by a tap
     UIColor *fg = ink_color(ink, 1);
     b.group.opacity = b.badge_group.opacity = [self opacityOf:b];
-    b.back.fillColor = (down ? ink_color(ink, 0.55) : lit && b.def->control == C_TWOSTICKS ? rgb(0x3C8FE0, 0.6) : ink_color(1 - ink, 0.5)).CGColor;
+    b.back.fillColor = (down ? ink_color(ink, 0.55) : lit && (b.def->control == C_TWOSTICKS || (b.def->control == C_RT && crouch_latched)) ? rgb(0x3C8FE0, 0.6) : ink_color(1 - ink, 0.5)).CGColor;
     b.back.strokeColor = (self.editing && b.hiddenByPlayer ? rgb(0xE86A6A, 0.95)
                           : lit                          ? rgb(0x7FB2E5, 1)
                                                          : ink_color(ink, 0.9)).CGColor;
@@ -726,6 +743,12 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
         if (k == C_LT) lt = 1;
         else if (k == C_RT) rt = 1;
         else if (k < C_WHEEL) bits |= 1u << k;
+        else if (k == C_COMBO_TD) bits |= 1u << B_NORTH | 1u << B_EAST;
+        else if (k == C_COMBO_THROW) bits |= 1u << B_EAST | 1u << B_SOUTH;
+        else if (k == C_COMBO_GROUND) {
+            rt = 1;
+            bits |= 1u << B_NORTH;
+        }
     }
     if (running) bits |= 1u << B_SOUTH;
     if (pulse_bits && CACurrentMediaTime() < pulse_until) bits |= pulse_bits;
@@ -733,6 +756,31 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
         lt = MAX(lt, zoom_lt);  // a pinch on the map: R2 zooms in, L2 out
         rt = MAX(rt, zoom_rt);
     }
+    if (crouch_latched && !in_menu) {
+        CFTimeInterval now = CACurrentMediaTime();
+        if (lt > 0) {
+            if (latch_shown) {
+                latch_shown = NO;
+                latch_changed_at = now;
+            }
+            if (now - latch_changed_at < 0.03) lt = 0;  // L2 waits until R2 has been seen let go
+        } else {
+            if (lt_sent > 0) l2_up_at = now;
+            if (!latch_shown && now - l2_up_at >= 0.03) {
+                latch_shown = YES;
+                latch_changed_at = now;
+            }
+        }
+        if (latch_shown) rt = 1;
+    } else {
+        latch_shown = NO;
+    }
+    if (rt_pulse_until > 0) {
+        CFTimeInterval now = CACurrentMediaTime();
+        if (now >= rt_pulse_from && now < rt_pulse_until) rt = 1;
+        else if (now >= rt_pulse_until) rt_pulse_until = 0;
+    }
+    lt_sent = lt;
     rt_touch_pad(lx, ly, rx, ry, lt, rt, bits);
     // In play walking goes straight to the engine (shims_sys.c); in menus the stick pans, through the pad; with two sticks it is the pad's, everywhere.
     rt_touch_move(lx, ly, !in_menu && !twosticks);
@@ -1032,6 +1080,23 @@ static UIView *gear_view;
             }
             continue;
         }
+        if (b && b.def->control == C_RT && !aim_only(b.def) && ![self aiming] && !in_menu && setting(@"crouchToggle", "ARKHAM_TOUCH_CROUCH_TOGGLE", 1) > 0) {
+            CFTimeInterval tnow = CACurrentMediaTime();
+            if (crouch_latched && tnow - crouch_tapped_at < 0.35) {
+                crouch_latched = NO;
+                rt_pulse_from = tnow + 0.04;  // R2 seen let go first
+                rt_pulse_until = tnow + 0.10;
+            } else {
+                crouch_latched = !crouch_latched;
+            }
+            crouch_tapped_at = tnow;
+            [owners setObject:@"crouch" forKey:t];
+            [tap impactOccurred];
+            [self restyle];
+            [self send];
+            fprintf(stderr, "[touch] crouch %s\n", crouch_latched ? "on: R2 held until tapped again" : "off");
+            continue;
+        }
         if (b) {
             if (b.def->control == B_BACK && !in_menu) {  // the map button in play: what comes next is the map
                 map_open = YES;
@@ -1235,6 +1300,7 @@ static UIView *gear_view;
     zoom_debt = 0;
     zoom_lt = zoom_rt = 0;
     running = panning = NO;
+    crouch_latched = NO;
     pulse_bits = 0;
     stick_base.hidden = stick_knob.hidden = rstick_base.hidden = rstick_knob.hidden = YES;
     if (wheel_open) [self closeWheel];
@@ -1494,11 +1560,12 @@ static UIView *gear_view;
     [self toggle:@"Прятать вне игры" on:setting(@"hideInMenus", "ARKHAM_TOUCH_HIDE", 1) > 0 action:@selector(hideChanged:)];
     [self action:@"Расположение кнопок" selector:@selector(editLayout)];
 
-    [self section:@"Управление" footer:@"Камера поворачивается ровно на столько, на сколько проведён палец, с любой скоростью и на ходу. Скорость — на сколько градусов поворачивает свайп через весь экран. При прицеле (зажата L2) игра сама замедляет камеру, поэтому свайп тогда во столько раз быстрее."];
+    [self section:@"Управление" footer:@"Камера поворачивается ровно на столько, на сколько проведён палец, с любой скоростью и на ходу. Скорость — на сколько градусов поворачивает свайп через весь экран. При прицеле (зажата L2) игра сама замедляет камеру, поэтому свайп тогда во столько раз быстрее. Присед нажатием: R2 включает присед и выключает его повторным нажатием (кнопка синяя); при прицеле R2 — бросок, как обычно, а присед возвращается после прицела."];
     look_value = [self slider:@"Скорость камеры" min:0.25 max:3.0 value:setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) action:@selector(lookChanged:)];
     aim_value = [self slider:@"Камера при прицеле" min:1.0 max:5.0 value:setting(@"aimCameraSpeed", "ARKHAM_TOUCH_AIM_LOOK", 2.5) action:@selector(aimLookChanged:)];
     [self toggle:@"Инвертировать вверх-вниз" on:setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 action:@selector(invertChanged:)];
     [self toggle:@"Бег: стик за край" on:setting(@"autoRun", "ARKHAM_TOUCH_RUN", 1) > 0 action:@selector(runChanged:)];
+    [self toggle:@"Присед нажатием (R2)" on:setting(@"crouchToggle", "ARKHAM_TOUCH_CROUCH_TOGGLE", 1) > 0 action:@selector(crouchToggleChanged:)];
     [self section:@"Камера игры" footer:@"Помощь камеры — сама разворачивает камеру за спину Бэтмена на бегу. С сенсорной камерой она мешает поворачивать на бегу, с геймпадом может быть удобна. Меняется со следующего запуска игры."];
     [self toggle:@"Помощь камеры" on:setting(@"cameraAssist", "ARKHAM_CAMERA_ASSIST", 0) > 0 action:@selector(assistChanged:)];
     [self showValues];
@@ -1550,6 +1617,10 @@ static UIView *gear_view;
 }
 - (void)invertChanged:(UISwitch *)s { set_setting(@"invertLook", s.on); }
 - (void)runChanged:(UISwitch *)s { set_setting(@"autoRun", s.on); }
+- (void)crouchToggleChanged:(UISwitch *)s {
+    set_setting(@"crouchToggle", s.on);
+    if (!s.on) [controls releaseAll];  // a latched crouch let go with it
+}
 - (void)assistChanged:(UISwitch *)s { set_setting(@"cameraAssist", s.on); }
 - (void)hideChanged:(UISwitch *)s { set_setting(@"hideInMenus", s.on); }
 - (void)fpsLineChanged:(UISwitch *)s {

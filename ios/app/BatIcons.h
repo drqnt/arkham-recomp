@@ -326,6 +326,38 @@ static inline void bi_twosticks(CGContextRef g) {
 
 
 
+// The two-button moves, one touch each. Special Combo Takedown (triangle and circle): a lightning bolt.
+static inline void bi_combo_takedown(CGContextRef g) {
+    CGContextMoveToPoint(g, 62, 4);
+    CGContextAddLineToPoint(g, 20, 56);
+    CGContextAddLineToPoint(g, 46, 56);
+    CGContextAddLineToPoint(g, 36, 96);
+    CGContextAddLineToPoint(g, 80, 40);
+    CGContextAddLineToPoint(g, 54, 40);
+    CGContextAddLineToPoint(g, 66, 4);
+    CGContextClosePath(g);
+    CGContextFillPath(g);
+}
+// Special Combo Throw (circle and cross): an arrow up and over.
+static inline void bi_combo_throw(CGContextRef g) {
+    bi_round(g, 12);
+    CGContextMoveToPoint(g, 22, 86);
+    CGContextAddLineToPoint(g, 22, 46);
+    CGContextAddArc(g, 50, 46, 28, (CGFloat)M_PI, 0, 0);
+    CGContextAddLineToPoint(g, 78, 56);
+    CGContextStrokePath(g);
+    bi_tri(g, 60, 54, 96, 54, 78, 84);
+    CGContextFillPath(g);
+}
+// Ground Takedown (R2 and triangle): an arrow down onto the floor.
+static inline void bi_combo_ground(CGContextRef g) {
+    bi_line(g, 16, 50, 8, 50, 50);
+    bi_tri(g, 24, 46, 76, 46, 50, 76);
+    CGContextFillPath(g);
+    bi_rrect(g, 12, 84, 76, 12, 4);
+    CGContextFillPath(g);
+}
+
 // Draws the icon for a button's ident into g, white, in a box of size x size with its top left at the origin and y down; 0 if there's none.
 static inline int bat_icon_draw(CGContextRef g, const char *ident, CGFloat size) {
     static const struct {
@@ -334,7 +366,8 @@ static inline int bat_icon_draw(CGContextRef g, const char *ident, CGFloat size)
     } icons[] = {
         {"cross", bi_run},   {"square", bi_fist},  {"triangle", bi_shield}, {"circle", bi_cape}, {"r1", bi_grapple},  {"r2", bi_crouch},  {"r3", bi_zoom},
         {"l1", bi_cowl},     {"l2", bi_reticle},   {"l3", bi_recenter},     {"map", bi_map},     {"pause", bi_pause}, {"photo", bi_hide}, {"close", bi_close},
-        {"gadgets", bi_batarang}, {"findbat", bi_findbat}, {"twosticks", bi_twosticks},
+        {"gadgets", bi_batarang}, {"findbat", bi_findbat}, {"twosticks", bi_twosticks}, {"combo_td", bi_combo_takedown},
+        {"combo_throw", bi_combo_throw}, {"combo_ground", bi_combo_ground},
     };
     for (size_t i = 0; i < sizeof icons / sizeof icons[0]; i++) {
         if (strcmp(icons[i].ident, ident)) continue;
