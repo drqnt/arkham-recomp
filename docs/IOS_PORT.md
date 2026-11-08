@@ -600,3 +600,15 @@ app goes to the background.
 - While the touch L2 is held (a gadget aimed), the swipe turns the camera "Камера при прицеле" times faster (settings, Управление: 1 to 5,
   2.5 by default; `ARKHAM_TOUCH_AIM_LOOK`). The game itself slows the camera a lot while aiming, and the owner found aiming the batarang
   very slow.
+
+## v25: a second throw button, one-touch combo moves, the render thread's waits measured, 2026-11-08 (built, waiting to be installed)
+
+- While the touch L2 is held (a gadget aimed), a second throw button (R2, drawn as the batarang) shows on the left; the first stays. The owner
+  keeps every button under the right thumb, so holding the aim left no finger for the throw.
+- One touch for the moves that take two buttons at once: Special Combo Takedown (triangle and circle), Special Combo Throw (circle and cross),
+  Ground Takedown (R2 and triangle). Those are the game's only two-button moves as far as known; the other upgrades are passive or use one
+  button, or aim and throw.
+- Crouch stays as it was (held). A tap-to-crouch was tried and taken out at the owner's word: R2 is also the throw while aiming, its release
+  ends the crouch and releases a gadget, and a double tap fires the Batclaw.
+- The `[fps]` line has "waiting for the layer": how long the render thread waits on the Direct3D thread a frame, to tell its own work from
+  waiting. Repeated state calls are answered before the queue's full handler (no change measurable on the Mac).
