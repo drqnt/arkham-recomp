@@ -503,9 +503,16 @@ _Noreturn static void phase2(CPU *c, Exc *e) {
                             ti_name(e->ti), e->frame, (double)(w0 - e->thrown_ns) / 1e6, e->cleanups, steps, (double)(w1 - w0) / 1e6);
                 }
                 run_top = &run;
+                u64 thrown = e->thrown_ns;  // the catch's end frees the record
                 rt_dispatch(c, cs.lp);
                 // The function holding the handler has returned: continue in its native caller.
                 run_top = run.prev;
+                // The startup's 2.5 s on the phone are in libunwind, called from here (v18's profile, the image named): after the handler is found,
+                // phase2 calls it only in unw_resume. When the first throws' functions return says whether that is it.
+                static _Atomic int told_back;
+                if (atomic_fetch_add(&told_back, 1) < 8)
+                    fprintf(stderr, "[eh] the handler's function returned %.1f ms after the throw; unw_resume next\n",
+                            (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - thrown) / 1e6);
                 unw_resume(&run.resume);
                 rt_trap(c, cs.lp, "unw_resume failed");
             }

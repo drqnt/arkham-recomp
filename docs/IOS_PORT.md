@@ -506,3 +506,18 @@ app goes to the background.
   On the phone that wait was most of the render thread's time; what it's worth there, the next play profile will say.
 - **A new layer for a new limit too:** in v17's log, after 120 and back to 60, iOS held the frames unevenly for some 15 s before it settled,
   as after a turn. `rt_set_fps_cap` now makes a new layer when the limit changes.
+
+## v19: back to waiting for the queries, the startup's 2.5 s in libunwind, which way the phone is held, 2026-11-08
+
+- **The query change undone (opt-in now, `ARKHAM_QUERY_FAST=1`).** With it on the phone (v18), at the limit of 60 the game made 60 frames a
+  second but only 53 to 58 reached the screen, with gaps of 25 to 33 ms; in v17 all 60 did. The render thread no longer waited, ran ahead in
+  bursts, and turning the camera felt uneven to the user, who found v17 smoother. The GPU's time a frame was also higher, more of the scene being
+  drawn while its queries weren't answered yet.
+- **The startup's 2.5 s are in libunwind.** v18's profile, with the image of the innermost frame, shows
+  `<redacted>(libunwind.dylib) < <redacted> < <redacted> < phase2`. The earlier reading of "phase2" as the innermost frame was a mistake in the
+  reading: the `<redacted>` frames had been cut out of the lines before looking at them. After the handler is found, phase2 calls libunwind only
+  in `unw_resume`, once the function holding the handler has returned. `[eh] the handler's function returned ... ms after the throw` now says
+  when that is; on the Mac it is 8.3 ms, and the Mac's whole gap is 0.1 s.
+- **Which way the phone is held:** each turn now logs the phone's orientation and the app's, to tell whether iOS refused a turn of the inner
+  screen or never saw one. v18's log has the inner screen upright once (669 x 951 points), yet the user found it didn't turn.
+- The first launch of a build no longer profiles 90 to 110 s in play: the sampling itself made play stutter (`ARKHAM_TRACE_PROFILE_PLAY` on asking).

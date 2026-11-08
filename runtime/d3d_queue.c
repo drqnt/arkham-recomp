@@ -856,11 +856,13 @@ static void method_call(CPU *c, u32 index) {
             if (rt_mtl_on()) rt_mtl_query_issued(arg_of(c, 0));
             break;
         case K_QUERY_DATA: {
-            // Answered here from what the layer's thread has already done for the query, not by waiting for it to reach this call
-            // (rt_mtl_query_answer says why). Not ready is an answer Direct3D gives too. With the engine's flush flag, a GetData is queued once
-            // for each Issue with no place to write to, so that the layer commits what the query needs. ARKHAM_QUERY_SYNC=1 waits, the old way.
+            // With ARKHAM_QUERY_FAST=1, answered here from what the layer's thread has already done for the query, not by waiting for it to
+            // reach this call (rt_mtl_query_answer says why). Not ready is an answer Direct3D gives too. With the engine's flush flag, a GetData
+            // is queued once for each Issue with no place to write to, so that the layer commits what the query needs.
+            // Off by default since v19: on the phone (v18) the render thread then ran ahead in bursts, 2 to 7 frames a second at the limit of 60
+            // didn't reach the screen, and turning the camera felt uneven; on the Mac it gained nothing (183 against 181 FPS).
             static int fast = -1;
-            if (fast < 0) fast = rt_mtl_on() && !getenv("ARKHAM_QUERY_SYNC") && !pipe_on;
+            if (fast < 0) fast = rt_mtl_on() && getenv("ARKHAM_QUERY_FAST") && !pipe_on;
             if (fast) {
                 int r = rt_mtl_query_answer(arg_of(c, 0), arg_of(c, 1), arg_of(c, 2), arg_of(c, 3));
                 if (r >= 0) {

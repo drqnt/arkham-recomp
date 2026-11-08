@@ -53,15 +53,14 @@ static void settings(void) {
     [d setBool:rt_ios_hud_at_launch forKey:@"MetalForceHudEnabled"];
     if (rt_ios_hud_at_launch) setenv("MTL_HUD_ENABLED", "1", 1);
     // The first launch of each new build samples every thread through the startup (hitch.c), so that its log shows where the black seconds go
-    // without a launch from the Mac. Then again from 90 to 110 s, by then most likely in play, once every 2 s: what the game's own threads do there,
-    // for making them faster (the Mac's profile doesn't name the translated functions). A build is known by its executable's time.
+    // without a launch from the Mac. A build is known by its executable's time. (v17 and v18 also sampled 90 to 110 s, in play, every 2 s: what the
+    // render thread does there was found, and the sampling itself made play stutter, so ARKHAM_TRACE_PROFILE_PLAY is only on asking now.)
     NSDate *built = [NSFileManager.defaultManager attributesOfItemAtPath:NSBundle.mainBundle.executablePath error:nil].fileModificationDate;
     if (built && [d doubleForKey:@"profiledBuild"] != built.timeIntervalSince1970 && !getenv("ARKHAM_TRACE_PROFILE")) {
         [d setDouble:built.timeIntervalSince1970 forKey:@"profiledBuild"];
         setenv("ARKHAM_TRACE_PROFILE", "0.5", 1);
         setenv("ARKHAM_TRACE_PROFILE_FOR", "10", 1);
-        setenv("ARKHAM_TRACE_PROFILE_PLAY", "90:20:2", 1);
-        fprintf(stderr, "[ios] the first launch of this build: where every thread is, every half second for the first 10 s, and every 2 s from 90 to 110 s\n");
+        fprintf(stderr, "[ios] the first launch of this build: where every thread is, every half second for the first 10 s\n");
     }
 }
 
@@ -347,6 +346,17 @@ static void show_text(UIViewController *vc, NSString *text) {
     }];
     [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
         fprintf(stderr, "[ios] the app went to the background\n");
+    }];
+    // How the phone is held, and which way iOS has the app, each time the phone turns: the inner screen turned upright didn't always turn the game
+    // (2026-11-08), and only this says whether iOS refused it or never saw the turn.
+    [UIDevice.currentDevice beginGeneratingDeviceOrientationNotifications];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIDeviceOrientationDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+        static const char *const held[] = {"unknown", "upright", "upside down", "on its left side", "on its right side", "face up", "face down"};
+        static const char *const app[] = {"unknown", "upright", "upside down", "landscape right", "landscape left"};
+        UIDeviceOrientation o = UIDevice.currentDevice.orientation;
+        UIInterfaceOrientation i = root_view.window.windowScene.interfaceOrientation;
+        CGSize s = root_view.bounds.size;
+        fprintf(stderr, "[ios] the phone is held %s; the app is %s, %.0f x %.0f points\n", (unsigned)o < 7 ? held[o] : "?", (unsigned)i < 5 ? app[i] : "?", s.width, s.height);
     }];
     // How warm the phone gets, in the log as it changes.
     [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
