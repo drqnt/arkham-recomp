@@ -42,6 +42,7 @@ enum {
     K_QUERY_DATA,
     K_SURFACE_LEVEL,
     K_CREATE_TEXTURE,
+    K_QUERY_ISSUE,    // asynchronous, counted for K_QUERY_DATA's answer on this thread
 };
 
 typedef struct {
@@ -106,7 +107,7 @@ static const struct {
     {"Device.DrawPrimitiveUP", K_DRAW_UP, 3, -1, -1, 0, 0},
     {"Device.DrawIndexedPrimitiveUP", K_DRAW_IUP, 5, 7, -1, 0, 0},
     {"Device.Present", K_PRESENT, 1, 2, -1, 16, 16},
-    {"Query.Issue", K_ASYNC, -1, -1, -1, 0, 0},
+    {"Query.Issue", K_QUERY_ISSUE, -1, -1, -1, 0, 0},
     {"Query.GetData", K_QUERY_DATA, -1, -1, -1, 0, 0},
     {"Texture.GetSurfaceLevel", K_SURFACE_LEVEL, -1, -1, -1, 0, 0},
     {"Device.CreateTexture", K_CREATE_TEXTURE, -1, -1, -1, 0, 0},
@@ -628,6 +629,9 @@ int rt_d3dq_is_worker(CPU *c) { return c == worker_cpu; }
 static int metal_on;
 static u32 layer_lo = ~0u, layer_hi;
 void rt_mtl_missing(CPU *c);
+int rt_mtl_on(void);
+void rt_mtl_query_issued(u32 guest);                                 // mtl_device.m: a query's polls answered on this thread
+int rt_mtl_query_answer(u32 guest, u32 data, u32 size, u32 flags);
 // ARKHAM_D3D_TRACE=from,step,count: every call the engine makes to Direct3D during one frame as [d3d] lines, from that many seconds after the first Present, then every step seconds.
 // It sits in front of both renderers, so a run on each shows whether the engine asks for the same thing. Shaders go by the names of the files in logs/msl.
 uint32_t d3dsh_words(const uint32_t *code, uint32_t limit);
@@ -848,7 +852,31 @@ static void method_call(CPU *c, u32 index) {
             shadow.indices_made = made_now();
             break;
         }
+        case K_QUERY_ISSUE:
+            if (rt_mtl_on()) rt_mtl_query_issued(arg_of(c, 0));
+            break;
         case K_QUERY_DATA: {
+            // Answered here from what the layer's thread has already done for the query, not by waiting for it to reach this call
+            // (rt_mtl_query_answer says why). Not ready is an answer Direct3D gives too. With the engine's flush flag, a GetData is queued once
+            // for each Issue with no place to write to, so that the layer commits what the query needs. ARKHAM_QUERY_SYNC=1 waits, the old way.
+            static int fast = -1;
+            if (fast < 0) fast = rt_mtl_on() && !getenv("ARKHAM_QUERY_SYNC") && !pipe_on;
+            if (fast) {
+                int r = rt_mtl_query_answer(arg_of(c, 0), arg_of(c, 1), arg_of(c, 2), arg_of(c, 3));
+                if (r >= 0) {
+                    if (r == 2) {
+                        u32 data = G32(c->esp + 8), size = G32(c->esp + 12);
+                        G32(c->esp + 8) = 0;
+                        G32(c->esp + 12) = 0;
+                        run_async(c, m, index, 0, 0, 0, 0);
+                        G32(c->esp + 8) = data;
+                        G32(c->esp + 12) = size;
+                    }
+                    if (trace) n_skipped++;
+                    c->eax = r == 0 ? 0 : 1;
+                    return;
+                }
+            }
             if (pipe_on && G32(arg_of(c, 0) + 0xc) == 9) {
                 static u32 reading_frame = ~0u;
                 if (reading_frame != pipe_n[2]) {

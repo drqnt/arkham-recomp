@@ -84,6 +84,9 @@ struct Obj {
     // queries
     u32 query_type, slot;
     u64 serial;
+    // Issue calls the render thread has queued, and those this thread has done; and the last queued one a flush was asked for (rt_mtl_query_answer)
+    _Atomic u32 issues_queued, issues_done;
+    u32 flush_asked;
     u64 uid;  // never reused, unlike the object's address and its id: caches key on this
 };
 #define MAX_OBJS (1u << 18)
@@ -2503,7 +2506,42 @@ static void m_QueryIssue(CPU *c) {  // this, flags: 1 end, 2 begin
     } else if (flags & 1) {
         q->serial = cb_serial;
     }
+    atomic_fetch_add_explicit(&q->issues_done, 1, memory_order_release);
     RET(0);
+}
+// Polling a query from the render thread without waiting for this one (d3d_queue.c).
+// The game polls its occlusion queries some 250 times a frame. Each poll used to wait for this thread to reach it in the queue and wake up for it.
+// In v17's profile on the phone, that was 90% of the render thread's time, the render thread and this one working in turn rather than together.
+// It goes by what this thread has already done for the query: Issue calls the render thread has queued (rt_mtl_query_issued) against those done.
+void rt_mtl_query_issued(u32 guest) {
+    Obj *q = obj_of(guest);
+    if (q && q->kind == O_QUERY) atomic_fetch_add_explicit(&q->issues_queued, 1, memory_order_relaxed);
+}
+// The answer: 0 with it written, as GetData's S_OK; 1, S_FALSE, not ready yet; 2, not ready and the caller should queue the GetData that commits
+// the frame's commands so far (asked once for each Issue, as the engine's flag says); -1 when only this thread can answer.
+int rt_mtl_query_answer(u32 guest, u32 data, u32 size, u32 flags) {
+    Obj *q = obj_of(guest);
+    if (!q || q->kind != O_QUERY) return -1;
+    u32 queued = atomic_load_explicit(&q->issues_queued, memory_order_relaxed);
+    u64 serial = 0;
+    int ready = 0;
+    if (atomic_load_explicit(&q->issues_done, memory_order_acquire) == queued) {
+        serial = __atomic_load_n(&q->serial, __ATOMIC_RELAXED);
+        if (!serial) {  // never issued, as m_QueryGetData answers it
+            if (data && size >= 4) G32(data) = 1;
+            return 0;
+        }
+        ready = serial != ~0ull && atomic_load(&completed_serial) >= serial;
+    }
+    if (ready) {
+        if (data && size >= 4) G32(data) = q->query_type == 9 ? (u32)((u64 *)visibility.contents)[q->slot] : 1;
+        return 0;
+    }
+    if ((flags & 1) && q->flush_asked != queued) {
+        q->flush_asked = queued;
+        return 2;
+    }
+    return 1;
 }
 static void m_QueryGetData(CPU *c) {  // this, data, size, flags
     Obj *q = obj_of(ARG(0));
@@ -2850,7 +2888,15 @@ static void dump_target(Obj *rt) {
 // So another thread does the waiting and leaves the drawable here. A frame that finds one goes on screen, and any other frame is simply not shown.
 // ARKHAM_MTL_VSYNC=1 makes the Direct3D thread wait instead, which holds the game to the display's rate.
 static _Atomic double fps_cap = -1;  // frames a second at most; 0 for no limit, -1 until ARKHAM_FPS_CAP has been read
-void rt_set_fps_cap(double n) { atomic_store(&fps_cap, n > 0 ? n : 0); }
+void rt_set_fps_cap(double n) {
+    double now = n > 0 ? n : 0, was = atomic_exchange(&fps_cap, now);
+#if TARGET_OS_IPHONE
+    // A new layer for a new limit, as after a turn: from 120 back to 60, iOS held the frames unevenly for some 15 s (v17's log).
+    if (was >= 0 && was != now) dispatch_async(dispatch_get_main_queue(), ^{ rt_mtl_new_layer(); });
+#else
+    (void)was;
+#endif
+}
 // With a frame rate limit, each frame is held on screen for a whole step of it.
 // The phone's display can show a frame for 8.3, 12.5, 16.7, 20.8 or 25 ms. A frame only waited for by the clock reached it a little early or late.
 // A late one stayed up 25 ms and the next only 8.3, and that was the uneven line in the Metal HUD and on screen.

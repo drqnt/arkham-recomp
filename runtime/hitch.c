@@ -146,7 +146,9 @@ static const char *sym_of(u64 pc) {
 }
 // The innermost frame of a profile line. In the runtime's own code it also gets the offset into its function, to 16 bytes, which tells a loop
 // from the rest of the function. That was needed when the startup's 2.5 s on the phone showed only as "phase2" (eh.c).
-// Not for translated functions (F_) or the system's, where the name says enough.
+// Not for translated functions (F_), where the name says enough. Outside the game's own executable, the image it's in instead, waits aside:
+// v17's profile still showed the startup's 2.5 s as "phase2" with no offset, so not the runtime's phase2, and only the image can say whose.
+static int is_waiting(const char *s);
 static const char *leaf_of(u64 pc, char *buf, size_t cap) {
     Dl_info di;
     if (!dladdr((void *)pc, &di) || !di.dli_sname) return "?";
@@ -155,7 +157,13 @@ static const char *leaf_of(u64 pc, char *buf, size_t cap) {
         Dl_info me;
         if (dladdr((void *)leaf_of, &me)) main_base = me.dli_fbase;
     }
-    if (di.dli_fbase != main_base || !strncmp(di.dli_sname, "F_", 2)) return di.dli_sname;
+    if (di.dli_fbase != main_base) {
+        if (is_waiting(di.dli_sname) || !di.dli_fname) return di.dli_sname;
+        const char *img = strrchr(di.dli_fname, '/');
+        snprintf(buf, cap, "%s(%s)", di.dli_sname, img ? img + 1 : di.dli_fname);
+        return buf;
+    }
+    if (!strncmp(di.dli_sname, "F_", 2)) return di.dli_sname;
     snprintf(buf, cap, "%s+0x%llx", di.dli_sname, (unsigned long long)((pc - (u64)(uintptr_t)di.dli_saddr) & ~15ull));
     return buf;
 }
