@@ -961,6 +961,12 @@ static UIView *gear_view;
 }
 
 // ---------- touches ----------
+// Whether a gadget is being aimed: the touch L2 held.
+- (BOOL)aiming {
+    for (PadButton *b in buttons)
+        if (b.def->control == C_LT && b.holders > 0) return YES;
+    return NO;
+}
 - (BOOL)inStickZone:(CGPoint)p {
     CGRect a = [self padArea];
     if ([self portrait] && p.y < a.origin.y - 8) return NO;  // on the picture: the camera
@@ -1127,6 +1133,9 @@ static UIView *gear_view;
             }
             if (!in_menu) {
                 double k = setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT / CAMERA_DEG_PER_PIXEL;
+                // While a gadget is aimed (L2 held) the game turns the camera much more slowly for the same mouse travel (the owner, v23:
+                // "very, very slow, hard to aim"), so the swipe is scaled up then, by its own setting.
+                if ([self aiming]) k *= setting(@"aimCameraSpeed", "ARKHAM_TOUCH_AIM_LOOK", 2.5);
                 rt_touch_mouse(d.x * k, d.y * k * (setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 ? -1 : 1));
             }
         }
@@ -1377,7 +1386,7 @@ static UIView *gear_view;
     NSMutableArray<NSString *> *titles, *footers;
     NSMutableArray<NSMutableArray<UITableViewCell *> *> *rows;
     NSMutableDictionary<NSValue *, NSString *> *actions;  // rows that do something when tapped
-    UILabel *size_value, *opacity_value, *look_value;
+    UILabel *size_value, *opacity_value, *look_value, *aim_value;
 }
 - (UITableViewCell *)cellWith:(NSArray<UIView *> *)views {
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
@@ -1478,8 +1487,9 @@ static UIView *gear_view;
     [self toggle:@"Прятать вне игры" on:setting(@"hideInMenus", "ARKHAM_TOUCH_HIDE", 1) > 0 action:@selector(hideChanged:)];
     [self action:@"Расположение кнопок" selector:@selector(editLayout)];
 
-    [self section:@"Управление" footer:@"Камера поворачивается ровно на столько, на сколько проведён палец, с любой скоростью и на ходу. Скорость — на сколько градусов поворачивает свайп через весь экран."];
+    [self section:@"Управление" footer:@"Камера поворачивается ровно на столько, на сколько проведён палец, с любой скоростью и на ходу. Скорость — на сколько градусов поворачивает свайп через весь экран. При прицеле (зажата L2) игра сама замедляет камеру, поэтому свайп тогда во столько раз быстрее."];
     look_value = [self slider:@"Скорость камеры" min:0.25 max:3.0 value:setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) action:@selector(lookChanged:)];
+    aim_value = [self slider:@"Камера при прицеле" min:1.0 max:5.0 value:setting(@"aimCameraSpeed", "ARKHAM_TOUCH_AIM_LOOK", 2.5) action:@selector(aimLookChanged:)];
     [self toggle:@"Инвертировать вверх-вниз" on:setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 action:@selector(invertChanged:)];
     [self toggle:@"Бег: стик за край" on:setting(@"autoRun", "ARKHAM_TOUCH_RUN", 1) > 0 action:@selector(runChanged:)];
     [self section:@"Камера игры" footer:@"Помощь камеры — сама разворачивает камеру за спину Бэтмена на бегу. С сенсорной камерой она мешает поворачивать на бегу, с геймпадом может быть удобна. Меняется со следующего запуска игры."];
@@ -1491,6 +1501,7 @@ static UIView *gear_view;
     size_value.text = [NSString stringWithFormat:@"%.0f %%", setting(@"buttonScale", "ARKHAM_TOUCH_SIZE", 1.0) * 100];
     opacity_value.text = [NSString stringWithFormat:@"%.0f %%", (1 - setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.8)) * 100];
     look_value.text = [NSString stringWithFormat:@"%.0f° на экран", setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT * 951];
+    aim_value.text = [NSString stringWithFormat:@"× %.1f", setting(@"aimCameraSpeed", "ARKHAM_TOUCH_AIM_LOOK", 2.5)];
 }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)t { return (NSInteger)rows.count; }
 - (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return (NSInteger)rows[(NSUInteger)s].count; }
@@ -1524,6 +1535,10 @@ static UIView *gear_view;
 }
 - (void)lookChanged:(UISlider *)s {
     set_setting(@"mouseCameraSpeed", s.value);
+    [self showValues];
+}
+- (void)aimLookChanged:(UISlider *)s {
+    set_setting(@"aimCameraSpeed", s.value);
     [self showValues];
 }
 - (void)invertChanged:(UISwitch *)s { set_setting(@"invertLook", s.on); }
