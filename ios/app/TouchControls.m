@@ -118,6 +118,9 @@ static const Def defs[] = {
     // Both sticks at once, for the cryptographic sequencer, whose tuning takes the pad's left and right sticks together: while it's on, the stick goes to
     // the game as the pad's left one, and a touch where the camera's swipe would be is the pad's right stick. Below the photo button.
     {"twosticks", C_TWOSTICKS, {TL, 30, 74, 19}, {TC, 0, 120, 22}, "", "", "gamecontroller.fill", "Два стика (взлом шифров): слева левый стик геймпада, справа правый; выключить — та же кнопка", SH_NONE, 0xFFFFFF, 0xFFFFFF},
+    // A second throw, on the left, shown only while a gadget is aimed (L2 held): with everything under the right thumb, holding the aim leaves no
+    // finger for R2 (the owner, 2026-11-08). The pad's R2 like the other; drawn as the batarang, as R2 is while aiming.
+    {"r2aim", C_RT, {BL, 120, -170, 34}, {BL, 75, -215, 38}, "R2", "RT", "batarang", "Бросок слева (видна только при прицеле)", SH_NONE, 0xFFFFFF, 0xFFFFFF},
 };
 #define N_DEFS (sizeof defs / sizeof defs[0])
 // Outside play the only one: backs out of menus, closes the map, skips a cutscene. It stays at the top left, as the gear does at the right.
@@ -145,6 +148,9 @@ static int old_anchor(NSString *ident) {
         if ([ident isEqualToString:s]) return OLD_TC;
     return OLD_NONE;
 }
+
+// The second throw button, shown only while a gadget is aimed.
+static BOOL aim_only(const Def *d) { return !strcmp(d->ident, "r2aim"); }
 
 static UIColor *rgb(int c, CGFloat a) { return [UIColor colorWithRed:((c >> 16) & 255) / 255.0 green:((c >> 8) & 255) / 255.0 blue:(c & 255) / 255.0 alpha:a]; }
 
@@ -672,6 +678,7 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
         BOOL show = b == close_button                                    ? in_menu && !self.editing && !photo
                     : b == findbat_button                                ? in_menu && map_open && !self.editing && !photo
                     : b.def->control == C_TWOSTICKS && twosticks && !self.editing ? !photo  // while on, always there to turn them off
+                    : aim_only(b.def) && !self.editing                   ? !in_menu && !photo && !b.hiddenByPlayer && [self aiming]
                                                                          : self.editing || (!in_menu && !photo && !b.hiddenByPlayer);
         b.shown = show;
         b.group.hidden = b.badge_group.hidden = !show;
