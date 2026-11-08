@@ -26,11 +26,11 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
 - **MSAA as a setting.** The game's resolution is one since v21 (high, medium, low: 0.5, 0.42, 0.375 of the screen's pixels).
 - **Better anti-aliasing and upscaling:** FXAA with the game's MSAA (FXAA is in), MetalFX (spatial first; temporal needs jitter and motion
   vectors), TAA, possibly SMAA.
-- **Speed:** the 300 FPS bar on the Mac (the Windows version gives about 350), game thread first, a second-generation translator in its own
-  branch. On the phone (v17's profile) the render thread spent 90% of play waiting on occlusion query polls, one Direct3D thread wake-up each.
-  Answering them itself (v18) ran it ahead in bursts and dropped frames, so that is `ARKHAM_QUERY_FAST=1` only. At 120 the busiest thread
-  spends about 7.5 ms a frame (v21's log), so the processor caps the phone near 130; the owner asked for processor work (2026-11-08) and chose
-  to play first.
+- **Speed:** branch `cpu-speed` (2026-11-08, docs/CPU_SPEED.md): on the Mac the game thread 2.73 to 2.52 ms a frame where it is the limit
+  (351 to 388 FPS there), 309 to 324 FPS over the whole route; translated code takes guest memory as a parameter of its own, the
+  Objective-C bridge keeps plans, the hottest small imports run in place, HFS path URLs are kept, call sites keep their last target. Not yet
+  on the phone, where at 120 the game thread took about 7 ms and the render thread 8.6. Left: the Direct3D queue's machinery in the render
+  thread (about 20%), the locals of functions in registers (about 5%), the 300 FPS bar on the Mac.
 - **MetalFX cheaper at 120:** it costs about 15 shown frames a second there (v21: 89 to 91 shown against 104 without; the GPU at 9.5 ms against
   5.5). Possible: scale up to less than all of the screen's pixels, or turn it off by itself above 60.
 - **Hitches** of 45 to 85 ms a few times in 5 minutes on the phone, mostly where new shaders first appear. The user had said earlier not to

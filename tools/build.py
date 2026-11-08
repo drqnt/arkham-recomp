@@ -44,6 +44,7 @@ def main() -> int:
     ap.add_argument("--serial", action="store_true", help="for ARKHAM_SERIAL=1 debugging: objects and binary in build/serial")
     ap.add_argument("--define", action="append", default=[], help="an experiment's macro, as -D: its objects go in a folder of their own, so the usual build isn't redone")
     ap.add_argument("--ios", action="store_true", help="for the iPhone: everything into build/ios/libarkham.a, which the app in ios/app links")
+    ap.add_argument("--order", default="", help="a linker order file (one symbol a line): the hot functions first, so that they share pages and cache")
     args = ap.parse_args()
     if args.ios:
         sdk = subprocess.run(["xcrun", "--sdk", "iphoneos", "--show-sdk-path"], env=ENV, capture_output=True, text=True).stdout.strip()
@@ -120,6 +121,8 @@ def main() -> int:
     bundle = ["-Wl,-sectcreate,__TEXT,__info_plist," + os.path.join(ROOT, "runtime", "Info.plist")]
     cmd = ["xcrun", "clang", "-arch", "arm64", "-mmacosx-version-min=14.0", f"@{rsp}", "-o", out, "-Wl,-w", "-lz",
            "-Wl,-stack_size,0x10000000", *bundle]
+    if args.order:
+        cmd.append(f"-Wl,-order_file,{os.path.abspath(args.order)}")
     for fw in FRAMEWORKS:
         cmd += ["-framework", fw]
     r = subprocess.run(cmd, env=ENV, capture_output=True, text=True)
