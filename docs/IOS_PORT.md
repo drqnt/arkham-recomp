@@ -579,3 +579,12 @@ app goes to the background.
   - Not tried on the sequencer itself: no save at one here. The owner turns it on when the sequencer's screen comes up.
 - **Anything else a playthrough needs by touch:** every pad button is on the touch pad (the four, the shoulders, the triggers, both stick clicks,
   start, back, the cross through the gadgets' wheel), and several can be held at once. The right stick's axes were the only input missing.
+
+## v23: the processor work from branch cpu-speed, 2026-11-08
+
+- Installed from branch `cpu-speed` (docs/CPU_SPEED.md): translated functions take guest memory as a restrict parameter of their own,
+  the Objective-C bridge keeps plans for repeated messages, the hottest small library functions run in place, call sites keep their last
+  target, the heap's small blocks are kept per thread, HFS path URLs are kept, sleeping threads spread over 4096 buckets. On the Mac the
+  game thread went from 2.73 to 2.52 ms a frame where it is the limit.
+- To compare on the phone, from v21's log at the limit of 120 and about 100 FPS: the game thread (1dab9d0) about 7.06 ms a frame, the render
+  thread (1c260f0) about 8.64 ms, waiting included (the `[fps]` line's "guest threads, CPU ms a frame").
