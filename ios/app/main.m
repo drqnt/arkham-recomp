@@ -207,20 +207,10 @@ CGRect rt_ios_game_rect(void) {
     [CATransaction commit];
     CGSize s = self.view.bounds.size;
     if (!CGSizeEqualToSize(s, laid_out)) {
-        BOOL first = CGSizeEqualToSize(laid_out, CGSizeZero);
         laid_out = s;
         UIEdgeInsets in = self.view.safeAreaInsets;
         fprintf(stderr, "[ios] the view is %.0f x %.0f points (safe area insets top %.0f left %.0f bottom %.0f right %.0f), the game's picture %.0f x %.0f at %.0f,%.0f\n",
                 s.width, s.height, in.top, in.left, in.bottom, in.right, g.size.width, g.size.height, g.origin.x, g.origin.y);
-        // Turned or folded: once it has settled, a new layer for the game (mtl_device.m says why). A turn and back within the wait makes one.
-        if (!first) {
-            static unsigned changes;
-            unsigned mine = ++changes;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-                void rt_mtl_new_layer(void);
-                if (mine == changes) rt_mtl_new_layer();
-            });
-        }
     }
 }
 @end

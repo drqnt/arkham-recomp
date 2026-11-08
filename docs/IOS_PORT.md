@@ -521,3 +521,19 @@ app goes to the background.
 - **Which way the phone is held:** each turn now logs the phone's orientation and the app's, to tell whether iOS refused a turn of the inner
   screen or never saw one. v18's log has the inner screen upright once (669 x 951 points), yet the user found it didn't turn.
 - The first launch of a build no longer profiles 90 to 110 s in play: the sampling itself made play stutter (`ARKHAM_TRACE_PROFILE_PLAY` on asking).
+
+## v20: frames on the display's beat, one layer, the startup throw resumed by the runtime, 2026-11-08
+
+- **The startup:** the user's screen recording shows about 8.5 s of black from the tap to the title. v19's log: the handler's function returned
+  8 ms after the startup throw and the game went on 2.6 s later, all of it in libunwind's `unw_resume`. `resume_at` (eh.c) now does what it
+  does on arm64 itself: the frame's x19 to x28, frame pointer, stack and program counter and d8 to d15 from the cursor, then a jump there.
+  `ARKHAM_EH_UNW_RESUME=1` uses libunwind's. On the Mac the game starts and plays with it.
+- **Frames at a limit on the phone:** v19 at 60 still had fewer than 59 frames on screen in 42 seconds of 135. The limit slept to a timer of its
+  own, which drifts against the display. Now a display link at the limit's rate, on a thread of its own, gives the beat that each frame waits for
+  (`beat_wait`), and asks the display for that rate (`ARKHAM_MTL_TIMER_LIMIT=1` for the timer).
+- **Why turning the phone broke the pacing (v16):** the touch controls' own display link asked for 120 whatever the limit. After a turn the display
+  ran at 120 (present to screen fell from 25.5 to 21 ms), and a game at 60 landed on 8.3 ms steps as it fell. The controls' link now asks for no
+  more than the limit. The new layer made after each turn or fold (v17 to v19) froze the picture for a moment and is gone: one layer again.
+- **The inner screen upright:** v19's log has the phone held on its left side turning the app upright, and on its right side not. iOS refuses
+  upside-down portrait on iPhone whatever the app allows, and for the inner screen that is one of the two upright ways.
+- `docs/WISHLIST.md` keeps the owner's open wishes and what has been done, so that none is lost between rounds.

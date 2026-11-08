@@ -242,6 +242,7 @@ enum { KIND_PS_SHAPE, KIND_TEXT, KIND_ICON, KIND_BAT };
 - (void)restyle;
 - (void)releaseAll;
 - (void)startEditing;
+- (void)followFrameRateLimit;
 @end
 static TouchControlsView *controls;
 static void open_settings(void);
@@ -381,7 +382,7 @@ static void open_settings(void);
     photo_hint.frame = CGRectInset(photo_hint.frame, 0, -8);
     [self addSubview:photo_hint];
     link = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
-    if (@available(iOS 15.0, *)) link.preferredFrameRateRange = CAFrameRateRangeMake(60, 120, 120);
+    [self followFrameRateLimit];
     [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     fprintf(stderr, "[touch] camera: %.0f degrees across the screen's width (speed %.2f)%s\n",
             setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT * MAX(frame.size.width, frame.size.height), setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0),
@@ -639,6 +640,16 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
             break;
     }
     b.ink_shown = ink;
+}
+// The controls' own display link asks the display for no more than the frame rate limit.
+// It used to ask for 120 whatever the limit. After the phone was turned, iOS ran the display at 120 by it: a game at 60 then landed on 8.3 ms
+// steps as it fell, and the frames went uneven (v16's log: from 25.5 to 21 ms present to screen, 40 a second off the step, at the turn).
+- (void)followFrameRateLimit {
+    double cap = setting(@"fpsCap", "ARKHAM_FPS_CAP", 0);
+    if (@available(iOS 15.0, *)) {
+        float top = cap > 0 && cap < 120 ? (float)cap : 120;
+        link.preferredFrameRateRange = CAFrameRateRangeMake(MIN(top, 30), top, top);
+    }
 }
 - (void)restyle {
     int style = (int)setting(@"buttonStyle", "ARKHAM_TOUCH_STYLE", STYLE_PS);
@@ -1409,6 +1420,7 @@ static UIView *gear_view;
     static const double caps[] = {30, 60, 120, 0};
     set_setting(@"fpsCap", caps[s.selectedSegmentIndex]);
     rt_set_fps_cap(caps[s.selectedSegmentIndex]);
+    [controls followFrameRateLimit];
 }
 - (void)styleChanged:(UISegmentedControl *)s {
     set_setting(@"buttonStyle", s.selectedSegmentIndex);

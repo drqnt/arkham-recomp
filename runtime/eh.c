@@ -459,6 +459,56 @@ static int find_native_caller(unw_cursor_t *out, u32 identity, int occurrence) {
     return 0;
 }
 
+// ---------- going on in a frame libunwind found ----------
+// What unw_resume does, the arm64 way: the frame's callee-saved registers, frame pointer, stack and program counter, then a jump there, as if
+// the call it made had just returned. The phone's unw_resume (iOS 27) took 2.5 s at the startup's one throw, all inside libunwind, against
+// 0.1 s for the whole stretch on the Mac (v19's log). ARKHAM_EH_UNW_RESUME=1 uses libunwind's again.
+#if defined(__aarch64__)
+__attribute__((noreturn, naked)) static void jump_to_regs(const u64 *r) {  // x19..x28, fp, sp, pc, d8..d15
+    __asm__ volatile("ldp x19, x20, [x0, #0]\n"
+                     "ldp x21, x22, [x0, #16]\n"
+                     "ldp x23, x24, [x0, #32]\n"
+                     "ldp x25, x26, [x0, #48]\n"
+                     "ldp x27, x28, [x0, #64]\n"
+                     "ldp x29, x16, [x0, #80]\n"
+                     "ldr x17, [x0, #96]\n"
+                     "ldp d8, d9, [x0, #104]\n"
+                     "ldp d10, d11, [x0, #120]\n"
+                     "ldp d12, d13, [x0, #136]\n"
+                     "ldp d14, d15, [x0, #152]\n"
+                     "mov sp, x16\n"
+                     "br x17\n");
+}
+#endif
+_Noreturn static void resume_at(unw_cursor_t *cur) {
+#if defined(__aarch64__)
+    static int libunwind = -1;
+    if (libunwind < 0) libunwind = getenv("ARKHAM_EH_UNW_RESUME") != NULL;
+    if (!libunwind) {
+        u64 r[21];
+        int ok = 1;
+        for (int i = 0; i < 10; i++) {
+            unw_word_t v = 0;
+            ok &= unw_get_reg(cur, UNW_ARM64_X19 + i, &v) == 0;
+            r[i] = v;
+        }
+        unw_word_t fp = 0, sp = 0, pc = 0;
+        ok &= unw_get_reg(cur, UNW_ARM64_FP, &fp) == 0;
+        ok &= unw_get_reg(cur, UNW_REG_SP, &sp) == 0;
+        ok &= unw_get_reg(cur, UNW_REG_IP, &pc) == 0;
+        r[10] = fp, r[11] = sp, r[12] = pc;
+        for (int i = 0; i < 8; i++) {
+            unw_fpreg_t d = 0;
+            ok &= unw_get_fpreg(cur, UNW_ARM64_D8 + i, &d) == 0;
+            memcpy(&r[13 + i], &d, 8);
+        }
+        if (ok && sp && pc && !(sp & 15)) jump_to_regs(r);
+    }
+#endif
+    unw_resume(cur);
+    abort();
+}
+
 // ---------- the two phases ----------
 static void set_guest_regs(CPU *c, const Ctx *x, u32 eax, u32 edx) {
     c->ebx = x->r[R_EBX];
@@ -507,14 +557,13 @@ _Noreturn static void phase2(CPU *c, Exc *e) {
                 rt_dispatch(c, cs.lp);
                 // The function holding the handler has returned: continue in its native caller.
                 run_top = run.prev;
-                // The startup's 2.5 s on the phone are in libunwind, called from here (v18's profile, the image named): after the handler is found,
-                // phase2 calls it only in unw_resume. When the first throws' functions return says whether that is it.
+                // The startup's 2.5 s on the phone were libunwind's unw_resume here: the handler's function returned 8 ms after the throw and
+                // the game went on 2.6 s later (v19's log). resume_at does the same itself.
                 static _Atomic int told_back;
                 if (atomic_fetch_add(&told_back, 1) < 8)
-                    fprintf(stderr, "[eh] the handler's function returned %.1f ms after the throw; unw_resume next\n",
+                    fprintf(stderr, "[eh] the handler's function returned %.1f ms after the throw; on to its caller\n",
                             (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - thrown) / 1e6);
-                unw_resume(&run.resume);
-                rt_trap(c, cs.lp, "unw_resume failed");
+                resume_at(&run.resume);
             }
             if (kind == 2) {
                 e->cleanups++;

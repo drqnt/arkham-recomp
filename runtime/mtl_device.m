@@ -2606,31 +2606,94 @@ static void make_layer_on_main(void) {
     layer = [l retain];
     fprintf(stderr, "[mtl] drawing into a layer on the app's view, %.0f x %.0f points at %.0fx\n", content.bounds.size.width, content.bounds.size.height, l.contentsScale);
     atomic_store(&layer_ready, 1);
+    void beat_start(void);
+    beat_start();
 }
-// After the phone turns or folds, a new layer in place of the old (main thread; ios/app/main.m calls it once the view has settled at a new size).
-// Seen on the phone, 2026-11-08: turned upright and back, the layer kept its place and size, but iOS no longer held each frame for the limit's step.
-// Frames came 25 and 8.3 ms apart again, a third of them off the step, to the end of the run; before the turn, none for a minute.
-// A layer made then, as at the start, should be held as at the start. The new one goes under the old, so there is no black frame.
-// The old one leaves a moment later, once frames reach the new one. It is let go only at the next change: the drawable thread may still be using it.
-void rt_mtl_new_layer(void) {
-    UIView *content = rt_ios_game_view;
-    if (!atomic_load(&layer_ready) || !content || !layer) return;
-    CAMetalLayer *old = layer, *l = new_game_layer(content);
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    [content.layer insertSublayer:l atIndex:0];
-    [CATransaction commit];
-    layer = [l retain];
-    static CAMetalLayer *retired;
-    [retired release];
-    retired = old;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        [old removeFromSuperlayer];
-        [CATransaction commit];
-    });
-    fprintf(stderr, "[mtl] a new layer for the game's picture, the view having changed\n");
+// The frame rate limit's beat on the phone: a display link at the limit's rate, on a thread of its own.
+// The limit used to sleep to a timer of its own, which drifts against the display. Every few seconds two frames then met in one of its steps and
+// one didn't reach the screen, or one came a step late: v19 at 60 had fewer than 59 frames on screen in 42 seconds of 135.
+// Now each frame waits for the display's own beat at the limit's rate, and the link also asks the display for that rate. Another display link
+// asking for 120 had kept the display at 120 after a turn of the phone (TouchControls.m).
+// v17 to v19 made a new layer after each turn or fold instead, which froze the picture for a moment; there is one layer again.
+static pthread_mutex_t beat_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t beat_cv = PTHREAD_COND_INITIALIZER;
+static u64 beat_n, beat_seen;
+static _Atomic int beat_on;
+static CADisplayLink *beat_link;
+static CFRunLoopRef beat_loop;
+static _Atomic double fps_cap;
+@interface ArkhamBeat : NSObject
+@end
+@implementation ArkhamBeat
+- (void)tick:(CADisplayLink *)l {
+    (void)l;
+    pthread_mutex_lock(&beat_mu);
+    beat_n++;
+    pthread_cond_broadcast(&beat_cv);
+    pthread_mutex_unlock(&beat_mu);
+}
+@end
+static _Atomic double beat_cap = -1;  // the rate the beat was last set to
+static void beat_rate(double cap) {  // on the beat's thread
+    if (!beat_link) return;
+    beat_link.paused = cap <= 0;
+    if (cap > 0)
+        if (@available(iOS 15.0, *)) beat_link.preferredFrameRateRange = CAFrameRateRangeMake((float)cap, (float)cap, (float)cap);
+    atomic_store(&beat_cap, cap);
+}
+static void *beat_main(void *unused) {
+    (void)unused;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    @autoreleasepool {
+        beat_link = [[CADisplayLink displayLinkWithTarget:[[ArkhamBeat new] autorelease] selector:@selector(tick:)] retain];
+        beat_loop = CFRunLoopGetCurrent();
+        beat_rate(atomic_load(&fps_cap));
+        [beat_link addToRunLoop:NSRunLoop.currentRunLoop forMode:NSRunLoopCommonModes];
+    }
+    atomic_store(&beat_on, 1);
+    fprintf(stderr, "[mtl] the frame rate limit keeps to the display's beat\n");
+    for (;;) @autoreleasepool {
+            [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:NSDate.distantFuture];
+        }
+    return NULL;
+}
+void beat_start(void) {
+    static int started;
+    if (started++ || getenv("ARKHAM_MTL_TIMER_LIMIT")) return;  // ARKHAM_MTL_TIMER_LIMIT=1: the timer of v16 to v19
+    pthread_t t;
+    pthread_create(&t, NULL, beat_main, NULL);
+    pthread_detach(t);
+}
+static void beat_set_rate(double cap) {
+    if (!atomic_load(&beat_on)) return;
+    CFRunLoopPerformBlock(beat_loop, kCFRunLoopCommonModes, ^{ beat_rate(cap); });
+    CFRunLoopWakeUp(beat_loop);
+}
+// Waits for the next beat since the last frame's: at once if one has come meanwhile, without making up for missed ones. 0 with no beat to keep to.
+// At most 100 ms: the display stops beating while the app is away. A beat not yet at the limit's rate (the limit set before the beat's thread
+// was up) is set to it, and this frame keeps to the timer.
+static int beat_wait(double cap) {
+    if (!atomic_load(&beat_on)) return 0;
+    if (atomic_load(&beat_cap) != cap) {
+        static double asked;
+        if (asked != cap) {
+            asked = cap;
+            beat_set_rate(cap);
+        }
+        return 0;
+    }
+    pthread_mutex_lock(&beat_mu);
+    if (beat_n == beat_seen) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 100000000;
+        if (ts.tv_nsec >= 1000000000) ts.tv_sec++, ts.tv_nsec -= 1000000000;
+        while (beat_n == beat_seen)
+            if (pthread_cond_timedwait(&beat_cv, &beat_mu, &ts)) break;
+    }
+    beat_seen = beat_n;
+    pthread_mutex_unlock(&beat_mu);
+    return 1;
 }
 #else
 static void log_views(NSView *v, int depth) {
@@ -2891,8 +2954,7 @@ static _Atomic double fps_cap = -1;  // frames a second at most; 0 for no limit,
 void rt_set_fps_cap(double n) {
     double now = n > 0 ? n : 0, was = atomic_exchange(&fps_cap, now);
 #if TARGET_OS_IPHONE
-    // A new layer for a new limit, as after a turn: from 120 back to 60, iOS held the frames unevenly for some 15 s (v17's log).
-    if (was >= 0 && was != now) dispatch_async(dispatch_get_main_queue(), ^{ rt_mtl_new_layer(); });
+    if (was != now) beat_set_rate(now);  // the beat at the new limit's rate, and the display asked for it
 #else
     (void)was;
 #endif
@@ -2915,7 +2977,7 @@ static _Atomic u32 drawable_w, drawable_h;
 static _Atomic(void *) ready_drawable;
 static dispatch_semaphore_t drawable_wanted;
 static id<CAMetalDrawable> fetch_drawable(void) {
-    CAMetalLayer *l = layer;  // read once: the phone may put a new layer in its place (rt_mtl_new_layer)
+    CAMetalLayer *l = layer;
     CGSize want = CGSizeMake(atomic_load(&drawable_w), atomic_load(&drawable_h));
     if (!CGSizeEqualToSize(l.drawableSize, want)) l.drawableSize = want;
     return [l nextDrawable];
@@ -3361,6 +3423,9 @@ static void m_Present(CPU *c) {
         fps_cap = v ? atof(v) : 0.0;
     }
     double cap = fps_cap;
+#if TARGET_OS_IPHONE
+    if (cap > 0 && beat_wait(cap)) cap = 0;  // the display's beat at the limit's rate held this frame instead of the timer below
+#endif
     if (cap > 0) {
         u64 t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), step = (u64)(1e9 / cap);
         if (t < next_ns) {
