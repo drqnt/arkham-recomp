@@ -588,3 +588,15 @@ app goes to the background.
   game thread went from 2.73 to 2.52 ms a frame where it is the limit.
 - To compare on the phone, from v21's log at the limit of 120 and about 100 FPS: the game thread (1dab9d0) about 7.06 ms a frame, the render
   thread (1c260f0) about 8.64 ms, waiting included (the `[fps]` line's "guest threads, CPU ms a frame").
+- **v23 on the phone (the owner's 277 s, limit 120, MetalFX off, high resolution):** the first minute 113-115 frames a second on screen,
+  the game thread 3.6 ms a frame; from 66 s, in heavier places (up to 1,200 draws), the game thread 5.2-6.6 ms and 87-105 on screen. The
+  render thread 7.1-9.0 ms all along, waiting included: it is now the one holding the frame rate. Warm from 211 s. v21 in a similar session
+  at 120 (warm, then hot): the game thread 7-9 ms, 82-90 on screen. The owner felt the first minute faster and the rest about the same,
+  which is the scenes getting heavier, not the heat.
+
+## v24: the camera faster while aiming, 2026-11-08
+
+- The cpu-speed branch is now in `ios-port` (fast-forward).
+- While the touch L2 is held (a gadget aimed), the swipe turns the camera "Камера при прицеле" times faster (settings, Управление: 1 to 5,
+  2.5 by default; `ARKHAM_TOUCH_AIM_LOOK`). The game itself slows the camera a lot while aiming, and the owner found aiming the batarang
+  very slow.

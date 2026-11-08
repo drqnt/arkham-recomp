@@ -26,11 +26,10 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
 - **MSAA as a setting.** The game's resolution is one since v21 (high, medium, low: 0.5, 0.42, 0.375 of the screen's pixels).
 - **Better anti-aliasing and upscaling:** FXAA with the game's MSAA (FXAA is in), MetalFX (spatial first; temporal needs jitter and motion
   vectors), TAA, possibly SMAA.
-- **Speed:** branch `cpu-speed` (2026-11-08, docs/CPU_SPEED.md): on the Mac the game thread 2.73 to 2.52 ms a frame where it is the limit
-  (351 to 388 FPS there), 309 to 324 FPS over the whole route; translated code takes guest memory as a parameter of its own, the
-  Objective-C bridge keeps plans, the hottest small imports run in place, HFS path URLs are kept, call sites keep their last target. Not yet
-  on the phone, where at 120 the game thread took about 7 ms and the render thread 8.6. Left: the Direct3D queue's machinery in the render
-  thread (about 20%), the locals of functions in registers (about 5%), the 300 FPS bar on the Mac.
+- **Speed:** branch `cpu-speed`, merged into `ios-port` (docs/CPU_SPEED.md): the game thread on the phone 7-9 ms to 3.6-6.6 ms a frame
+  at 120 (v23); on the Mac 2.73 to 2.52 ms where it is the limit. The render thread, 7-9 ms a frame on the phone with its waits, now holds
+  the frame rate at 120: the Direct3D queue's machinery (about 20% of it on the Mac), the waits for query results. Also left: the locals of
+  functions in registers (about 5% of the game thread), the 300 FPS bar on the Mac.
 - **MetalFX cheaper at 120:** it costs about 15 shown frames a second there (v21: 89 to 91 shown against 104 without; the GPU at 9.5 ms against
   5.5). Possible: scale up to less than all of the screen's pixels, or turn it off by itself above 60.
 - **Hitches** of 45 to 85 ms a few times in 5 minutes on the phone, mostly where new shaders first appear. The user had said earlier not to
@@ -40,6 +39,8 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
 
 ## Done, by version (phone)
 
+- v24: the camera faster while aiming (L2), with its own setting.
+- v23: the processor work (game thread 20-50% faster on the phone).
 - v22: two sticks for the cryptographic sequencer (a button; the stick and a second floating stick as the pad's two).
 - v21: MetalFX spatial upscaling to the screen's pixels (on by default); the game's resolution as a setting.
 - v19 to v20: the occlusion query change made opt-in; the startup throw's resume done by the runtime itself; each turn of the phone logged.
