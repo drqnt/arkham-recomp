@@ -194,7 +194,9 @@ CGRect rt_ios_game_rect(void) {
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAllButUpsideDown; }
+// All four ways up. The foldable's inner screen turned upright one way is upside-down portrait to iOS, and without it the game stayed on its side
+// that way (2026-11-08); turned the other way, it turned with it.
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
 // The Metal layer (mtl_device.m) is a sublayer of this view's: it goes where the picture goes whenever the view changes, as the phone turns or folds.
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];

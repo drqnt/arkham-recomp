@@ -477,3 +477,32 @@ app goes to the background.
 - **Icons:** the counter is now a shield with the blow sent back (`bi_shield`), where the lightning didn't read as counter. The fist is drawn
   again from the front, with its finger segments, the thumb across them and a cuff. The map's "Показать Бэтмена" is the bat in a target's ring
   (`bi_findbat`). `tools/bat_icons_preview.c` draws them as the app now does: the halo, the disc's shadow, the badge, over dark, light and grey.
+
+## v18: occlusion queries answered without waiting, all four ways up, 2026-11-08
+
+- **The startup's 2.5 s, narrowed down.** v17's first launch: the startup's one throw reaches its handler one frame up 8.3 ms after it was thrown,
+  with no cleanups and no steps over running handlers. So the 2.5 s come after the handler is found. The profile still shows them as
+  `phase2 < lsda_lookup < shim___cxa_throw` with no offset on `phase2`, so that innermost frame isn't in the game's executable at all.
+  The profiler now names the image of an innermost frame outside it, for the next first launch.
+- **What the render thread does in play** (v17's profile, 90 to 110 s, on the phone): the busiest thread is the game's render thread, and 90% of
+  its samples are `swtch_pri < run_sync`, yielding while it waits for the Direct3D thread to reach one of its calls in the queue. The Direct3D
+  thread itself is mostly idle. Nearly all of those calls are `Query.GetData`, the engine polling its occlusion queries: on the Mac, 45 000 to
+  53 000 synchronous calls a second (about 250 a frame), the render thread waiting 30 to 34 ms a second there. On the phone, waking the other
+  thread for each costs far more.
+  - Now the render thread answers `GetData` itself (`rt_mtl_query_answer`, mtl_device.m) from what the Direct3D thread has already done for the
+    query. Each `Query.Issue` is counted when the render thread queues it and when the layer has done it.
+    - All of them done, and the GPU past the query's command buffer: the visibility count straight from the shared buffer.
+    - Otherwise: not ready, as Direct3D 9 may answer. With the engine's flush flag, a `GetData` with nowhere to write is queued once for each
+      Issue, so that the layer still commits the commands the query needs.
+  - `ARKHAM_QUERY_SYNC=1` waits the old way.
+- **All four ways up:** the foldable's inner screen turned upright one way is upside-down portrait to iOS. The app didn't allow that, so the game
+  stayed on its side; turned the other way, it turned (v16's log has it upright on the inner screen). The Metal HUD starting over with only
+  its FPS line, after a fold or a turn, is the new layer that v17 makes then: the HUD belongs to the layer.
+- **Mac A/B of the queries,** the same walk into the level, no limit:
+  - synchronous calls 45 000 to 53 000 a second down to 330 to 440 (`Texture.LockRect` and resource creation are what's left);
+  - the render thread's waiting 30 to 34 ms a second down to 7 to 8;
+  - 183 against 181 FPS, the Mac's render thread not being what holds it;
+  - shots at the same moments show the same scene, nothing missing.
+  On the phone that wait was most of the render thread's time; what it's worth there, the next play profile will say.
+- **A new layer for a new limit too:** in v17's log, after 120 and back to 60, iOS held the frames unevenly for some 15 s before it settled,
+  as after a turn. `rt_set_fps_cap` now makes a new layer when the limit changes.
