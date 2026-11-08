@@ -288,6 +288,13 @@ static void *thread_tramp(void *p) {
     track_thread(t->start);
     rt_gate_acquire();
     tl_self = t;
+    {
+        // Named after the guest function it starts in, so that profilers tell the engine's threads apart (1dab9d0 the game's, 1c260f0 rendering).
+        // The guest's own pthread_setname_np is ignored (below), so the name stays.
+        char name[32];
+        snprintf(name, sizeof name, "guest %07x", t->start);
+        pthread_setname_np(name);
+    }
     while (t->suspended) block_a_little();
     CPU *c = rt_new_cpu(2u << 20);
     t->cpu = c;

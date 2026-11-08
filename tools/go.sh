@@ -3,7 +3,8 @@
 cd "$(dirname "$0")/.." || exit 1
 [ -f config.local ] && . ./config.local  # local settings, not tracked: ARKHAM_RENDERER, ARKHAM_LANGUAGE, ARKHAM_METAL_HUD
 [ "$ARKHAM_METAL_HUD" = 1 ] && export MTL_HUD_ENABLED=1  # Apple's Metal performance HUD in the game's window
-if ! python3 -I tools/build.py > logs/build.log 2>&1; then
+# NOBUILD=1 runs the binary as it is, as for an experiment's build (tools/build.py --define), which a normal build would relink over.
+if [ -z "$NOBUILD" ] && ! python3 -I tools/build.py > logs/build.log 2>&1; then
   grep -E 'FAILED|error:|failed=[1-9]|ld:|Undefined|"_' logs/build.log | head -20 | cut -c1-200
   exit 1
 fi

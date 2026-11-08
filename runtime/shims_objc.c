@@ -11,6 +11,8 @@ void rt_gl_context_changed(void);
 #include <CoreFoundation/CoreFoundation.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <stdatomic.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #if TARGET_OS_IPHONE
@@ -37,7 +39,58 @@ static int looks_like_name(u32 r) {
     return 0;
 }
 
+// A class named by a string in the game's image ("NSScreen", "NSAutoreleasePool"), which Feral's code sends class messages to hundreds of
+// times a frame: what the string names, worked out once. The image never changes, so neither does the answer.
+typedef struct NameInfo {
+    u32 r;
+    u8 is_name;
+    struct GClass *g;  // the guest class of that name, if there is one
+    Class host;        // the system class of that name, if there is one
+} NameInfo;
+#define NAME_N 1024u
+static NameInfo *_Atomic name_infos[NAME_N];
+static pthread_mutex_t name_mu = PTHREAD_MUTEX_INITIALIZER;
+static int looks_like_name(u32 r);
+static struct GClass *gclass_by_name(const char *n);
+static const NameInfo *name_info(u32 r) {
+    u32 h = (r * 0x9E3779B1u) >> 22;
+    for (u32 i = 0; i < 8; i++) {
+        NameInfo *n = atomic_load_explicit(&name_infos[(h + i) % NAME_N], memory_order_acquire);
+        if (!n) break;
+        if (n->r == r) return n;
+    }
+    NameInfo *made = calloc(1, sizeof *made);
+    made->r = r;
+    made->is_name = (u8)looks_like_name(r);
+    if (made->is_name) {
+        made->g = gclass_by_name(GS(r));
+        made->host = objc_getClass(GS(r));
+    }
+    const NameInfo *use = made;
+    pthread_mutex_lock(&name_mu);
+    for (u32 i = 0; i < 8; i++) {
+        NameInfo *q = atomic_load_explicit(&name_infos[(h + i) % NAME_N], memory_order_relaxed);
+        if (q && q->r == r) {
+            use = q;
+            break;
+        }
+        if (!q) {
+            atomic_store_explicit(&name_infos[(h + i) % NAME_N], made, memory_order_release);
+            made = NULL;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&name_mu);
+    if (made && use != made) free(made);
+    return use;  // when the table is full here, the answer just isn't kept (and leaks one small block)
+}
 static id proxy_host(u32 p);
+// ARKHAM_OBJC_SLOW=1: every message the slow way, without the kept answers below, to compare.
+static int plan_off = -1;
+static int plan_off_now(void) {
+    if (plan_off < 0) plan_off = getenv("ARKHAM_OBJC_SLOW") != NULL;
+    return plan_off;
+}
 extern const unsigned rt_objc_class_addr, rt_objc_class_size, rt_objc_cat_addr, rt_objc_cat_size;
 
 static id host_receiver(u32 r) {
@@ -47,7 +100,10 @@ static id host_receiver(u32 r) {
         id h = proxy_host(r);
         if (h) return h;
     }
-    if (looks_like_name(r)) return (id)objc_getClass(GS(r));
+    if (r >= 0x1000 && r < IMAGE_END) {
+        const NameInfo *n = name_info(r);
+        if (n->is_name) return (id)n->host;
+    }
     if (r >= rt_objc_class_addr && r < rt_objc_class_addr + rt_objc_class_size) return (id)objc_getClass(GS(G32(r + 8)));
     if (r >= 0x1000 && r < IMAGE_END) return (id)cf_unwrap(r);
     return nil;
@@ -102,94 +158,107 @@ static void put_s(Regs *r, float v) {
 // Host-side out slots for pointer-to-object arguments such as NSError**.
 typedef struct { u32 guest; id val; } OutSlot;
 
-static u32 marshal_args(Method m, const char *sel, u32 ap, Regs *r, OutSlot *outs, int *nout) {
+// How each argument of a method crosses from the guest's stack to the host's registers, worked out once from its type encoding.
+enum { AK_OBJ, AK_SEL, AK_CSTR, AK_OUTOBJ, AK_PTR, AK_SINT, AK_UINT, AK_FLOAT, AK_GDOUBLE, AK_CGFLOAT, AK_RANGE, AK_RECT, AK_POINT, AK_BAD };
+#define MAX_KINDS 16
+// The kinds of a method's arguments after self and _cmd; their number, or -1 if there are more than MAX_KINDS. AK_BAD for a type it can't carry.
+static int arg_kinds(Method m, const char *sel, u8 *kinds) {
     unsigned n = method_getNumberOfArguments(m);
+    if (n > MAX_KINDS + 2) return -1;
     const char *t = method_getTypeEncoding(m);
     t = next_type(t);  // return type
     t = next_type(t);  // self
     t = next_type(t);  // _cmd
+    int nk = 0;
     for (unsigned i = 2; i < n; i++) {
         const char *q = skip_quals(t);
         char k = *q;
-        u32 v = G32(ap);
+        u8 kind;
         switch (k) {
-            case '@': case '#':
-                put_x(r, (u64)host_receiver(v));
-                ap += 4;
+            case '@': case '#': kind = AK_OBJ; break;
+            case ':': kind = AK_SEL; break;
+            case '*': kind = AK_CSTR; break;
+            case '^': kind = q[1] == '@' ? AK_OUTOBJ : AK_PTR; break;
+            case 'i': case 'l': case 'q': kind = AK_SINT; break;  // NSInteger: 32-bit in the guest
+            case 'c': case 'C': case 'B': case 's': case 'S': case 'I': case 'L': case 'Q': kind = AK_UINT; break;
+            case 'f': kind = AK_FLOAT; break;
+            case 'd': kind = guest_double_selector(sel) ? AK_GDOUBLE : AK_CGFLOAT; break;
+            case '{':
+                if (!strncmp(q, "{_NSRange", 9) || !strncmp(q, "{?=QQ", 5)) kind = AK_RANGE;
+                else if (!strncmp(q, "{CGRect", 7) || !strncmp(q, "{_NSRect", 8)) kind = AK_RECT;
+                else if (!strncmp(q, "{CGPoint", 8) || !strncmp(q, "{CGSize", 7) || !strncmp(q, "{_NSPoint", 9) || !strncmp(q, "{_NSSize", 8)) kind = AK_POINT;
+                else {
+                    fprintf(stderr, "[objc] unsupported struct argument %s in %s\n", q, sel);
+                    kind = AK_BAD;
+                }
                 break;
-            case ':':
-                put_x(r, v ? (u64)sel_registerName(GS(v)) : 0);
-                ap += 4;
+            default:
+                fprintf(stderr, "[objc] unsupported argument type %c in %s\n", k, sel);
+                kind = AK_BAD;
                 break;
-            case '*':
-                put_x(r, v ? (u64)GP(v) : 0);
-                ap += 4;
-                break;
-            case '^':
-                if (q[1] == '@' && v && *nout < 4) {
+        }
+        kinds[nk++] = kind;
+        t = next_type(t);
+    }
+    return nk;
+}
+static u32 marshal_exec(const u8 *kinds, int nk, u32 ap, Regs *r, OutSlot *outs, int *nout) {
+    for (int i = 0; i < nk; i++) {
+        u32 v = G32(ap);
+        switch (kinds[i]) {
+            case AK_OBJ: put_x(r, (u64)host_receiver(v)); ap += 4; break;
+            case AK_SEL: put_x(r, v ? (u64)sel_registerName(GS(v)) : 0); ap += 4; break;
+            case AK_CSTR: put_x(r, v ? (u64)GP(v) : 0); ap += 4; break;
+            case AK_OUTOBJ:
+                if (v && *nout < 4) {
                     outs[*nout].guest = v;
                     outs[*nout].val = nil;
                     put_x(r, (u64)&outs[*nout].val);
                     (*nout)++;
                 } else if (rt_is_handle(v)) {
-                    // An opaque system object such as a CGImageRef, known to the guest only by its handle.
                     put_x(r, (u64)rt_handle_get(v));
                 } else {
                     put_x(r, v ? (u64)GP(v) : 0);
                 }
                 ap += 4;
                 break;
-            case 'c': case 'C': case 'B': case 's': case 'S': case 'i': case 'I': case 'l': case 'L':
-                put_x(r, (k == 'i' || k == 'l') ? (u64)(i64)(i32)v : (u64)v);
+            case AK_PTR:
+                // An opaque system object such as a CGImageRef, known to the guest only by its handle.
+                if (rt_is_handle(v)) put_x(r, (u64)rt_handle_get(v));
+                else put_x(r, v ? (u64)GP(v) : 0);
                 ap += 4;
                 break;
-            case 'q':
-                put_x(r, (u64)(i64)(i32)v);  // NSInteger: 32-bit in the guest
-                ap += 4;
+            case AK_SINT: put_x(r, (u64)(i64)(i32)v); ap += 4; break;
+            case AK_UINT: put_x(r, (u64)v); ap += 4; break;
+            case AK_FLOAT: put_s(r, *(f32a *)(GMEM + ap)); ap += 4; break;
+            case AK_GDOUBLE: put_d(r, *(f64a *)(GMEM + ap)); ap += 8; break;
+            case AK_CGFLOAT: put_d(r, *(f32a *)(GMEM + ap)); ap += 4; break;  // CGFloat: float on the guest
+            case AK_RANGE:
+                put_x(r, v);
+                put_x(r, G32(ap + 4));
+                ap += 8;
                 break;
-            case 'Q':
-                put_x(r, (u64)v);  // NSUInteger: 32-bit in the guest
-                ap += 4;
+            case AK_RECT:
+                for (int j = 0; j < 4; j++) put_d(r, *(f32a *)(GMEM + ap + (u32)j * 4));
+                ap += 16;
                 break;
-            case 'f':
-                put_s(r, *(f32a *)(GMEM + ap));
-                ap += 4;
+            case AK_POINT:
+                for (int j = 0; j < 2; j++) put_d(r, *(f32a *)(GMEM + ap + (u32)j * 4));
+                ap += 8;
                 break;
-            case 'd':
-                if (guest_double_selector(sel)) {
-                    put_d(r, *(f64a *)(GMEM + ap));
-                    ap += 8;
-                } else {  // CGFloat
-                    put_d(r, *(f32a *)(GMEM + ap));
-                    ap += 4;
-                }
-                break;
-            case '{':
-                if (!strncmp(q, "{_NSRange", 9) || !strncmp(q, "{?=QQ", 5)) {
-                    put_x(r, v);
-                    put_x(r, G32(ap + 4));
-                    ap += 8;
-                } else if (!strncmp(q, "{CGRect", 7) || !strncmp(q, "{_NSRect", 8)) {
-                    for (int j = 0; j < 4; j++) put_d(r, *(f32a *)(GMEM + ap + (u32)j * 4));
-                    ap += 16;
-                } else if (!strncmp(q, "{CGPoint", 8) || !strncmp(q, "{CGSize", 7) || !strncmp(q, "{_NSPoint", 9) || !strncmp(q, "{_NSSize", 8)) {
-                    for (int j = 0; j < 2; j++) put_d(r, *(f32a *)(GMEM + ap + (u32)j * 4));
-                    ap += 8;
-                } else {
-                    fprintf(stderr, "[objc] unsupported struct argument %s in %s\n", q, sel);
-                    put_x(r, 0);
-                    ap += 4;
-                }
-                break;
-            default:
-                fprintf(stderr, "[objc] unsupported argument type %c in %s\n", k, sel);
-                put_x(r, 0);
-                ap += 4;
-                break;
+            default: put_x(r, 0); ap += 4; break;
         }
-        t = next_type(t);
     }
     return ap;
+}
+static u32 marshal_args(Method m, const char *sel, u32 ap, Regs *r, OutSlot *outs, int *nout) {
+    u8 kinds[MAX_KINDS];
+    int nk = arg_kinds(m, sel, kinds);
+    if (nk < 0) {
+        fprintf(stderr, "[objc] too many arguments in %s\n", sel);
+        return ap;
+    }
+    return marshal_exec(kinds, nk, ap, r, outs, nout);
 }
 
 typedef u64 (*msg_x)(id, SEL, u64, u64, u64, u64, u64, u64, double, double, double, double, double, double, double, double);
@@ -295,78 +364,17 @@ static void event_monitor_send(CPU *c, id recv, u32 ap) {
     fprintf(stderr, "[objc] the game watches events with mask %llx\n", mask);
     RET(obj_wrap(monitor));
 }
-static int host_send_from(CPU *c, u32 self, u32 selg, u32 ap, u32 stret, Class start_class) {
-    id recv = host_receiver(self);
-    const char *sn = GS(selg);
-    if (!recv) return 0;
-    if (!strcmp(sn, "countByEnumeratingWithState:objects:count:")) return fast_enumerate(c, recv, ap);
-    if (strstr(sn, "Format:") && format_send(c, recv, sn, ap)) return 1;
-    if (strstr(sn, "Objects") && collection_send(c, recv, sn, ap)) return 1;
-    // Test runs answer the welcome dialog with its default button instead of waiting for a person.
-    if (!strcmp(sn, "runModal") && getenv("ARKHAM_AUTO_ALERT")) {
-        id msg = ((id(*)(id, SEL))objc_msgSend)(recv, sel_registerName("messageText"));
-        id info = ((id(*)(id, SEL))objc_msgSend)(recv, sel_registerName("informativeText"));
-        fprintf(stderr, "[objc] auto-answering runModal with the first button: %s / %s\n", msg ? ns_utf8(msg) : "", info ? ns_utf8(info) : "");
-        RET(1000);
-        return 1;
-    }
-    if (!strcmp(sn, "addLocalMonitorForEventsMatchingMask:handler:")) {
-        event_monitor_send(c, recv, ap);
-        return 1;
-    }
-    if (!strcmp(sn, "setMainFrameURL:")) rt_note_webview(recv);
-    if (!strcmp(sn, "setMainFrameURL:") && getenv("ARKHAM_JS_DEBUG")) {
-        extern id rt_web_debug_delegate(void);
-        ((void (*)(id, SEL, id))objc_msgSend)(recv, sel_registerName("setUIDelegate:"), rt_web_debug_delegate());
-    }
-    if (!strcmp(sn, "operatingSystemVersion")) {
-        // The same answer as Gestalt: the newest system the 32-bit build ever knew.
-        if (stret) {
-            G32(stret) = 10;
-            G32(stret + 4) = 14;
-            G32(stret + 8) = 6;
-        }
-        return 1;
-    }
-    if (recv == (id)objc_getClass("NSBundle") && !strcmp(sn, "mainBundle")) {
-        extern id rt_game_bundle(void);
-        RET(cf_wrap(rt_game_bundle()));
-        return 1;
-    }
-    SEL sel = sel_registerName(sn);
-    Class cls = start_class ? start_class : object_getClass(recv);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return 0;
-    void *fn = start_class ? (void *)method_getImplementation(m) : (void *)objc_msgSend;
-    if (start_class && !strcmp(sn, "dealloc")) proxy_forget(recv);
-    Regs r;
-    memset(&r, 0, sizeof r);
-    OutSlot outs[4];
-    int nout = 0;
-    marshal_args(m, sn, ap, &r, outs, &nout);
-    if (trace && r.nx > 0 && (intptr_t)r.x[0] > 0x100000000LL) {
-        // Show string arguments, which is what makes a message trace readable.
-        const char *t2 = next_type(next_type(next_type(method_getTypeEncoding(m))));
-        if (*skip_quals(t2) == '@') {
-            id a0 = (id)r.x[0];
-            if (((signed char (*)(id, SEL, Class))objc_msgSend)(a0, sel_registerName("isKindOfClass:"), objc_getClass("NSString"))) {
-                const char *u = ((const char *(*)(id, SEL))objc_msgSend)(a0, sel_registerName("UTF8String"));
-                fprintf(stderr, "[objc]   arg0 = \"%.200s\"\n", u ? u : "");
-            }
-        }
-    }
-    const char *rt = skip_quals(method_getTypeEncoding(m));
-    char k = *rt;
-    // (The bindings OpenGL shims remember belong to the current context.)
-    // Quick reads of window and screen state run in place. Giving up the gate for them would cost a whole time slice each.
+// Quick reads of window and screen state run in place. Giving up the gate for them would cost a whole time slice each.
+static int quick_selector(const char *sn) {
     static const char *const quick[] = {"frame", "isKeyWindow", "contentRectForFrameRect:", "screens", "mainScreen", "objectAtIndex:", "count", "backingScaleFactor", NULL};
-    int keep_gate = 0;
-    for (const char *const *q = quick; *q; q++) {
-        if (!strcmp(sn, *q)) {
-            keep_gate = 1;
-            break;
-        }
-    }
+    for (const char *const *q = quick; *q; q++)
+        if (!strcmp(sn, *q)) return 1;
+    return 0;
+}
+// The call itself and its result, after the arguments are in place.
+static int send_call(CPU *c, id recv, SEL sel, void *fn, const char *rt, int keep_gate, Regs *rp, OutSlot *outs, int nout, u32 stret, const char *sn) {
+    Regs r = *rp;
+    char k = *rt;
     if (!strcmp(sn, "makeCurrentContext") || !strcmp(sn, "clearCurrentContext")) {
         rt_glq_drain();
         rt_gl_context_changed();
@@ -461,6 +469,163 @@ static int host_send_from(CPU *c, u32 self, u32 selg, u32 ap, u32 stret, Class s
     }
     for (int i = 0; i < nout; i++) G32(outs[i].guest) = cf_wrap(outs[i].val);
     return 1;
+}
+// ---------- plans: a message to a system object, worked out once for its class and selector ----------
+// Feral's code asks the window and the screen for their geometry hundreds of times a frame (frame, screens, backingScaleFactor,
+// contentRectForFrameRect:...: about 310 sends a frame, 2026-11-08). Each send used to compare its selector with a dozen names,
+// look the method up in the class's method lists, and parse its type encoding. A plan keeps the method, its argument kinds and its
+// return type for a class and a selector in the game's image, whose strings never change; sends that need a special case get none.
+typedef struct Plan {
+    Class cls;
+    u32 sel_g;
+    SEL sel;
+    const char *rt;  // the return type, qualifiers skipped
+    u8 ok, keep_gate, nk;
+    u8 kinds[MAX_KINDS];
+} Plan;
+#define PLAN_N 4096u
+#define PLAN_PROBE 16u
+static Plan *_Atomic plans[PLAN_N];
+static pthread_mutex_t plan_mu = PTHREAD_MUTEX_INITIALIZER;
+// Selectors the slow path treats specially, before or after the call: never planned.
+static int plan_excluded(const char *sn) {
+    static const char *const names[] = {"countByEnumeratingWithState:objects:count:", "runModal", "addLocalMonitorForEventsMatchingMask:handler:",
+                                        "setMainFrameURL:", "operatingSystemVersion", "mainBundle", "makeCurrentContext",
+                                        "clearCurrentContext", "dealloc", NULL};
+    for (const char *const *n = names; *n; n++)
+        if (!strcmp(sn, *n)) return 1;
+    return strstr(sn, "Format:") || strstr(sn, "Objects");
+}
+static int plan_return_ok(const char *rt) {
+    switch (*rt) {
+        case 'v': case '@': case '#': case '^': case ':': case '*': case 'f': case 'd':
+        case 'c': case 'C': case 'B': case 's': case 'S': case 'i': case 'I': case 'l': case 'L': case 'q': case 'Q':
+            return 1;
+        case '{':
+            return !strncmp(rt, "{CGRect", 7) || !strncmp(rt, "{_NSRect", 8) || !strncmp(rt, "{CGPoint", 8) || !strncmp(rt, "{CGSize", 7) ||
+                   !strncmp(rt, "{_NSPoint", 9) || !strncmp(rt, "{_NSSize", 8) || !strncmp(rt, "{_NSRange", 9);
+    }
+    return 0;
+}
+static Plan *plan_make(Class cls, u32 sel_g, const char *sn) {
+    Plan *p = calloc(1, sizeof *p);
+    p->cls = cls;
+    p->sel_g = sel_g;
+    if (plan_excluded(sn)) return p;
+    p->sel = sel_registerName(sn);
+    Method m = class_getInstanceMethod(cls, p->sel);
+    if (!m) return p;
+    p->rt = skip_quals(method_getTypeEncoding(m));
+    if (!plan_return_ok(p->rt)) return p;
+    int nk = arg_kinds(m, sn, p->kinds);
+    if (nk < 0) return p;
+    for (int i = 0; i < nk; i++)
+        if (p->kinds[i] == AK_BAD) return p;
+    p->nk = (u8)nk;
+    p->keep_gate = (u8)quick_selector(sn);
+    p->ok = 1;
+    return p;
+}
+// The plan for a class and a selector, made on first use; NULL when the send has to go the slow way.
+static Plan *plan_get(Class cls, u32 sel_g, const char *sn) {
+    u32 h = (u32)((((uintptr_t)cls >> 3) * 0x9E3779B97F4A7C15ull) >> 40) ^ (sel_g * 0x85EBCA6Bu);
+    for (u32 i = 0; i < PLAN_PROBE; i++) {
+        Plan *p = atomic_load_explicit(&plans[(h + i) % PLAN_N], memory_order_acquire);
+        if (!p) break;
+        if (p->cls == cls && p->sel_g == sel_g) return p->ok ? p : NULL;
+    }
+    Plan *made = plan_make(cls, sel_g, sn), *use = NULL;
+    pthread_mutex_lock(&plan_mu);
+    for (u32 i = 0; i < PLAN_PROBE; i++) {
+        Plan *q = atomic_load_explicit(&plans[(h + i) % PLAN_N], memory_order_relaxed);
+        if (q && q->cls == cls && q->sel_g == sel_g) {
+            use = q;
+            break;
+        }
+        if (!q) {
+            atomic_store_explicit(&plans[(h + i) % PLAN_N], made, memory_order_release);
+            use = made;
+            made = NULL;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&plan_mu);
+    free(made);  // another thread's was there first, or the table is full here
+    return use && use->ok ? use : NULL;
+}
+static int host_send_from(CPU *c, u32 self, u32 selg, u32 ap, u32 stret, Class start_class) {
+    id recv = host_receiver(self);
+    const char *sn = GS(selg);
+    if (!recv) return 0;
+    if (!start_class && !trace && !plan_off_now() && selg >= 0x1000u && selg < IMAGE_END) {
+        Plan *p = plan_get(object_getClass(recv), selg, sn);
+        if (p) {
+            Regs r;
+            memset(&r, 0, sizeof r);
+            OutSlot outs[4];
+            int nout = 0;
+            marshal_exec(p->kinds, p->nk, ap, &r, outs, &nout);
+            return send_call(c, recv, p->sel, (void *)objc_msgSend, p->rt, p->keep_gate, &r, outs, nout, stret, sn);
+        }
+    }
+    if (!strcmp(sn, "countByEnumeratingWithState:objects:count:")) return fast_enumerate(c, recv, ap);
+    if (strstr(sn, "Format:") && format_send(c, recv, sn, ap)) return 1;
+    if (strstr(sn, "Objects") && collection_send(c, recv, sn, ap)) return 1;
+    // Test runs answer the welcome dialog with its default button instead of waiting for a person.
+    if (!strcmp(sn, "runModal") && getenv("ARKHAM_AUTO_ALERT")) {
+        id msg = ((id(*)(id, SEL))objc_msgSend)(recv, sel_registerName("messageText"));
+        id info = ((id(*)(id, SEL))objc_msgSend)(recv, sel_registerName("informativeText"));
+        fprintf(stderr, "[objc] auto-answering runModal with the first button: %s / %s\n", msg ? ns_utf8(msg) : "", info ? ns_utf8(info) : "");
+        RET(1000);
+        return 1;
+    }
+    if (!strcmp(sn, "addLocalMonitorForEventsMatchingMask:handler:")) {
+        event_monitor_send(c, recv, ap);
+        return 1;
+    }
+    if (!strcmp(sn, "setMainFrameURL:")) rt_note_webview(recv);
+    if (!strcmp(sn, "setMainFrameURL:") && getenv("ARKHAM_JS_DEBUG")) {
+        extern id rt_web_debug_delegate(void);
+        ((void (*)(id, SEL, id))objc_msgSend)(recv, sel_registerName("setUIDelegate:"), rt_web_debug_delegate());
+    }
+    if (!strcmp(sn, "operatingSystemVersion")) {
+        // The same answer as Gestalt: the newest system the 32-bit build ever knew.
+        if (stret) {
+            G32(stret) = 10;
+            G32(stret + 4) = 14;
+            G32(stret + 8) = 6;
+        }
+        return 1;
+    }
+    if (recv == (id)objc_getClass("NSBundle") && !strcmp(sn, "mainBundle")) {
+        extern id rt_game_bundle(void);
+        RET(cf_wrap(rt_game_bundle()));
+        return 1;
+    }
+    SEL sel = sel_registerName(sn);
+    Class cls = start_class ? start_class : object_getClass(recv);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return 0;
+    void *fn = start_class ? (void *)method_getImplementation(m) : (void *)objc_msgSend;
+    if (start_class && !strcmp(sn, "dealloc")) proxy_forget(recv);
+    Regs r;
+    memset(&r, 0, sizeof r);
+    OutSlot outs[4];
+    int nout = 0;
+    marshal_args(m, sn, ap, &r, outs, &nout);
+    if (trace && r.nx > 0 && (intptr_t)r.x[0] > 0x100000000LL) {
+        // Show string arguments, which is what makes a message trace readable.
+        const char *t2 = next_type(next_type(next_type(method_getTypeEncoding(m))));
+        if (*skip_quals(t2) == '@') {
+            id a0 = (id)r.x[0];
+            if (((signed char (*)(id, SEL, Class))objc_msgSend)(a0, sel_registerName("isKindOfClass:"), objc_getClass("NSString"))) {
+                const char *u = ((const char *(*)(id, SEL))objc_msgSend)(a0, sel_registerName("UTF8String"));
+                fprintf(stderr, "[objc]   arg0 = \"%.200s\"\n", u ? u : "");
+            }
+        }
+    }
+    const char *rt = skip_quals(method_getTypeEncoding(m));
+    return send_call(c, recv, sel, fn, rt, quick_selector(sn), &r, outs, nout, stret, sn);
 }
 static int host_send(CPU *c, u32 self, u32 selg, u32 ap, u32 stret) { return host_send_from(c, self, selg, ap, stret, Nil); }
 
@@ -558,7 +723,7 @@ static u32 list_find(u32 ml, const char *sn) {
 }
 
 // Resolve a guest method on a class, walking up the guest part of the hierarchy, categories included.
-static u32 gclass_method(GClass *k, const char *sn, int meta) {
+static u32 gclass_method_slow(GClass *k, const char *sn, int meta) {
     while (k) {
         u32 addr = meta ? k->meta : k->addr;
         u32 imp = list_find(G32(addr + 28), sn);
@@ -574,6 +739,39 @@ static u32 gclass_method(GClass *k, const char *sn, int meta) {
     return 0;
 }
 
+// The same, kept for a selector string in the game's image: {class, meta, selector} to the method, 0 for none.
+typedef struct { GClass *k; u32 sel_g; u32 imp; u8 meta; } GMethod;
+#define GM_N 1024u
+static GMethod *_Atomic gmethods[GM_N];
+static pthread_mutex_t gm_mu = PTHREAD_MUTEX_INITIALIZER;
+static u32 gclass_method_at(GClass *k, u32 sel_g, int meta) {
+    const char *sn = GS(sel_g);
+    if (sel_g < 0x1000u || sel_g >= IMAGE_END || plan_off_now()) return gclass_method_slow(k, sn, meta);
+    u32 h = (u32)(((uintptr_t)k >> 3) * 0x9E3779B1u) ^ (sel_g * 0x85EBCA6Bu) ^ (u32)meta;
+    h = (h >> 16 ^ h) % GM_N;
+    for (u32 i = 0; i < 8; i++) {
+        GMethod *g = atomic_load_explicit(&gmethods[(h + i) % GM_N], memory_order_acquire);
+        if (!g) break;
+        if (g->k == k && g->sel_g == sel_g && g->meta == (u8)meta) return g->imp;
+    }
+    u32 imp = gclass_method_slow(k, sn, meta);
+    GMethod *made = malloc(sizeof *made);
+    *made = (GMethod){k, sel_g, imp, (u8)meta};
+    pthread_mutex_lock(&gm_mu);
+    for (u32 i = 0; i < 8; i++) {
+        GMethod *q = atomic_load_explicit(&gmethods[(h + i) % GM_N], memory_order_relaxed);
+        if (q && q->k == k && q->sel_g == sel_g && q->meta == (u8)meta) break;
+        if (!q) {
+            atomic_store_explicit(&gmethods[(h + i) % GM_N], made, memory_order_release);
+            made = NULL;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gm_mu);
+    free(made);
+    return imp;
+}
+
 // Decide whether a receiver belongs to a guest class. Sets *meta when the receiver is the class itself.
 static GClass *guest_class_of(u32 r, int *meta) {
     if (r < 0x1000 || rt_is_handle(r)) return NULL;
@@ -585,13 +783,12 @@ static GClass *guest_class_of(u32 r, int *meta) {
             }
         }
     }
-    if (looks_like_name(r)) {
-        GClass *k = gclass_by_name(GS(r));
-        if (k) {
-            *meta = 1;
-            return k;
+    if (r < IMAGE_END) {
+        const NameInfo *n = name_info(r);
+        if (n->is_name) {
+            if (n->g) *meta = 1;
+            return n->g;
         }
-        return NULL;
     }
     if (r >= 0x04000000u && r < 0xE0000000u) {
         u32 isa = G32(r);
@@ -619,7 +816,7 @@ static void guest_root_message(CPU *c, GClass *k, int meta, u32 self, const char
                !strcmp(sn, "class")) {
         c->eax = self;
     } else if (!strcmp(sn, "isKindOfClass:") || !strcmp(sn, "respondsToSelector:")) {
-        c->eax = (!strcmp(sn, "respondsToSelector:") && gclass_method(k, GS(G32(ap)), meta)) ? 1 : 0;
+        c->eax = (!strcmp(sn, "respondsToSelector:") && gclass_method_slow(k, GS(G32(ap)), meta)) ? 1 : 0;
     } else {
         if (trace) fprintf(stderr, "[objc] unanswered [%s %s]\n", k->name, sn);
         c->eax = 0;
@@ -670,8 +867,50 @@ static u32 obj_wrap(id o) {
 }
 
 // Returns 1 when a guest method ran: it has then already popped any hidden struct-return pointer itself.
+// ARKHAM_TRACE_OBJC_COUNTS=1: how often each selector is sent from each place, the busiest every 5 s, for finding what to make faster.
+#define SC_N 1024u
+static struct { u32 sel, from; _Atomic u64 n; } sc_table[SC_N];
+static int sc_on;
+static void sc_count(u32 sel, u32 from) {
+    for (u32 i = ((sel * 0x9E3779B1u) ^ from) % SC_N, tries = 0; tries < 32; i = (i + 1) % SC_N, tries++) {
+        if (!sc_table[i].sel) {
+            sc_table[i].sel = sel;
+            sc_table[i].from = from;
+        }
+        if (sc_table[i].sel == sel && sc_table[i].from == from) {
+            atomic_fetch_add_explicit(&sc_table[i].n, 1, memory_order_relaxed);
+            return;
+        }
+    }
+}
+static void *sc_report(void *arg) {
+    (void)arg;
+    static u64 last[SC_N];
+    for (;;) {
+        sleep(5);
+        u64 d[SC_N], total = 0;
+        for (u32 i = 0; i < SC_N; i++) {
+            u64 n = atomic_load_explicit(&sc_table[i].n, memory_order_relaxed);
+            d[i] = n - last[i];
+            last[i] = n;
+            total += d[i];
+        }
+        if (!total) continue;
+        fprintf(stderr, "[objc-count] %llu sends in 5 s\n", total);
+        for (int k = 0; k < 16; k++) {
+            u32 best = SC_N;
+            for (u32 i = 0; i < SC_N; i++)
+                if (d[i] && (best == SC_N || d[i] > d[best])) best = i;
+            if (best == SC_N) break;
+            fprintf(stderr, "[objc-count]   %8llu %-40s from %08x\n", d[best], GS(sc_table[best].sel), sc_table[best].from);
+            d[best] = 0;
+        }
+    }
+    return NULL;
+}
 static int send(CPU *c, u32 self, u32 sel, u32 ap, u32 stret) {
     char b[80];
+    if (sc_on) sc_count(sel, G32(c->esp));
     if (!self) {
         c->eax = 0;
         c->edx = 0;
@@ -681,7 +920,7 @@ static int send(CPU *c, u32 self, u32 sel, u32 ap, u32 stret) {
     int meta = 0;
     GClass *k = guest_class_of(self, &meta);
     if (k) {
-        u32 imp = gclass_method(k, sn, meta);
+        u32 imp = gclass_method_at(k, sel, meta);
         if (trace) fprintf(stderr, "[objc] [%s %s] guest %08x from %08x\n", k->name, sn, imp, G32(c->esp));
         if (!strcmp(sn, "setEntryPoint:")) entry_point = G32(ap);
         if (imp) {
@@ -720,7 +959,7 @@ SHIM(objc_msgSendSuper) {
     for (int i = 0; i < ngclasses; i++)
         if (gclasses[i].addr == kl || gclasses[i].meta == kl) s = &gclasses[i];
     if (!s && looks_like_name(kl)) s = gclass_by_name(GS(kl));
-    u32 imp = s ? gclass_method(s, sn, meta) : 0;
+    u32 imp = s ? gclass_method_slow(s, sn, meta) : 0;
     if (trace) fprintf(stderr, "[objc] [super %s] from %s -> guest %08x\n", sn, s ? s->name : (looks_like_name(kl) ? GS(kl) : "?"), imp);
     if (imp) {
         // The method expects the receiver where objc_super was: same frame, first argument rewritten.
@@ -1613,6 +1852,12 @@ void rt_launcher_skip_install(void) {
 
 void rt_objc_init(void) {
     trace = getenv("ARKHAM_TRACE_OBJC") != NULL;
+    sc_on = getenv("ARKHAM_TRACE_OBJC_COUNTS") != NULL;
+    if (sc_on) {
+        pthread_t t;
+        pthread_create(&t, NULL, sc_report, NULL);
+        pthread_detach(t);
+    }
     h2p = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
     p2h = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
     gclasses_load();
