@@ -304,6 +304,25 @@ static inline void bi_findbat(CGContextRef g) {
     CGPathRelease(p);
     CGContextFillPath(g);
 }
+// Both sticks at once, for the cryptographic sequencer: a pad, its two sticks cut out of it with their knobs in them.
+static inline void bi_twosticks(CGContextRef g) {
+    CGContextMoveToPoint(g, 27, 22);
+    CGContextAddLineToPoint(g, 73, 22);
+    CGContextAddCurveToPoint(g, 88, 22, 94, 46, 96, 70);    // the right side, down into its grip
+    CGContextAddCurveToPoint(g, 97, 82, 88, 88, 80, 82);
+    CGContextAddCurveToPoint(g, 74, 76, 70, 68, 64, 68);    // the right grip's inside
+    CGContextAddLineToPoint(g, 36, 68);
+    CGContextAddCurveToPoint(g, 30, 68, 26, 76, 20, 82);
+    CGContextAddCurveToPoint(g, 12, 88, 3, 82, 4, 70);
+    CGContextAddCurveToPoint(g, 6, 46, 12, 22, 27, 22);
+    CGContextFillPath(g);
+    bi_cut(g, 1);
+    CGContextFillEllipseInRect(g, CGRectMake(20, 33, 28, 28));
+    CGContextFillEllipseInRect(g, CGRectMake(52, 33, 28, 28));
+    bi_cut(g, 0);
+    CGContextFillEllipseInRect(g, CGRectMake(26.5, 39.5, 15, 15));
+    CGContextFillEllipseInRect(g, CGRectMake(58.5, 39.5, 15, 15));
+}
 
 
 
@@ -315,7 +334,7 @@ static inline int bat_icon_draw(CGContextRef g, const char *ident, CGFloat size)
     } icons[] = {
         {"cross", bi_run},   {"square", bi_fist},  {"triangle", bi_shield}, {"circle", bi_cape}, {"r1", bi_grapple},  {"r2", bi_crouch},  {"r3", bi_zoom},
         {"l1", bi_cowl},     {"l2", bi_reticle},   {"l3", bi_recenter},     {"map", bi_map},     {"pause", bi_pause}, {"photo", bi_hide}, {"close", bi_close},
-        {"gadgets", bi_batarang}, {"findbat", bi_findbat},
+        {"gadgets", bi_batarang}, {"findbat", bi_findbat}, {"twosticks", bi_twosticks},
     };
     for (size_t i = 0; i < sizeof icons / sizeof icons[0]; i++) {
         if (strcmp(icons[i].ident, ident)) continue;

@@ -46,7 +46,7 @@ void rt_ios_overlay_hidden(int hidden);
 CGRect rt_ios_game_rect(void);       // main.m: where the game's picture is
 
 // The runtime's numbers for the controls (the enum in shims_hid.m), and the wheel's own.
-enum { C_LT = 4, C_RT = 5, B_SOUTH = 7, B_EAST, B_WEST, B_NORTH, B_LB, B_RB, B_START, B_BACK, B_L3, B_R3, B_HOME, D_UP, D_DOWN, D_LEFT, D_RIGHT, C_WHEEL = 100, C_PHOTO };
+enum { C_LT = 4, C_RT = 5, B_SOUTH = 7, B_EAST, B_WEST, B_NORTH, B_LB, B_RB, B_START, B_BACK, B_L3, B_R3, B_HOME, D_UP, D_DOWN, D_LEFT, D_RIGHT, C_WHEEL = 100, C_PHOTO, C_TWOSTICKS };
 enum { STYLE_PS, STYLE_XBOX, STYLE_ICONS };
 enum { SH_NONE, SH_CROSS, SH_CIRCLE, SH_SQUARE, SH_TRIANGLE };
 enum { SIDE_UP, SIDE_RIGHT, SIDE_DOWN, SIDE_LEFT };
@@ -115,6 +115,9 @@ static const Def defs[] = {
     {"map", B_BACK, {TC, -64, 28, 20}, {TC, -70, 55, 24}, "", "", "map.fill", "Карта", SH_NONE, 0xFFFFFF, 0xFFFFFF},
     {"pause", B_START, {TC, 64, 28, 20}, {TC, 70, 55, 24}, "", "", "pause.fill", "Пауза", SH_NONE, 0xFFFFFF, 0xFFFFFF},
     {"photo", C_PHOTO, {TL, 30, 26, 19}, {TC, 0, 55, 22}, "", "", "eye.slash.fill", "Скрыть все кнопки (для скриншотов); вернуть — касание экрана", SH_NONE, 0xFFFFFF, 0xFFFFFF},
+    // Both sticks at once, for the cryptographic sequencer, whose tuning takes the pad's left and right sticks together: while it's on, the stick goes to
+    // the game as the pad's left one, and a touch where the camera's swipe would be is the pad's right stick. Below the photo button.
+    {"twosticks", C_TWOSTICKS, {TL, 30, 74, 19}, {TC, 0, 120, 22}, "", "", "gamecontroller.fill", "Два стика (взлом шифров): слева левый стик геймпада, справа правый; выключить — та же кнопка", SH_NONE, 0xFFFFFF, 0xFFFFFF},
 };
 #define N_DEFS (sizeof defs / sizeof defs[0])
 // Outside play the only one: backs out of menus, closes the map, skips a cutscene. It stays at the top left, as the gear does at the right.
@@ -280,6 +283,11 @@ static void open_settings(void);
     unsigned pulse_bits;  // the wheel's choice, held for a moment
     CFTimeInterval pulse_until;
     CAShapeLayer *stick_base, *stick_knob;
+    // Two sticks (the cryptographic sequencer): the second one, where the camera's swipe would be, as the pad's right stick.
+    BOOL twosticks;
+    UITouch *rstick_touch;
+    CGPoint rstick_center;
+    CAShapeLayer *rstick_base, *rstick_knob;
     UIImpactFeedbackGenerator *tap;
     UISelectionFeedbackGenerator *tick;
     CADisplayLink *link;
@@ -343,11 +351,13 @@ static void open_settings(void);
     findbat_button = [self makeButton:&findbat_def];
     stick_base = [CAShapeLayer layer];
     stick_knob = [CAShapeLayer layer];
-    for (CAShapeLayer *l in @[stick_base, stick_knob]) {
+    rstick_base = [CAShapeLayer layer];
+    rstick_knob = [CAShapeLayer layer];
+    for (CAShapeLayer *l in @[stick_base, stick_knob, rstick_base, rstick_knob]) {
         l.hidden = YES;
         [self.layer addSublayer:l];
     }
-    stick_base.lineWidth = 2;
+    stick_base.lineWidth = rstick_base.lineWidth = 2;
     wheel_disc = [CAShapeLayer layer];
     wheel_disc.fillColor = [UIColor colorWithWhite:0 alpha:0.35].CGColor;
     wheel_disc.strokeColor = [UIColor colorWithWhite:1 alpha:0.5].CGColor;
@@ -372,15 +382,14 @@ static void open_settings(void);
     wheel_side = -1;
     in_menu = YES;  // until play is seen: the films and loading at the start are outside it
     photo_hint = [UILabel new];
-    photo_hint.text = @"  Коснитесь экрана, чтобы вернуть кнопки  ";
     photo_hint.textColor = UIColor.whiteColor;
     photo_hint.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
     photo_hint.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+    photo_hint.numberOfLines = 0;
+    photo_hint.textAlignment = NSTextAlignmentCenter;
     photo_hint.layer.cornerRadius = 10;
     photo_hint.clipsToBounds = YES;
     photo_hint.alpha = 0;
-    [photo_hint sizeToFit];
-    photo_hint.frame = CGRectInset(photo_hint.frame, 0, -8);
     [self addSubview:photo_hint];
     link = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     [self followFrameRateLimit];
@@ -620,10 +629,11 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
 - (void)colorButton:(PadButton *)b {
     BOOL down = b.holders > 0;
     float ink = b.ink;
-    BOOL lit = b.def->control == C_RT && b.kind == KIND_BAT;  // R2 while aiming: lit up, to show where to throw
+    BOOL lit = (b.def->control == C_RT && b.kind == KIND_BAT)     // R2 while aiming: lit up, to show where to throw
+               || (b.def->control == C_TWOSTICKS && twosticks);  // the two sticks, while they're on
     UIColor *fg = ink_color(ink, 1);
     b.group.opacity = b.badge_group.opacity = [self opacityOf:b];
-    b.back.fillColor = (down ? ink_color(ink, 0.55) : ink_color(1 - ink, 0.5)).CGColor;
+    b.back.fillColor = (down ? ink_color(ink, 0.55) : lit && b.def->control == C_TWOSTICKS ? rgb(0x3C8FE0, 0.6) : ink_color(1 - ink, 0.5)).CGColor;
     b.back.strokeColor = (self.editing && b.hiddenByPlayer ? rgb(0xE86A6A, 0.95)
                           : lit                          ? rgb(0x7FB2E5, 1)
                                                          : ink_color(ink, 0.9)).CGColor;
@@ -659,9 +669,10 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
     [CATransaction setDisableActions:YES];
     for (PadButton *b in [self allButtons]) {
         [self placeButton:b];
-        BOOL show = b == close_button     ? in_menu && !self.editing && !photo
-                    : b == findbat_button ? in_menu && map_open && !self.editing && !photo
-                                          : self.editing || (!in_menu && !photo && !b.hiddenByPlayer);
+        BOOL show = b == close_button                                    ? in_menu && !self.editing && !photo
+                    : b == findbat_button                                ? in_menu && map_open && !self.editing && !photo
+                    : b.def->control == C_TWOSTICKS && twosticks && !self.editing ? !photo  // while on, always there to turn them off
+                                                                         : self.editing || (!in_menu && !photo && !b.hiddenByPlayer);
         b.shown = show;
         b.group.hidden = b.badge_group.hidden = !show;
         if (!show) {
@@ -677,11 +688,12 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
 }
 - (void)colorStick {
     CGFloat o = setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.8);
-    stick_base.opacity = (float)o;
-    stick_knob.opacity = (float)MAX(o, 0.9);  // the thumb's own place always shows
-    stick_base.fillColor = ink_color(1 - stick_ink, 0.44).CGColor;
-    stick_base.strokeColor = ink_color(stick_ink, 0.85).CGColor;
+    stick_base.opacity = rstick_base.opacity = (float)o;
+    stick_knob.opacity = rstick_knob.opacity = (float)MAX(o, 0.9);  // the thumb's own place always shows
+    stick_base.fillColor = rstick_base.fillColor = ink_color(1 - stick_ink, 0.44).CGColor;
+    stick_base.strokeColor = rstick_base.strokeColor = ink_color(stick_ink, 0.85).CGColor;
     stick_knob.fillColor = (running ? rgb(0x7FB2E5, 0.85) : ink_color(stick_ink, 0.75)).CGColor;
+    rstick_knob.fillColor = ink_color(stick_ink, 0.75).CGColor;
 }
 
 - (PadButton *)buttonAt:(CGPoint)p {
@@ -715,19 +727,29 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
         rt = MAX(rt, zoom_rt);
     }
     rt_touch_pad(lx, ly, rx, ry, lt, rt, bits);
-    rt_touch_move(lx, ly, !in_menu);  // in play walking goes straight to the engine (shims_sys.c); in menus the stick pans, through the pad
+    // In play walking goes straight to the engine (shims_sys.c); in menus the stick pans, through the pad; with two sticks it is the pad's, everywhere.
+    rt_touch_move(lx, ly, !in_menu && !twosticks);
 }
 
 - (CGFloat)stickRadius { return 62 * [self unit] / 1.15 * ([self portrait] ? 1.2 : 1); }
-- (void)showStickAt:(CGPoint)c knob:(CGPoint)k {
+- (void)showStick:(BOOL)right at:(CGPoint)c knob:(CGPoint)k {
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     CGFloat R = [self stickRadius], kr = R * 0.42;
-    stick_base.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.x - R, c.y - R, R * 2, R * 2)].CGPath;
-    stick_knob.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(k.x - kr, k.y - kr, kr * 2, kr * 2)].CGPath;
-    stick_base.hidden = stick_knob.hidden = photo;
+    CAShapeLayer *base = right ? rstick_base : stick_base, *knob = right ? rstick_knob : stick_knob;
+    base.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.x - R, c.y - R, R * 2, R * 2)].CGPath;
+    knob.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(k.x - kr, k.y - kr, kr * 2, kr * 2)].CGPath;
+    base.hidden = knob.hidden = photo;
     [self colorStick];
     [CATransaction commit];
+}
+// A stick's tilt, from its centre to the thumb: up positive, with a dead zone so that a resting thumb doesn't move it; and where its knob is drawn.
+- (CGPoint)tiltFrom:(CGPoint)c to:(CGPoint)p knob:(CGPoint *)k {
+    CGFloat R = [self stickRadius], dx = p.x - c.x, dy = p.y - c.y, d = hypot(dx, dy), shown = MIN(d, R);
+    float m = (float)(shown / R);
+    m = m < 0.12f ? 0 : (m - 0.12f) / 0.88f;
+    *k = CGPointMake(c.x + (d > 0 ? dx / d * shown : 0), c.y + (d > 0 ? dy / d * shown : 0));
+    return CGPointMake(d > 0 ? dx / d * m : 0, d > 0 ? -dy / d * m : 0);
 }
 
 // ---------- the gadgets' wheel ----------
@@ -831,15 +853,40 @@ static UIView *gear_view;
     gear_view.hidden = on;
     rt_ios_overlay_hidden(on);
     if (on) {
-        stick_base.hidden = stick_knob.hidden = YES;
-        photo_hint.center = CGPointMake(self.bounds.size.width / 2, CGRectGetMaxY(rt_ios_game_rect()) - 40);
-        photo_hint.alpha = 1;
-        [UIView animateWithDuration:0.6 delay:1.6 options:0 animations:^{ self->photo_hint.alpha = 0; } completion:nil];
+        stick_base.hidden = stick_knob.hidden = rstick_base.hidden = rstick_knob.hidden = YES;
+        [self flashHint:@"Коснитесь экрана, чтобы вернуть кнопки" for:1.6];
     } else {
         photo_hint.alpha = 0;
     }
     [self restyle];
     fprintf(stderr, "[touch] %s\n", on ? "photo mode: everything hidden" : "photo mode over");
+}
+// A few words of help over the bottom of the picture, for a moment.
+- (void)flashHint:(NSString *)text for:(NSTimeInterval)secs {
+    photo_hint.text = text;
+    CGFloat most = MIN(self.bounds.size.width - 40, 560);
+    CGSize s = [photo_hint sizeThatFits:CGSizeMake(most - 24, CGFLOAT_MAX)];
+    photo_hint.bounds = CGRectMake(0, 0, MIN(most, s.width + 24), s.height + 16);
+    photo_hint.center = CGPointMake(self.bounds.size.width / 2, CGRectGetMaxY(rt_ios_game_rect()) - 24 - photo_hint.bounds.size.height / 2);
+    [photo_hint.layer removeAllAnimations];
+    photo_hint.alpha = 1;
+    [UIView animateWithDuration:0.6 delay:secs options:0 animations:^{ self->photo_hint.alpha = 0; } completion:nil];
+}
+// Two sticks, on or off. The camera's swipe and the right stick don't carry over from one to the other; the left stick goes on, without running.
+- (void)setTwoSticks:(BOOL)on {
+    if (on == twosticks) return;
+    twosticks = on;
+    look_touch = rstick_touch = nil;
+    rx = ry = 0;
+    running = NO;
+    rstick_base.hidden = rstick_knob.hidden = YES;
+    [self restyle];
+    [self flashHint:on ? @"Два стика: слева — левый стик геймпада, справа — правый (для взлома шифров). Выключить — та же кнопка"
+                       : @"Два стика выключены: справа снова камера"
+                    for:on ? 3 : 1.2];
+    fprintf(stderr, "[touch] %s\n", on ? "two sticks: the stick is the pad's left one and a touch elsewhere the pad's right one (the cryptographic sequencer)"
+                                       : "two sticks off: the swipe turns the camera again");
+    [self send];
 }
 // The map, each display frame. Measured on the Mac (2026-11-08):
 // - The pad's left stick moves the map's view: full right moves it right, so the map itself goes left. At full tilt that is about a third of
@@ -888,8 +935,10 @@ static UIView *gear_view;
     last_frame = now;
     if (dt <= 0 || dt > 0.1) dt = 1.0 / 60;
     [self updatePlay:now];
-    rx = ry = 0;
-    if (in_menu && map_open) {
+    if (!rstick_touch) rx = ry = 0;
+    if (twosticks) {
+        // Both sticks are the thumbs' own, outside play too.
+    } else if (in_menu && map_open) {
         [self mapFrame:dt];
     } else if (in_menu) {
         // Elsewhere outside play a drag is the left stick, the other way from the finger, at a tilt from its speed.
@@ -923,6 +972,14 @@ static UIView *gear_view;
     if (!CGRectContainsPoint(g, p)) return;
     rt_ios_click((p.x - g.origin.x) / g.size.width, (p.y - g.origin.y) / g.size.height);
 }
+- (void)startStick:(UITouch *)t at:(CGPoint)p {
+    stick_touch = t;
+    stick_center = p;
+    lx = ly = 0;
+    running = NO;
+    [owners setObject:@"stick" forKey:t];
+    [self showStick:NO at:p knob:p];
+}
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     for (UITouch *t in touches) {
         CGPoint p = [t locationInView:self];
@@ -945,6 +1002,12 @@ static UIView *gear_view;
             [tap impactOccurred];
             [owners setObject:@"photo" forKey:t];
             [self setPhoto:YES];
+            continue;
+        }
+        if (b && b.def->control == C_TWOSTICKS) {
+            [tap impactOccurred];
+            [owners setObject:@"twosticks" forKey:t];
+            [self setTwoSticks:!twosticks];
             continue;
         }
         if (b && b.def->control == C_WHEEL) {
@@ -972,6 +1035,20 @@ static UIView *gear_view;
         }
         [tap_start setObject:[NSValue valueWithCGPoint:p] forKey:t];
         [tap_time setObject:@(t.timestamp) forKey:t];
+        if (twosticks) {
+            // The stick's side as ever, and anywhere else the right stick, where the thumb lands. Outside play as well, in case the sequencer's
+            // screen doesn't look like play here; a tap there still clicks.
+            if ([self inStickZone:p] && !stick_touch) {
+                [self startStick:t at:p];
+            } else if (!rstick_touch) {
+                rstick_touch = t;
+                rstick_center = p;
+                rx = ry = 0;
+                [owners setObject:@"rstick" forKey:t];
+                [self showStick:YES at:p knob:p];
+            }
+            continue;
+        }
         if (in_menu) {
             if (!pan_touch) {
                 pan_touch = t;
@@ -992,12 +1069,7 @@ static UIView *gear_view;
             continue;
         }
         if ([self inStickZone:p] && !stick_touch) {
-            stick_touch = t;
-            stick_center = p;
-            lx = ly = 0;
-            running = NO;
-            [owners setObject:@"stick" forKey:t];
-            [self showStickAt:p knob:p];
+            [self startStick:t at:p];
         } else if (!look_touch) {
             look_touch = t;
             look_last = p;
@@ -1029,18 +1101,21 @@ static UIView *gear_view;
         } else if (t == pinch_touch) {
             pinch_point = p;
         } else if (t == stick_touch) {
-            CGFloat R = [self stickRadius], dx = p.x - stick_center.x, dy = p.y - stick_center.y, d = hypot(dx, dy);
-            BOOL run = setting(@"autoRun", "ARKHAM_TOUCH_RUN", 1) > 0 && d > R * 1.45;
+            // Past the stick's edge Batman runs, as the pad's cross held; not with two sticks, where the cross isn't wanted.
+            BOOL run = !twosticks && setting(@"autoRun", "ARKHAM_TOUCH_RUN", 1) > 0 && hypot(p.x - stick_center.x, p.y - stick_center.y) > [self stickRadius] * 1.45;
             if (run != running) {
                 running = run;
                 if (run) [tap impactOccurred];
             }
-            CGFloat shown = MIN(d, R);
-            float m = (float)(shown / R);
-            m = m < 0.12f ? 0 : (m - 0.12f) / 0.88f;  // a dead zone, so a resting thumb doesn't walk
-            lx = d > 0 ? (float)(dx / d) * m : 0;
-            ly = d > 0 ? (float)(-dy / d) * m : 0;
-            [self showStickAt:stick_center knob:CGPointMake(stick_center.x + (d > 0 ? dx / d * shown : 0), stick_center.y + (d > 0 ? dy / d * shown : 0))];
+            CGPoint k, v = [self tiltFrom:stick_center to:p knob:&k];
+            lx = (float)v.x;
+            ly = (float)v.y;
+            [self showStick:NO at:stick_center knob:k];
+        } else if (t == rstick_touch) {
+            CGPoint k, v = [self tiltFrom:rstick_center to:p knob:&k];
+            rx = (float)v.x;
+            ry = (float)v.y;
+            [self showStick:YES at:rstick_center knob:k];
         } else if (t == look_touch) {
             // The camera: the thumb's travel as the game's mouse, as it comes. Right turns right; up looks up, unless the settings invert it.
             CGPoint d = CGPointZero;
@@ -1119,6 +1194,11 @@ static UIView *gear_view;
             running = NO;
             stick_base.hidden = stick_knob.hidden = YES;
         }
+        if (t == rstick_touch) {
+            rstick_touch = nil;
+            rx = ry = 0;
+            rstick_base.hidden = rstick_knob.hidden = YES;
+        }
         if (t == look_touch) look_touch = nil;
         [owners removeObjectForKey:t];
     }
@@ -1132,7 +1212,7 @@ static UIView *gear_view;
     [owners removeAllObjects];
     [tap_start removeAllObjects];
     [tap_time removeAllObjects];
-    stick_touch = look_touch = pan_touch = wheel_touch = pinch_touch = nil;
+    stick_touch = look_touch = pan_touch = wheel_touch = pinch_touch = rstick_touch = nil;
     lx = ly = rx = ry = 0;
     pan_sum = pan_debt = CGPointZero;
     pinch_last = 0;
@@ -1140,7 +1220,7 @@ static UIView *gear_view;
     zoom_lt = zoom_rt = 0;
     running = panning = NO;
     pulse_bits = 0;
-    stick_base.hidden = stick_knob.hidden = YES;
+    stick_base.hidden = stick_knob.hidden = rstick_base.hidden = rstick_knob.hidden = YES;
     if (wheel_open) [self closeWheel];
     [self restyle];
     [self send];
