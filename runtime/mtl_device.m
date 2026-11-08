@@ -3046,7 +3046,8 @@ static int fx_target(u32 bw, u32 bh, u32 *ow, u32 *oh) {
         h = (u32)(bh * k);
     }
 #endif
-    if (!w || !h || w < bw || h < bh || (w == bw && h == bh) || w > 16384 || h > 16384) return 0;  // not larger: nothing to scale up to
+    // Not larger, or hardly (the phone's full resolution, 2848 x 2000 on a screen of 2853 x 2007): nothing to scale up to.
+    if (!w || !h || w < bw || h < bh || (w * 20 <= bw * 21 && h * 20 <= bh * 21) || w > 16384 || h > 16384) return 0;
     *ow = w;
     *oh = h;
     return 1;

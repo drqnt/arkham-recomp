@@ -45,6 +45,8 @@ void rt_set_async_pipelines(int on);  // mtl_device.m: new pipelines built off t
 void rt_ios_overlay_enable(int on);  // main.m: the frame rate line
 void rt_ios_overlay_hidden(int hidden);
 CGRect rt_ios_game_rect(void);       // main.m: where the game's picture is
+extern double rt_ios_screen_w, rt_ios_screen_h, rt_ios_screen_scale;  // main.m: the screen the game is told it has, the biggest the app has been on
+static const double render_shares[4] = {1.0, 0.75, 0.5, 0.375};      // the settings' "Разрешение игры": of the screen's pixels, each way
 
 // The runtime's numbers for the controls (the enum in shims_hid.m), and the wheel's own.
 enum { C_LT = 4, C_RT = 5, B_SOUTH = 7, B_EAST, B_WEST, B_NORTH, B_LB, B_RB, B_START, B_BACK, B_L3, B_R3, B_HOME, D_UP, D_DOWN, D_LEFT, D_RIGHT, C_WHEEL = 100, C_PHOTO, C_TWOSTICKS, C_COMBO_TD, C_COMBO_THROW, C_COMBO_GROUND };
@@ -1539,13 +1541,18 @@ static UIView *gear_view;
     [self section:@"Изображение"
            footer:@"Экран показывает не больше 120 кадров в секунду; ограничение 60 бережёт батарею и греет меньше. Без рывков: в месте, где вы ещё не были, "
                   @"новый объект или эффект может появиться на кадр-другой позже, зато игра не замирает, пока видеокарта готовит его в первый раз. "
-                  @"MetalFX дотягивает картинку игры до полного разрешения экрана — чётче, чем простое растяжение. Разрешение игры: высокое — половина "
-                  @"пикселей экрана, как было; среднее и низкое дают больше FPS, MetalFX дотягивает их сильнее. Разрешение меняется со следующего запуска."];
+                  @"Разрешение игры — размер её картинки в пикселях для большого экрана, даже если игра запущена на сложенном телефоне; меняется со "
+                  @"следующего запуска. 1424×1000 — как было; полное — самое чёткое, видеокарте в четыре раза больше работы, MetalFX ему не нужен; "
+                  @"меньшие дают больше FPS. MetalFX дотягивает картинку игры до разрешения экрана — чётче, чем простое растяжение."];
     double cap = setting(@"fpsCap", "ARKHAM_FPS_CAP", 0);
     [self choice:@"Ограничение FPS" items:@[@"30", @"60", @"120", @"Без ограничения"] value:cap <= 0 ? 3 : cap <= 30 ? 0 : cap <= 60 ? 1 : 2 action:@selector(capChanged:)];
     [self toggle:@"MetalFX" on:setting(@"metalFX", "ARKHAM_METALFX", 1) > 0 action:@selector(metalFXChanged:)];
     double share = setting(@"renderScale", "ARKHAM_RENDER_SCALE", 0.5);
-    [self choice:@"Разрешение игры" items:@[@"Высокое", @"Среднее", @"Низкое"] value:share >= 0.49 ? 0 : share >= 0.41 ? 1 : 2 action:@selector(renderScaleChanged:)];
+    NSMutableArray *sizes = [NSMutableArray array];  // in the pixels of the screen the game is told it has (main.m: the biggest one)
+    for (int i = 0; i < 4; i++)
+        [sizes addObject:[NSString stringWithFormat:@"%d×%d", (int)(rt_ios_screen_w * rt_ios_screen_scale * render_shares[i]) & ~7,
+                                                      (int)(rt_ios_screen_h * rt_ios_screen_scale * render_shares[i]) & ~7]];
+    [self choice:@"Разрешение игры" items:sizes value:share >= 0.99 ? 0 : share >= 0.74 ? 1 : share >= 0.49 ? 2 : 3 action:@selector(renderScaleChanged:)];
     [self toggle:@"Без рывков в новых местах" on:setting(@"asyncPipelines", "ARKHAM_ASYNC_PIPELINES", 1) > 0 action:@selector(asyncChanged:)];
     [self toggle:@"Строка FPS и нагрева" on:setting(@"showFPS", "ARKHAM_FPS", 1) > 0 action:@selector(fpsLineChanged:)];
     [self toggle:@"Metal HUD (со следующего запуска)" on:setting(@"metalHUD", "ARKHAM_METAL_HUD", 0) > 0 action:@selector(hudChanged:)];
@@ -1640,10 +1647,10 @@ static UIView *gear_view;
     set_setting(@"metalFX", s.on);
     rt_set_metalfx(s.on);
 }
-// The share of the screen's pixels the game draws at: half (1424 x 1000 on the inner screen), 0.42 and 0.375. The game takes it at its start.
+// The share of the screen's pixels the game draws at, each way: all of them, three quarters, half (1424 x 1000 on the inner screen, the default)
+// and 0.375. The game takes it at its start.
 - (void)renderScaleChanged:(UISegmentedControl *)s {
-    static const double shares[] = {0.5, 0.42, 0.375};
-    set_setting(@"renderScale", shares[s.selectedSegmentIndex]);
+    set_setting(@"renderScale", render_shares[s.selectedSegmentIndex]);
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Разрешение игры" message:@"Поменяется при следующем запуске игры."
                                                         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];

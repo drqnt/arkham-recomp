@@ -26,10 +26,10 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
   Telling by itself when the sequencer is up isn't done: the button is turned on by hand.
 - **Low Power Mode** (2026-11-08): with it on, the phone made about 50 frames a second at the limit of 60 and showed 46 (v20's log).
   iOS lowers the processor's clock and the game's threads can't keep up. Possible: say so in the frame rate line when it's on.
-- **MSAA as a setting.** The game's resolution is one since v21 (high, medium, low: 0.5, 0.42, 0.375 of the screen's pixels).
+- **MSAA as a setting.** The game's resolution is one since v21, in pixels and up to full since v27.
 - **Better anti-aliasing and upscaling:** FXAA with the game's MSAA (FXAA is in), MetalFX (spatial first; temporal needs jitter and motion
   vectors), TAA, possibly SMAA.
-- **Speed:** branch `cpu-speed`, merged into `ios-port` (docs/CPU_SPEED.md): the game thread on the phone 7-9 ms to 3.6-6.6 ms a frame
+- **Speed** (closed 2026-11-08: the owner calls the performance good and wants no more optimizing): branch `cpu-speed`, merged into `ios-port` (docs/CPU_SPEED.md): the game thread on the phone 7-9 ms to 3.6-6.6 ms a frame
   at 120 (v23); on the Mac 2.73 to 2.52 ms where it is the limit. The render thread, 7-9 ms a frame on the phone with its waits, now holds
   the frame rate at 120: the Direct3D queue's machinery (about 20% of it on the Mac), the waits for query results. Also left: the locals of
   functions in registers (about 5% of the game thread), the 300 FPS bar on the Mac.
@@ -42,6 +42,8 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
 
 ## Done, by version (phone)
 
+- v27: the game's size from the inner screen even when started folded (it had drawn at 1016 x 696); the resolution as sizes in pixels,
+  up to full (2848×2000).
 - v26: the gadgets' wheel as the game's own: eight gadgets with their pictures and Russian names, the diagonals for the four between the
   cross's arms. v25 in it: a second throw button on the left while aiming; one touch for the three two-button moves.
 - v24: the camera faster while aiming (L2), with its own setting.

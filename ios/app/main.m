@@ -167,6 +167,20 @@ static void start_game(void) {
 
 // ---------- the screen ----------
 static UIView *root_view;
+// The biggest screen this app has been on, landscape, in points, and its scale, kept in the settings for the game's size at its next start: on
+// the foldable, the inner screen, whichever screen the app starts on.
+static void keep_screen(UIScreen *screen) {
+    if (!screen) return;
+    CGRect b = screen.bounds;
+    double w = MAX(b.size.width, b.size.height), h = MIN(b.size.width, b.size.height), s = screen.nativeScale;
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    double kw = [d doubleForKey:@"screenW"], kh = [d doubleForKey:@"screenH"], ks = [d doubleForKey:@"screenScale"];
+    if (w * h * s * s <= kw * kh * ks * ks) return;
+    [d setDouble:w forKey:@"screenW"];
+    [d setDouble:h forKey:@"screenH"];
+    [d setDouble:s forKey:@"screenScale"];
+    fprintf(stderr, "[ios] the biggest screen so far: %.0f x %.0f points at %.0fx, kept for the game's size\n", w, h, s);
+}
 // Where the game's picture is, in the view's points: across the top under the camera when the phone is upright, otherwise the middle of the screen,
 // always in the proportions of the screen the game started on (what it was told its display is: rt_ios_screen_w and _h).
 CGRect rt_ios_game_rect(void) {
@@ -217,6 +231,7 @@ CGRect rt_ios_game_rect(void) {
     CGSize s = self.view.bounds.size;
     if (!CGSizeEqualToSize(s, laid_out)) {
         laid_out = s;
+        keep_screen(self.view.window.windowScene.screen);  // unfolded onto a bigger screen: the game's size at its next start
         UIEdgeInsets in = self.view.safeAreaInsets;
         fprintf(stderr, "[ios] the view is %.0f x %.0f points (safe area insets top %.0f left %.0f bottom %.0f right %.0f), the game's picture %.0f x %.0f at %.0f,%.0f\n",
                 s.width, s.height, in.top, in.left, in.bottom, in.right, g.size.width, g.size.height, g.origin.x, g.origin.y);
@@ -298,11 +313,19 @@ static void show_text(UIViewController *vc, NSString *text) {
     [self.window makeKeyAndVisible];
     UIApplication.sharedApplication.idleTimerDisabled = YES;
 
-    // The screen as the game will see it: landscape, in points, and its scale (shims_cg.c, ios_appkit.m).
+    // The screen as the game will see it: landscape, in points, and its scale (shims_cg.c, ios_appkit.m). The game takes its size once, at its
+    // start, for the whole run: on the foldable that's the inner screen's even when the game starts folded, on the outer one, since it's the
+    // biggest screen this app has been on, kept in the settings (keep_screen). Started folded, the game had drawn at the outer screen's size,
+    // 1016 x 696, a very low picture once unfolded (2026-11-08).
     CGRect b = ws.screen.bounds;
-    rt_ios_screen_w = MAX(b.size.width, b.size.height);
-    rt_ios_screen_h = MIN(b.size.width, b.size.height);
-    rt_ios_screen_scale = ws.screen.nativeScale;
+    keep_screen(ws.screen);
+    NSUserDefaults *kept = NSUserDefaults.standardUserDefaults;
+    rt_ios_screen_w = [kept doubleForKey:@"screenW"];
+    rt_ios_screen_h = [kept doubleForKey:@"screenH"];
+    rt_ios_screen_scale = [kept doubleForKey:@"screenScale"];
+    if (rt_ios_screen_w * rt_ios_screen_scale > MAX(b.size.width, b.size.height) * ws.screen.nativeScale + 1)
+        fprintf(stderr, "[ios] started on a smaller screen, %.0f x %.0f points: the game is told the bigger one this app has been on\n",
+                MAX(b.size.width, b.size.height), MIN(b.size.width, b.size.height));
     NSDictionary *fs = [NSFileManager.defaultManager attributesOfFileSystemForPath:documents() error:nil];
     fprintf(stderr, "[ios] free space on the device: %.1f GB, memory the app may use: %.0f MB\n", [fs[NSFileSystemFreeSize] doubleValue] / 1e9,
             (double)os_proc_available_memory() / 1048576.0);

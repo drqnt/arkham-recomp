@@ -637,3 +637,17 @@ app goes to the background.
   only the Batarang, so the diagonals aren't tried in the game yet: the first gadget on one (the sequencer, say) will show it.
 - A scripted run's `pad:57:<hat>` steps need `ARKHAM_FAKE_PAD_TYPE=ps`: the default pad is the Xbox one, which has no hat, and the steps did
   nothing at all in the first try (a "[pad] scripted 1:57" line is logged either way).
+
+## v27: the game's size from the inner screen even when started folded; the resolution in pixels, up to full, 2026-11-08
+
+- The owner saw a very low picture in v26: the game had started with the phone folded, on the outer screen (466 x 678 points), and took its
+  size from it, 1016 x 696, for the whole run; unfolded, that went up to 2853 x 2007 pixels. MetalFX only scaled it up better.
+- The game is now told the biggest screen this app has been on (the settings keep it: `screenW`, `screenH`, `screenScale` in main.m's
+  keep_screen, updated whenever the view is laid out on a bigger one). On the foldable that's the inner screen whichever one the game starts on;
+  on the outer one the picture is the inner screen's, shown smaller.
+- "Разрешение игры" offers the sizes themselves for that screen: 2848×2000 (all of its pixels), 2136×1504, 1424×1000 (half, the default, as
+  before) and 1064×752. It was high, medium and low (0.5, 0.42 and 0.375). Taken at the next start, as before.
+- MetalFX isn't used when there's hardly anything to scale up (within 5%, as at the full size): the frame goes to the screen as it is.
+- v26's log (started folded, 1016 x 696, no FPS limit): 173 frames a second made in play (the median), up to 230 and 300 to 400 in light places,
+  112 to 120 shown; the GPU about 3 ms a frame, the busiest game thread 5 to 8 ms in heavier scenes. The owner calls the performance good and
+  wants no more optimizing (2026-11-08).
