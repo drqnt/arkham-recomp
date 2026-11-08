@@ -19,10 +19,8 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
   haptics engine is retried there since 2026-11-07, never felt with a pad connected. Then the phone: Feral's code goes through IOHIDDevice and
   ForceFeedback, which has to become GameController haptics.
 - **MetalFX, temporal.** The spatial upscaler is in since v21. Temporal needs jitter and motion vectors; UE3 makes no motion vectors.
-- **The cryptographic sequencer by touch** ("Секвенатор кода", a gadget later in the story: its "Tune Frequency" mini-game takes both sticks
-  at once, and the touch controls have one stick and the swipe as the mouse). The owner's design (2026-11-08): two touch sticks while the
-  mini-game is up. To find out first: how to tell that it's up (the game's own input actions or interface for it, or the game starting to read
-  the right stick).
+- **The cryptographic sequencer by touch:** two sticks since v22 (a button, the owner's design). To confirm on the phone at the first sequencer.
+  Telling by itself when the sequencer is up isn't done: the button is turned on by hand.
 - **Low Power Mode** (2026-11-08): with it on, the phone made about 50 frames a second at the limit of 60 and showed 46 (v20's log).
   iOS lowers the processor's clock and the game's threads can't keep up. Possible: say so in the frame rate line when it's on.
 - **MSAA as a setting.** The game's resolution is one since v21 (high, medium, low: 0.5, 0.42, 0.375 of the screen's pixels).
@@ -30,7 +28,11 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
   vectors), TAA, possibly SMAA.
 - **Speed:** the 300 FPS bar on the Mac (the Windows version gives about 350), game thread first, a second-generation translator in its own
   branch. On the phone (v17's profile) the render thread spent 90% of play waiting on occlusion query polls, one Direct3D thread wake-up each.
-  Answering them itself (v18) ran it ahead in bursts and dropped frames, so that is `ARKHAM_QUERY_FAST=1` only.
+  Answering them itself (v18) ran it ahead in bursts and dropped frames, so that is `ARKHAM_QUERY_FAST=1` only. At 120 the busiest thread
+  spends about 7.5 ms a frame (v21's log), so the processor caps the phone near 130; the owner asked for processor work (2026-11-08) and chose
+  to play first.
+- **MetalFX cheaper at 120:** it costs about 15 shown frames a second there (v21: 89 to 91 shown against 104 without; the GPU at 9.5 ms against
+  5.5). Possible: scale up to less than all of the screen's pixels, or turn it off by itself above 60.
 - **Hitches** of 45 to 85 ms a few times in 5 minutes on the phone, mostly where new shaders first appear. The user had said earlier not to
   work on shader compiling further.
 - **Mac:** play the `door-stutter` branch (a5188d3) by hand, then merge it into `first-frame`. Also check the elevator lights, a change of
@@ -38,6 +40,7 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
 
 ## Done, by version (phone)
 
+- v22: two sticks for the cryptographic sequencer (a button; the stick and a second floating stick as the pad's two).
 - v21: MetalFX spatial upscaling to the screen's pixels (on by default); the game's resolution as a setting.
 - v19 to v20: the occlusion query change made opt-in; the startup throw's resume done by the runtime itself; each turn of the phone logged.
 - v17 to v18: the map by touch (a drag moves it as far as the finger, two fingers zoom, a "Показать Бэтмена" button); a soft dark ring under

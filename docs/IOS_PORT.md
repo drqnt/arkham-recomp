@@ -560,3 +560,22 @@ app goes to the background.
 - **"Разрешение игры"** (high, medium, low): 0.5, 0.42 or 0.375 of the screen's pixels, taken at the next start. `ARKHAM_RENDER_SCALE` is
   read by the preferences rewrite and by the display modes, which put that share first as the default. Feral takes back the default whenever
   the size it kept isn't one of the modes.
+
+## v22: two sticks for the cryptographic sequencer; what MetalFX costs on the phone, 2026-11-08
+
+- **v21 on the phone (the owner's log):**
+  - At the limit of 60, MetalFX on: 58.6 frames a second shown of 59.8 made.
+  - At 120: with MetalFX and the high resolution, 89 shown of 114 made, the GPU at 9.5 ms a frame; the medium resolution, 91 shown at 7.7 ms.
+    v20 without MetalFX showed 104, the GPU at 5.5 ms. So MetalFX costs about 15 shown frames a second at 120, and nothing much at 60.
+  - The processor is near its own limit at 120 too: the busiest thread spends about 7.5 ms a frame, which caps it near 130. At 60 it has
+    room. Making that thread faster is the translator's work on the wish list, not a quick change.
+- **Two sticks** (the owner's design): a button below the photo one, a pad with its two sticks. While it's on:
+  - the stick goes to the game as the pad's left stick, in play too, instead of the keyboard's movement names;
+  - a touch anywhere the camera's swipe would be is a second, floating stick, the pad's right one;
+  - no running past the stick's edge; the button is lit, and stays shown outside play, so that it can always be turned off; a tap outside play
+    still clicks.
+  - Why the sequencer needs it: the pad's sticks feed `aRawLHJoy` and `aRawRHJoy` (DefaultInput.ini), the keyboard's WASD the left one, and the
+    mouse only `aMouseX`/`aMouseY`. The swipe is the mouse, so the right stick had no way in by touch.
+  - Not tried on the sequencer itself: no save at one here. The owner turns it on when the sequencer's screen comes up.
+- **Anything else a playthrough needs by touch:** every pad button is on the touch pad (the four, the shoulders, the triggers, both stick clicks,
+  start, back, the cross through the gadgets' wheel), and several can be held at once. The right stick's axes were the only input missing.
