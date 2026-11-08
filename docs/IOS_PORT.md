@@ -613,7 +613,7 @@ app goes to the background.
 - The `[fps]` line has "waiting for the layer": how long the render thread waits on the Direct3D thread a frame, to tell its own work from
   waiting. Repeated state calls are answered before the queue's full handler (no change measurable on the Mac).
 
-## v26: the gadgets' wheel as the game's own: eight gadgets, each with its picture, 2026-11-08 (built, waiting to be installed; v25 is in it)
+## v26: the gadgets' wheel as the game's own: eight gadgets, each with its picture, 2026-11-08 (installed 14:03; v25 is in it)
 
 - The wheel has the game's eight gadgets around the pad's cross where the game's own wheel has them: up the Batarang, up and right the Sonic
   Batarang, right the Line Launcher, down and right the Cryptographic Sequencer, down the Batclaw (later the Ultra Batclaw, the same place),
