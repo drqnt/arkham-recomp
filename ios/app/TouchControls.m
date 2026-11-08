@@ -823,7 +823,7 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
             wheel_sides[i].fillColor = (lit ? [UIColor colorWithWhite:1 alpha:0.2] : [UIColor colorWithWhite:0 alpha:0.55]).CGColor;
             wheel_sides[i].strokeColor = (lit ? rgb(0xF5A000, 0.9) : [UIColor colorWithWhite:1 alpha:0.35]).CGColor;
             wheel_sides[i].lineWidth = lit ? 2 : 1;
-            CGFloat at = (R + ri) / 2 + 2, size = R * 0.4;
+            CGFloat at = (R + ri) / 2 + 2, size = R * 0.44;
             wheel_icons[i].frame = CGRectMake(c.x + cos(mid) * at - size / 2, c.y + sin(mid) * at - size / 2, size, size);
             wheel_icons[i].mask.frame = wheel_icons[i].bounds;
             wheel_icons[i].backgroundColor = (lit ? rgb(0xF5A000, 1) : UIColor.whiteColor).CGColor;

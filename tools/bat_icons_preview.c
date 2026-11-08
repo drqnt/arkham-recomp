@@ -92,7 +92,7 @@ static void button(CGContextRef g, int i, CGFloat cx, CGFloat cy, CGFloat r) {
     CGContextSetGrayStrokeColor(g, 1, 0.9);
     CGContextSetLineWidth(g, fmax(1.5, r * 0.05));
     CGContextStrokeEllipseInRect(g, CGRectMake(cx - r, cy - r, r * 2, r * 2));
-    CGFloat w = !strcmp(buttons[i].ident, "gadgets") ? r * 1.32 : r * 1.15;
+    CGFloat w = r * 1.15;
     int wi = (int)ceil(w), pad = (int)ceil(fmax(3, w * 0.09));
     CGImageRef halo = halo_image(buttons[i].ident, wi, pad);
     put_mask(g, halo, CGRectMake(cx - wi / 2.0 - pad, cy - wi / 2.0 - pad, wi + pad * 2, wi + pad * 2), 0, 0.75);

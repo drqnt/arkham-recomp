@@ -623,10 +623,15 @@ app goes to the background.
 - The four between the cross's arms are two of its sides at once, which the PlayStation pad gives the game as its cross's diagonals
   (`read_touch` in shims_hid.m) and the Xbox pad as two buttons. The wheel's eight parts are 45 degrees each, its radius 3.4 times the button's
   (112 points at least; it was 3 times and 96 with four).
-- Each gadget has its own picture in BatIcons.h (`g_*`), after the game's own: the batarang, it with sound to both sides, a line strung from wall
-  to wall with the launcher on it, a handheld with two prongs and a wave on its screen, a three-pronged claw on its cable, a batarang at the end of
-  a dotted flight, a spray can with a burst cut in it, three batarangs. The one under the thumb is lit in the game's orange, and its name, the
-  game's Russian one (Frontend.rus), shows above the wheel, or beside it where there's no room above.
+- Each gadget has its own picture in BatIcons.h (`g_*`), traced from the owner's picture of the game's wheel: each icon in a square of it,
+  its outline read off a grid in the icons' 100 units and fitted to the box. The same shapes turned the same ways, solid in this port's
+  manner with the game's lines cut out of them. A first set drawn from scratch (a spray can, a zip line and so on) was turned down by the
+  owner: they should look like the game's. The one under the thumb is lit in the game's orange, and its name, the game's Russian one
+  (Frontend.rus), shows above the wheel, or beside it where there's no room above.
+- The closed gadgets button shows the pad's cross as the game's wheel has it in its middle, four keys pointing in, with the eight arrows round
+  it (`bi_dpad`), for "hold and slide"; it was the batarang. The wheel opens only while the button is held, or after a tap on it, as before.
+  (A picture of the open wheel, sent with a wrong caption, had made it look always open.)
+- The left throw button from v25 had no icon in the icon style (its ident had none); it has the batarang now.
 - The game's own wheel shows only the gadgets Batman has; this one shows all eight, and choosing one he hasn't got leaves the gadget as it was.
 - Checked on the Mac with the owner's save (a frozen copy): the cross reaches the game, whose wheel comes up with "Бэтаранг" lit. That save has
   only the Batarang, so the diagonals aren't tried in the game yet: the first gadget on one (the sequencer, say) will show it.
