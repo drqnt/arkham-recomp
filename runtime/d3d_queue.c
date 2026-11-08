@@ -495,6 +495,14 @@ static void pipe_report(void) {
             reads * u / total, d[0] * u / used, d[1] * u / used, d[2] * u / used);
 }
 static u64 n_async, n_sync, wait_ticks;
+// Always counted: the time the threads calling into the layer spend waiting on it, for an answer (run_sync) or for room in the ring, in the
+// counter's ticks, and the answers waited for. mtl_device.m reports both a frame: what the render thread waits for is the layer's thread being
+// behind, so it tells the render thread's own work from the layer's.
+static _Atomic u64 wait_raw, sync_calls;
+u64 rt_d3dq_take_waits(u64 *calls) {
+    *calls = atomic_exchange_explicit(&sync_calls, 0, memory_order_relaxed);
+    return to_mach_ticks(atomic_exchange_explicit(&wait_raw, 0, memory_order_relaxed));
+}
 static u64 method_sync[MAX_METHODS], method_async[MAX_METHODS];
 
 // Must be called with q_lock held. Room for one command, wrapping if needed.
@@ -505,7 +513,9 @@ static inline Cmd *reserve(u32 size) {
     u64 need = head + gap + size - RING_SIZE;
     if ((i64)(__atomic_load_n(&q_tail, __ATOMIC_ACQUIRE) - need) < 0) {
         wake_worker();
+        u64 w0 = fast_ticks();
         for (u32 i = 0; (i64)(__atomic_load_n(&q_tail, __ATOMIC_ACQUIRE) - need) < 0; i++) spin_pause(i);
+        atomic_fetch_add_explicit(&wait_raw, fast_ticks() - w0, memory_order_relaxed);
     }
     if (gap) {
         Cmd *skip = (Cmd *)(ring + off);
@@ -528,8 +538,10 @@ static void run_sync(CPU *c, const Method *m, u32 index) {
     __atomic_store_n(&q_head, q_head + sizeof(Cmd), __ATOMIC_SEQ_CST);
     os_unfair_lock_unlock(&q_lock);
     wake_worker();
-    u64 t0 = trace ? mach_absolute_time() : 0;
+    u64 t0 = trace ? mach_absolute_time() : 0, w0 = fast_ticks();
     for (u32 i = 0; !__atomic_load_n(&r.done, __ATOMIC_ACQUIRE); i++) spin_pause(i);
+    atomic_fetch_add_explicit(&wait_raw, fast_ticks() - w0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&sync_calls, 1, memory_order_relaxed);
     if (trace) {
         wait_ticks += mach_absolute_time() - t0;
         n_sync++;
@@ -742,9 +754,71 @@ static void method_shim(CPU *c) { method_call(c, rt_dyn_cur_arg); }
 // Reached straight from rt_dispatch's table, through the vtable slot's address in c->jt: no search for the import, no thread-local variable.
 void rt_ht_add(u32 addr, guest_fn fn);
 u32 rt_dyn_arg_at(u32 addr);
-static void method_entry(CPU *c, u8 *m) {
-    (void)m;
-    method_call(c, rt_dyn_arg_at(c->jt));
+// Most of the engine's calls set state that is already set: about 6.5 million a second on the Mac's route against 2 million that go to the queue
+// (ARKHAM_TRACE_D3DQ, 2026-11-08). method_call skips them, but only after its large frame and checks. Here the same answer comes first, with
+// method_call's own conditions for skipping and its own comparisons, but without changing anything: a call that finds a change, and every
+// other call, goes on to method_call, which decides again and keeps the new state.
+static inline int fast_allowed(CPU *c, const Method *m) {
+    if (rt_d3d_census_on > 0 || lvl.on != 0 || dtr.enabled != 0 || trace) return 0;
+    if (c == worker_cpu || m->kind == K_LOCAL) return 0;
+    if (metal_on) {
+        u32 from = G32(c->esp);
+        if (from >= layer_lo && from < layer_hi) return 0;
+        if (m->missing || (!m->host && !m->noted)) return 0;
+    }
+    return 1;
+}
+static inline int already_set(CPU *c, const Method *m) {
+    switch (m->shadowed) {
+        case SH_NONE:
+            break;
+        case SH_TEXTURE: {  // this, stage, texture
+            u32 stage = arg_of(c, 1);
+            u32 i = stage < 16 ? stage : stage >= 257 && stage <= 260 ? stage - 241 : TEX_STAGES;
+            return i < TEX_STAGES && shadow.texture_made[i] == made_now() && shadow.texture[i] == arg_of(c, 2);
+        }
+        case SH_STREAM: {  // this, stream, buffer, offset, stride
+            u32 n = arg_of(c, 1);
+            return n < STREAMS && shadow.stream_made[n] == made_now() && shadow.stream[n][0] == arg_of(c, 2) && shadow.stream[n][1] == arg_of(c, 3) &&
+                   shadow.stream[n][2] == arg_of(c, 4);
+        }
+        case SH_DECL:
+            return shadow.decl_made == made_now() && shadow.decl == arg_of(c, 1);
+        case SH_VS:
+            return shadow.vs_made == made_now() && shadow.vs == arg_of(c, 1);
+        case SH_PS:
+            return shadow.ps_made == made_now() && shadow.ps == arg_of(c, 1);
+        default:
+            return 0;  // the constants and the creations: method_call
+    }
+    switch (m->kind) {
+        case K_RENDER_STATE: {
+            u32 state = arg_of(c, 1);
+            return state < RENDER_STATES && shadow.render_set[state] && shadow.render[state] == arg_of(c, 2);
+        }
+        case K_SAMPLER_STATE: {
+            u32 sampler = arg_of(c, 1), type = arg_of(c, 2);
+            return sampler < SAMPLERS && type < SAMPLER_TYPES && shadow.sampler_set[sampler][type] && shadow.sampler[sampler][type] == arg_of(c, 3);
+        }
+        case K_STREAM_FREQ: {
+            u32 stream = arg_of(c, 1);
+            return stream < STREAMS && shadow.freq_set[stream] && shadow.freq[stream] == arg_of(c, 2);
+        }
+        case K_INDICES:
+            return shadow.indices_set && shadow.indices == arg_of(c, 1) && shadow.indices_made == made_now();
+    }
+    return 0;
+}
+static void method_entry(CPU *c, u8 *mem) {
+    (void)mem;
+    u32 index = rt_dyn_arg_at(c->jt);
+    const Method *m = &methods[index];
+    if (fast_allowed(c, m) && already_set(c, m)) {
+        c->eax = 0;
+        c->esp += 4;
+        return;
+    }
+    method_call(c, index);
     c->esp += 4;  // the return address, which the import path pops for other imports
 }
 static void method_call(CPU *c, u32 index) {
