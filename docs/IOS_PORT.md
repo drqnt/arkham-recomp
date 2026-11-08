@@ -601,7 +601,7 @@ app goes to the background.
   2.5 by default; `ARKHAM_TOUCH_AIM_LOOK`). The game itself slows the camera a lot while aiming, and the owner found aiming the batarang
   very slow.
 
-## v25: a second throw button, one-touch combo moves, the render thread's waits measured, 2026-11-08 (built, waiting to be installed)
+## v25: a second throw button, one-touch combo moves, the render thread's waits measured, 2026-11-08 (never installed alone: it's in v26)
 
 - While the touch L2 is held (a gadget aimed), a second throw button (R2, drawn as the batarang) shows on the left; the first stays. The owner
   keeps every button under the right thumb, so holding the aim left no finger for the throw.
@@ -612,3 +612,23 @@ app goes to the background.
   ends the crouch and releases a gadget, and a double tap fires the Batclaw.
 - The `[fps]` line has "waiting for the layer": how long the render thread waits on the Direct3D thread a frame, to tell its own work from
   waiting. Repeated state calls are answered before the queue's full handler (no change measurable on the Mac).
+
+## v26: the gadgets' wheel as the game's own: eight gadgets, each with its picture, 2026-11-08 (built, waiting to be installed; v25 is in it)
+
+- The wheel has the game's eight gadgets around the pad's cross where the game's own wheel has them: up the Batarang, up and right the Sonic
+  Batarang, right the Line Launcher, down and right the Cryptographic Sequencer, down the Batclaw (later the Ultra Batclaw, the same place),
+  down and left the Remote Control Batarang, left Explosive Gel, up and left several Batarangs at once. Sources: the owner's picture of the
+  game's wheel, StrategyWiki's controls page (https://strategywiki.org/wiki/Batman:_Arkham_Asylum/Controls), and the game's own list of
+  gadgets (Frontend.int, `[GadgetHelp]`: those eight, besides the Joker's in the challenge maps).
+- The four between the cross's arms are two of its sides at once, which the PlayStation pad gives the game as its cross's diagonals
+  (`read_touch` in shims_hid.m) and the Xbox pad as two buttons. The wheel's eight parts are 45 degrees each, its radius 3.4 times the button's
+  (112 points at least; it was 3 times and 96 with four).
+- Each gadget has its own picture in BatIcons.h (`g_*`), after the game's own: the batarang, it with sound to both sides, a line strung from wall
+  to wall with the launcher on it, a handheld with two prongs and a wave on its screen, a three-pronged claw on its cable, a batarang at the end of
+  a dotted flight, a spray can with a burst cut in it, three batarangs. The one under the thumb is lit in the game's orange, and its name, the
+  game's Russian one (Frontend.rus), shows above the wheel, or beside it where there's no room above.
+- The game's own wheel shows only the gadgets Batman has; this one shows all eight, and choosing one he hasn't got leaves the gadget as it was.
+- Checked on the Mac with the owner's save (a frozen copy): the cross reaches the game, whose wheel comes up with "Бэтаранг" lit. That save has
+  only the Batarang, so the diagonals aren't tried in the game yet: the first gadget on one (the sequencer, say) will show it.
+- A scripted run's `pad:57:<hat>` steps need `ARKHAM_FAKE_PAD_TYPE=ps`: the default pad is the Xbox one, which has no hat, and the steps did
+  nothing at all in the first try (a "[pad] scripted 1:57" line is logged either way).

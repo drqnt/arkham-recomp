@@ -358,6 +358,119 @@ static inline void bi_combo_ground(CGContextRef g) {
     CGContextFillPath(g);
 }
 
+// The gadgets, for the wheel's eight directions, as the game's own wheel lays them out (TouchControls.m). Each after the game's own picture of it.
+static inline void bi_bats(CGContextRef g, const CGFloat (*at)[3], int n) {
+    CGMutablePathRef p = CGPathCreateMutable();
+    for (int i = 0; i < n; i++) bat_path_add(p, at[i][0], at[i][1], at[i][2]);
+    CGContextAddPath(g, p);
+    CGPathRelease(p);
+    CGContextFillPath(g);
+}
+// Several Batarangs at once (up and left): three, one above two.
+static inline void bi_g_batarangs(CGContextRef g) {
+    static const CGFloat at[][3] = {{50, 32, 29}, {26, 70, 24}, {74, 70, 24}};
+    bi_bats(g, at, 3);
+}
+// The Sonic Batarang (up and right): a Batarang sending sound out to both sides.
+static inline void bi_g_sonic(CGContextRef g) {
+    static const CGFloat at[][3] = {{50, 52, 27}};
+    bi_bats(g, at, 1);
+    bi_round(g, 6);
+    for (int k = 0; k < 2; k++) {
+        CGFloat r = 34 + k * 12, a = 0.5 - k * 0.08;
+        CGContextAddArc(g, 50, 50, r, -a, a, 0);
+        CGContextStrokePath(g);
+        CGContextAddArc(g, 50, 50, r, (CGFloat)M_PI - a, (CGFloat)M_PI + a, 0);
+        CGContextStrokePath(g);
+    }
+}
+// The Line Launcher (right): a line strung from wall to wall, the launcher riding it with Batman's grip below.
+static inline void bi_g_line(CGContextRef g) {
+    bi_rrect(g, 2, 12, 10, 76, 3);
+    bi_rrect(g, 88, 12, 10, 76, 3);
+    bi_rrect(g, 32, 26, 36, 20, 7);
+    CGContextFillPath(g);
+    bi_line(g, 6, 10, 32, 90, 32);
+    bi_line(g, 9, 50, 44, 50, 70);
+    bi_line(g, 9, 36, 72, 64, 72);
+}
+// The Cryptographic Sequencer (down and right): a handheld with two prongs on top, a wave on its screen and a dial below.
+static inline void bi_g_sequencer(CGContextRef g) {
+    bi_line(g, 7, 38, 26, 31, 6);
+    bi_line(g, 7, 62, 26, 69, 6);
+    bi_rrect(g, 22, 22, 56, 74, 10);
+    CGContextFillPath(g);
+    bi_cut(g, 1);
+    bi_rrect(g, 30, 31, 40, 33, 5);
+    CGContextFillPath(g);
+    CGContextFillEllipseInRect(g, CGRectMake(41, 71, 18, 18));
+    bi_cut(g, 0);
+    bi_round(g, 4.5);
+    CGContextMoveToPoint(g, 34, 48);
+    CGContextAddCurveToPoint(g, 41, 30, 46, 30, 50, 47.5);
+    CGContextAddCurveToPoint(g, 54, 65, 59, 65, 66, 47);
+    CGContextStrokePath(g);
+    CGContextFillEllipseInRect(g, CGRectMake(46, 76, 8, 8));
+}
+// The Batclaw (down): a claw flying up and to the right on its cable, three prongs open, the outer two hooked in at their tips.
+static inline void bi_g_batclaw(CGContextRef g) {
+    CGContextSaveGState(g);
+    CGContextTranslateCTM(g, 50, 50);
+    CGContextRotateCTM(g, -0.55);
+    CGContextTranslateCTM(g, -50, -50);
+    CGContextFillEllipseInRect(g, CGRectMake(19, 37, 26, 26));
+    bi_round(g, 8);
+    CGContextMoveToPoint(g, 38, 43);
+    CGContextAddQuadCurveToPoint(g, 54, 12, 80, 18);
+    CGContextMoveToPoint(g, 38, 57);
+    CGContextAddQuadCurveToPoint(g, 54, 88, 80, 82);
+    CGContextMoveToPoint(g, 44, 50);
+    CGContextAddLineToPoint(g, 82, 50);
+    CGContextStrokePath(g);
+    bi_tri(g, 76, 11, 92, 22, 74, 33);  // the tips: the outer two hooked in towards the middle one, a point
+    bi_tri(g, 76, 89, 92, 78, 74, 67);
+    bi_tri(g, 78, 41, 97, 50, 78, 59);
+    CGContextFillPath(g);
+    bi_round(g, 5);
+    CGContextMoveToPoint(g, 22, 50);
+    CGContextAddCurveToPoint(g, 12, 38, 10, 70, 0, 60);
+    CGContextStrokePath(g);
+    CGContextRestoreGState(g);
+}
+// The Remote Control Batarang (down and left): a Batarang at the end of its winding, steered flight.
+static inline void bi_g_remote(CGContextRef g) {
+    static const CGFloat at[][3] = {{64, 30, 31}};
+    bi_bats(g, at, 1);
+    bi_round(g, 6.5);
+    CGFloat dots[] = {0.5, 12.5};
+    CGContextSetLineDash(g, 0, dots, 2);
+    CGContextMoveToPoint(g, 6, 94);
+    CGContextAddCurveToPoint(g, 44, 94, 8, 54, 44, 50);
+    CGContextStrokePath(g);
+    CGContextSetLineDash(g, 0, NULL, 0);
+}
+// Explosive Gel (left): a spray can, a burst cut out of it, the gel coming out of its nozzle to the left in drops.
+static inline void bi_g_gel(CGContextRef g) {
+    bi_rrect(g, 44, 34, 40, 62, 9);  // the can
+    bi_rrect(g, 54, 22, 20, 14, 3);  // its cap
+    bi_rrect(g, 40, 24, 18, 8, 3);   // the nozzle, out to the left
+    CGContextFillPath(g);
+    bi_cut(g, 1);
+    CGContextMoveToPoint(g, 64, 49);  // the burst: eight points round the can's middle
+    for (int i = 1; i <= 16; i++) {
+        CGFloat a = i * (CGFloat)M_PI / 8 - (CGFloat)M_PI_2, r = i % 2 ? 7 : 16;
+        CGContextAddLineToPoint(g, 64 + cos(a) * r, 65 + sin(a) * r);
+    }
+    CGContextClosePath(g);
+    CGContextFillPath(g);
+    bi_cut(g, 0);
+    CGContextFillEllipseInRect(g, CGRectMake(22, 21, 12, 12));
+    CGContextFillEllipseInRect(g, CGRectMake(8, 10, 10, 10));
+    CGContextFillEllipseInRect(g, CGRectMake(7, 32, 10, 10));
+    CGContextFillEllipseInRect(g, CGRectMake(0, 21, 7, 7));
+    CGContextFillEllipseInRect(g, CGRectMake(20, 44, 7, 7));
+}
+
 // Draws the icon for a button's ident into g, white, in a box of size x size with its top left at the origin and y down; 0 if there's none.
 static inline int bat_icon_draw(CGContextRef g, const char *ident, CGFloat size) {
     static const struct {
@@ -368,6 +481,8 @@ static inline int bat_icon_draw(CGContextRef g, const char *ident, CGFloat size)
         {"l1", bi_cowl},     {"l2", bi_reticle},   {"l3", bi_recenter},     {"map", bi_map},     {"pause", bi_pause}, {"photo", bi_hide}, {"close", bi_close},
         {"gadgets", bi_batarang}, {"findbat", bi_findbat}, {"twosticks", bi_twosticks}, {"combo_td", bi_combo_takedown},
         {"combo_throw", bi_combo_throw}, {"combo_ground", bi_combo_ground},
+        {"g_batarang", bi_batarang}, {"g_sonic", bi_g_sonic}, {"g_line", bi_g_line}, {"g_sequencer", bi_g_sequencer},
+        {"g_batclaw", bi_g_batclaw}, {"g_remote", bi_g_remote}, {"g_gel", bi_g_gel}, {"g_batarangs", bi_g_batarangs},
     };
     for (size_t i = 0; i < sizeof icons / sizeof icons[0]; i++) {
         if (strcmp(icons[i].ident, ident)) continue;

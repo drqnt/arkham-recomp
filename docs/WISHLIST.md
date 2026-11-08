@@ -14,7 +14,10 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
   missing in a third of its seconds.
 - **The inner screen upright both ways.** iOS refuses upside-down portrait on iPhone whatever the app allows, and on the foldable's inner screen
   that is one of the two upright ways (v19's log). Only the game turning itself could do it.
-- **The gadgets' button showing the gadget chosen** (the game's choice isn't known outside it yet).
+- **The gadgets' button showing the gadget chosen** (the game's choice isn't known outside it yet). The wheel itself has the game's eight
+  gadgets with their pictures since v26; it shows all eight, since which ones Batman has isn't known outside the game either.
+- **The diagonal gadgets on the phone:** the four between the cross's arms (sonic, sequencer, remote, several batarangs) are chosen by
+  two sides at once since v26, untried in the game: the owner's save has only the Batarang. To confirm at the first of them.
 - **Rumble, Mac and phone** (the owner confirmed it's wanted, 2026-11-08, for later). Nobody knows yet whether it works on the Mac: the
   haptics engine is retried there since 2026-11-07, never felt with a pad connected. Then the phone: Feral's code goes through IOHIDDevice and
   ForceFeedback, which has to become GameController haptics.
@@ -39,6 +42,8 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
 
 ## Done, by version (phone)
 
+- v26: the gadgets' wheel as the game's own: eight gadgets with their pictures and Russian names, the diagonals for the four between the
+  cross's arms. v25 in it: a second throw button on the left while aiming; one touch for the three two-button moves.
 - v24: the camera faster while aiming (L2), with its own setting.
 - v23: the processor work (game thread 20-50% faster on the phone).
 - v22: two sticks for the cryptographic sequencer (a button; the stick and a second floating stick as the pad's two).

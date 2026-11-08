@@ -2,7 +2,8 @@
 //
 // In play: a stick wherever the left thumb lands (pushed past its edge it also holds the run button), swipes on the right that turn the camera, and
 // the pad's buttons where the thumbs rest: the main four in an arc under the right thumb, detective mode and aiming above the left one, and the
-// gadgets as a wheel, which opens while held and chooses the side the thumb slides to (let go without sliding, it stays open for a tap on a side).
+// gadgets as a wheel of the game's own eight, which opens while held and chooses the one the thumb slides to (let go without sliding, it stays open
+// for a tap on one).
 // The buttons draw as a PlayStation pad, an Xbox pad, or as icons of what each does in the game (from its bindings in DefaultInput.ini). What they do
 // goes to the runtime as a pad of its own (rt_touch_pad in shims_hid.m), shown to the game as the pad drawn so that its prompts match. The camera is
 // that pad's right stick, since the game ignores the mouse while a pad moves: its push is the swipe's speed, so the camera turns by how far the thumb
@@ -49,7 +50,23 @@ CGRect rt_ios_game_rect(void);       // main.m: where the game's picture is
 enum { C_LT = 4, C_RT = 5, B_SOUTH = 7, B_EAST, B_WEST, B_NORTH, B_LB, B_RB, B_START, B_BACK, B_L3, B_R3, B_HOME, D_UP, D_DOWN, D_LEFT, D_RIGHT, C_WHEEL = 100, C_PHOTO, C_TWOSTICKS, C_COMBO_TD, C_COMBO_THROW, C_COMBO_GROUND };
 enum { STYLE_PS, STYLE_XBOX, STYLE_ICONS };
 enum { SH_NONE, SH_CROSS, SH_CIRCLE, SH_SQUARE, SH_TRIANGLE };
-enum { SIDE_UP, SIDE_RIGHT, SIDE_DOWN, SIDE_LEFT };
+// The game's gadgets around the pad's cross, clockwise from up, as its own wheel lays them out: the four between the cross's arms are chosen by two
+// of them at once, a diagonal. Their names are the game's Russian ones (Frontend.rus). The game's wheel shows only the gadgets Batman has; this one
+// shows all eight, and choosing one he hasn't got yet leaves the gadget as it was.
+#define N_GADGETS 8
+static const struct {
+    const char *icon, *name;
+    unsigned cross;  // the pad's cross pressed for it
+} gadgets[N_GADGETS] = {
+    {"g_batarang", "Бэтаранг", 1u << D_UP},
+    {"g_sonic", "Звуковой Бэтаранг", 1u << D_UP | 1u << D_RIGHT},
+    {"g_line", "Тросомет", 1u << D_RIGHT},
+    {"g_sequencer", "Секвенатор кода", 1u << D_DOWN | 1u << D_RIGHT},
+    {"g_batclaw", "Бэткоготь", 1u << D_DOWN},
+    {"g_remote", "Управляемый Бэтаранг", 1u << D_DOWN | 1u << D_LEFT},
+    {"g_gel", "Взрывчатый гель", 1u << D_LEFT},
+    {"g_batarangs", "Бэтаранги", 1u << D_UP | 1u << D_LEFT},
+};
 
 // What a point of swipe turns the camera, at speed 1: a swipe across the phone's 951 points turns it about 270 degrees.
 #define CAMERA_DEG_PER_POINT 0.284
@@ -109,7 +126,7 @@ static const Def defs[] = {
     {"l1", B_LB, {BL, 68, -262, 28}, {TL, 76, 55, 33}, "L1", "LB", "eye.fill", "Режим детектива", SH_NONE, 0xFFFFFF, 0xFFFFFF},
     {"l2", C_LT, {BL, 166, -276, 28}, {TL, 185, 55, 33}, "L2", "LT", "scope", "Прицел гаджета", SH_NONE, 0xFFFFFF, 0xFFFFFF},
     {"l3", B_L3, {BL, 60, -350, 20}, {TL, 60, 153, 26}, "L3", "LS", "camera.rotate.fill", "Камера за спину", SH_NONE, 0xFFFFFF, 0xFFFFFF},
-    // The gadgets: one button for the pad's cross, a wheel of its four sides. Drawn as a batarang.
+    // The gadgets: one button for the pad's cross, a wheel of the game's eight gadgets around it. Drawn as a batarang.
     {"gadgets", C_WHEEL, {TL, 124, 144, 30}, {BC, 0, -77, 37}, "", "", "batarang", "Гаджеты: зажмите и ведите в сторону", SH_NONE, 0xFFFFFF, 0xFFFFFF},
     // The top: the map and the pause, and, at the top left, hiding all of them for a picture.
     {"map", B_BACK, {TC, -64, 28, 20}, {TC, -70, 55, 24}, "", "", "map.fill", "Карта", SH_NONE, 0xFFFFFF, 0xFFFFFF},
@@ -303,8 +320,9 @@ static void open_settings(void);
     UISelectionFeedbackGenerator *tick;
     CADisplayLink *link;
     // the gadgets' wheel
-    CAShapeLayer *wheel_disc, *wheel_sides[4];
-    CALayer *wheel_icons[4];
+    CAShapeLayer *wheel_disc, *wheel_sides[N_GADGETS];
+    CALayer *wheel_icons[N_GADGETS];  // each a colour through its icon's shape
+    UILabel *wheel_label;             // the name of the one the thumb is on
     CGPoint wheel_center, wheel_origin;
     CGFloat wheel_R;
     int wheel_side;
@@ -376,20 +394,31 @@ static void open_settings(void);
     wheel_disc.zPosition = 10;
     wheel_disc.hidden = YES;
     [self.layer addSublayer:wheel_disc];
-    NSArray *chevrons = @[@"chevron.up", @"chevron.right", @"chevron.down", @"chevron.left"];
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < N_GADGETS; i++) {
         wheel_sides[i] = [CAShapeLayer layer];
         wheel_sides[i].zPosition = 11;
         wheel_sides[i].strokeColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
         wheel_sides[i].lineWidth = 1;
         wheel_icons[i] = [CALayer layer];
         wheel_icons[i].zPosition = 12;
-        wheel_icons[i].contentsGravity = kCAGravityResizeAspect;
-        wheel_icons[i].contents = (__bridge id)symbol(chevrons[i], 40, UIColor.whiteColor).CGImage;
+        CALayer *shape = [CALayer layer];
+        shape.contentsGravity = kCAGravityResizeAspect;
+        shape.contents = (__bridge id)bat_icon(gadgets[i].icon, 56).CGImage;
+        wheel_icons[i].mask = shape;
         wheel_sides[i].hidden = wheel_icons[i].hidden = YES;
         [self.layer addSublayer:wheel_sides[i]];
         [self.layer addSublayer:wheel_icons[i]];
     }
+    wheel_label = [UILabel new];
+    wheel_label.textColor = UIColor.whiteColor;
+    wheel_label.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+    wheel_label.textAlignment = NSTextAlignmentCenter;
+    wheel_label.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+    wheel_label.layer.cornerRadius = 8;
+    wheel_label.layer.masksToBounds = YES;
+    wheel_label.layer.zPosition = 13;
+    wheel_label.hidden = YES;
+    [self addSubview:wheel_label];
     wheel_side = -1;
     in_menu = YES;  // until play is seen: the films and loading at the start are outside it
     photo_hint = [UILabel new];
@@ -777,22 +806,44 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
     [CATransaction setDisableActions:YES];
     BOOL on = wheel_open;
     wheel_disc.hidden = !on;
-    for (int i = 0; i < 4; i++) wheel_sides[i].hidden = wheel_icons[i].hidden = !on;
+    for (int i = 0; i < N_GADGETS; i++) wheel_sides[i].hidden = wheel_icons[i].hidden = !on;
+    CGPoint c = wheel_center;
+    CGFloat R = wheel_R;
     if (on) {
-        CGPoint c = wheel_center;
-        CGFloat R = wheel_R, ri = R * 0.3;
+        CGFloat ri = R * 0.3, half = M_PI / N_GADGETS;
         wheel_disc.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.x - R, c.y - R, R * 2, R * 2)].CGPath;
-        for (int i = 0; i < 4; i++) {
-            CGFloat mid = (i - 1) * M_PI_2, a0 = mid - M_PI_4 + 0.06, a1 = mid + M_PI_4 - 0.06;  // up, right, down, left: -90, 0, 90, 180 degrees
+        for (int i = 0; i < N_GADGETS; i++) {
+            BOOL lit = i == wheel_side;  // in the game's own orange, as its wheel shows the one chosen
+            CGFloat mid = -M_PI_2 + i * 2 * half, a0 = mid - half + 0.04, a1 = mid + half - 0.04;  // clockwise from up
             UIBezierPath *w = [UIBezierPath bezierPath];
             [w addArcWithCenter:c radius:R - 5 startAngle:a0 endAngle:a1 clockwise:YES];
             [w addArcWithCenter:c radius:ri startAngle:a1 endAngle:a0 clockwise:NO];
             [w closePath];
             wheel_sides[i].path = w.CGPath;
-            wheel_sides[i].fillColor = (i == wheel_side ? rgb(0x7FB2E5, 0.8) : [UIColor colorWithWhite:0 alpha:0.55]).CGColor;
-            CGFloat at = (R + ri) / 2, size = R * 0.3;
+            wheel_sides[i].fillColor = (lit ? [UIColor colorWithWhite:1 alpha:0.2] : [UIColor colorWithWhite:0 alpha:0.55]).CGColor;
+            wheel_sides[i].strokeColor = (lit ? rgb(0xF5A000, 0.9) : [UIColor colorWithWhite:1 alpha:0.35]).CGColor;
+            wheel_sides[i].lineWidth = lit ? 2 : 1;
+            CGFloat at = (R + ri) / 2 + 2, size = R * 0.4;
             wheel_icons[i].frame = CGRectMake(c.x + cos(mid) * at - size / 2, c.y + sin(mid) * at - size / 2, size, size);
+            wheel_icons[i].mask.frame = wheel_icons[i].bounds;
+            wheel_icons[i].backgroundColor = (lit ? rgb(0xF5A000, 1) : UIColor.whiteColor).CGColor;
         }
+    }
+    // The name of the one the thumb is on: above the wheel, or beside it, or below it, wherever there's room first.
+    BOOL named = on && wheel_side >= 0;
+    wheel_label.hidden = !named;
+    if (named) {
+        wheel_label.text = @(gadgets[wheel_side].name);
+        CGSize t = [wheel_label sizeThatFits:CGSizeMake(400, 40)], S = self.bounds.size;
+        CGFloat w = ceil(t.width) + 20, h = ceil(t.height) + 10, gap = 10;
+        UIEdgeInsets safe = self.safeAreaInsets;
+        CGRect f;
+        if (c.y - R - gap - h >= safe.top + 4) f = CGRectMake(c.x - w / 2, c.y - R - gap - h, w, h);
+        else if (c.x + R + gap + w <= S.width - safe.right - 4) f = CGRectMake(c.x + R + gap, c.y - R, w, h);
+        else if (c.x - R - gap - w >= safe.left + 4) f = CGRectMake(c.x - R - gap - w, c.y - R, w, h);
+        else f = CGRectMake(c.x - w / 2, c.y + R + gap, w, h);
+        f.origin.x = MIN(MAX(f.origin.x, safe.left + 4), S.width - safe.right - w - 4);
+        wheel_label.frame = f;
     }
     [CATransaction commit];
 }
@@ -801,7 +852,7 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
     wheel_open = YES;
     wheel_origin = p;
     wheel_side = -1;
-    wheel_R = MAX(b.radius * 3.0, 96);
+    wheel_R = MAX(b.radius * 3.4, 112);  // eight gadgets want more room than the cross's four sides did
     CGFloat m = wheel_R + 6;
     wheel_center = CGPointMake(MIN(MAX(b.center.x, m), s.width - m), MIN(MAX(b.center.y, m), s.height - m));
     [self drawWheel];
@@ -811,12 +862,13 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
     wheel_side = -1;
     [self drawWheel];
 }
-// Which side a point is on from a centre: none near it, and, for a tap on the open wheel, none well outside it either.
+// Which gadget a point is on from a centre, by its direction (0 up, then clockwise): none near it, and, for a tap on the open wheel, none well
+// outside it either.
 - (int)sideAt:(CGPoint)p from:(CGPoint)c within:(BOOL)within {
     CGFloat dx = p.x - c.x, dy = p.y - c.y, d = hypot(dx, dy);
     if (d < MAX(wheel_R * 0.3, 18) || (within && d > wheel_R * 1.25)) return -1;
-    if (fabs(dx) > fabs(dy)) return dx > 0 ? SIDE_RIGHT : SIDE_LEFT;
-    return dy > 0 ? SIDE_DOWN : SIDE_UP;
+    long i = lround((atan2(dy, dx) + M_PI_2) / (2 * M_PI / N_GADGETS));
+    return (int)((i % N_GADGETS + N_GADGETS) % N_GADGETS);
 }
 - (void)wheelMovedTo:(CGPoint)p {
     int side = [self sideAt:p from:wheel_origin within:NO];
@@ -825,10 +877,10 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
     if (side >= 0) [tick selectionChanged];
     [self drawWheel];
 }
-// The pad's cross pressed on that side for a moment, as the game wants a press to select a gadget.
+// The pad's cross pressed for that gadget for a moment, as the game wants a press to select one: for the four between its arms, two of its sides
+// at once, which the PlayStation pad's cross gives the game as one of its diagonals (shims_hid.m).
 - (void)choose:(int)side {
-    static const int bits[] = {D_UP, D_RIGHT, D_DOWN, D_LEFT};
-    pulse_bits = 1u << bits[side];
+    pulse_bits = gadgets[side].cross;
     pulse_until = CACurrentMediaTime() + 0.12;
     [tap impactOccurred];
     [self send];

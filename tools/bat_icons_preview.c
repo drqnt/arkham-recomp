@@ -19,6 +19,8 @@ static const struct {
     {"gadgets", "Гаджеты", 0},     {"map", "Карта", 0},      {"pause", "Пауза", 0},         {"photo", "Скрыть кнопки", 0}, {"close", "Назад", 0},
     {"findbat", "Показать Бэтмена", 2}, {"twosticks", "Два стика", 0}, {"combo_td", "△+○ добивание", 0},
     {"combo_throw", "○+✕ бросок", 0}, {"combo_ground", "R2+△ лежачего", 0},
+    {"g_batarang", "↑ Бэтаранг", 0}, {"g_sonic", "↗ Звуковой", 0}, {"g_line", "→ Тросомет", 0}, {"g_sequencer", "↘ Секвенатор", 0},
+    {"g_batclaw", "↓ Бэткоготь", 0}, {"g_remote", "↙ Управляемый", 0}, {"g_gel", "← Гель", 0}, {"g_batarangs", "↖ Бэтаранги", 0},
 };
 #define N (sizeof buttons / sizeof buttons[0])
 #define COLS 5
