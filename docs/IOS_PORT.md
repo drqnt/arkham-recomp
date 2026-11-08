@@ -651,3 +651,10 @@ app goes to the background.
 - v26's log (started folded, 1016 x 696, no FPS limit): 173 frames a second made in play (the median), up to 230 and 300 to 400 in light places,
   112 to 120 shown; the GPU about 3 ms a frame, the busiest game thread 5 to 8 ms in heavier scenes. The owner calls the performance good and
   wants no more optimizing (2026-11-08).
+
+## v28: the app's folder in the Files app, 2026-11-08 (installed 16:30)
+
+- `UIFileSharingEnabled` and `LSSupportsOpeningDocumentsInPlace` in Info.plist: the app's Documents shows in Files (On My iPhone, "Batman
+  Arkham Asylum") and in the Mac's Finder. The owner asked to see Steam's stored answer on the phone.
+- In it: `Steam` (answer.txt, what the Mac's Steam answered; the saves), `Logs` (run.txt), `Shaders`, `Shots`, `arkham.env`, and
+  `Batman Arkham Asylum GOTY`, the game's own files (about 9 GB), which must stay where they are.

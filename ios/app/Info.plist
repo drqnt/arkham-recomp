@@ -5,5 +5,11 @@
 	<!-- Keys Xcode's generated Info.plist has no build setting for. Without this one an iPhone shows an app at 60 Hz at most. -->
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
+	<!-- The app's Documents folder in the Files app (On My iPhone) and in the Mac's Finder: Steam's stored answer (Steam/answer.txt), the
+	     logs (Logs/run.txt), the saves, and the game's own files, which must stay where they are. The owner asked for it, 2026-11-08. -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 </dict>
 </plist>
