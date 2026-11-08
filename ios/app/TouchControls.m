@@ -24,6 +24,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
 #include "BatIcons.h"
+#include "BatHalo.h"
 
 void rt_touch_pad(float lx, float ly, float rx, float ry, float lt, float rt, unsigned buttons);
 void rt_touch_mouse(double dx, double dy);  // shims_sys.c: the pointer's motion in pixels, which the game reads as its mouse's
@@ -33,9 +34,6 @@ void rt_touch_pad_playstation(int ps);
 int rt_controller_connected(void);
 int rt_game_holds_cursor(void);
 unsigned rt_frames_presented(void), rt_last_frame_draws(void);
-void rt_want_picture_luma(int on);
-double rt_picture_luma(double x0, double y0, double x1, double y1);  // mtl_device.m: how light a part of the picture is, 0 to 1
-void rt_request_snapshot(const char *name);                          // mtl_device.m: the next frame into Documents/Shots
 void rt_ios_click(double share_x, double share_y);
 void rt_ios_park_cursor(void);
 void rt_set_fps_cap(double n);
@@ -120,6 +118,8 @@ static const Def defs[] = {
 #define N_DEFS (sizeof defs / sizeof defs[0])
 // Outside play the only one: backs out of menus, closes the map, skips a cutscene. It stays at the top left, as the gear does at the right.
 static const Def close_def = {"close", B_EAST, {TL, 0, 0, 22}, {TL, 0, 0, 22}, "", "", "xmark", "Назад", SH_NONE, 0xFFFFFF, 0xFFFFFF};
+// On the map only: the game's "Show Batman", the pad's square there (its hints, 2026-11-08). At the bottom right, under the thumb.
+static const Def findbat_def = {"findbat", B_WEST, {BR, 0, 0, 30}, {BR, 0, 0, 30}, "", "X", "location.fill", "Показать Бэтмена", SH_SQUARE, 0xE48AD6, 0x3C8FE0};
 #undef BR
 #undef BL
 #undef BC
@@ -189,6 +189,23 @@ static UIImage *bat_icon(const char *ident, CGFloat w) {
     [made setObject:img forKey:key];
     return img;
 }
+// A soft dark ring around a button's icon, the icon's own shape left clear, pad points wider on each side. It lies under the white icon.
+// It lets the icon read over a light picture, and over a dark one it doesn't show.
+static UIImage *bat_icon_halo(const char *ident, CGFloat w, CGFloat pad) {
+    static NSCache *made;
+    if (!made) made = [NSCache new];
+    NSString *key = [NSString stringWithFormat:@"%s@%.1f/%.1f", ident, w, pad];
+    UIImage *img = [made objectForKey:key];
+    if (img) return img;
+    __block int drawn = 0;
+    CGFloat side = w + pad * 2;
+    img = [[[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side)] imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        drawn = bat_icon_halo_draw(ctx.CGContext, ident, w, pad);
+    }];
+    if (!drawn) return nil;
+    [made setObject:img forKey:key];
+    return img;
+}
 static UIImage *symbol(NSString *name, CGFloat size, UIColor *color) {
     UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:size weight:UIImageSymbolWeightSemibold];
     UIImage *img = [UIImage systemImageNamed:name withConfiguration:cfg];
@@ -201,19 +218,20 @@ static UIImage *symbol(NSString *name, CGFloat size, UIColor *color) {
 @property(nonatomic) CGPoint center;
 @property(nonatomic) CGFloat radius;
 @property(nonatomic, strong) CALayer *group;
-// The badge in the corner (the PlayStation symbol or name) sits in a layer of its own over the button. The button's transparency doesn't fade it as much.
+// The badge in the corner (the PlayStation symbol or name) sits in a layer of its own over the button, at the button's opacity.
 @property(nonatomic, strong) CALayer *badge_group;
 @property(nonatomic, strong) CAShapeLayer *badge_symbol;
 @property(nonatomic, strong) CAShapeLayer *back, *symbol, *badge;
 @property(nonatomic, strong) CATextLayer *text, *badge_text;
 @property(nonatomic, strong) CALayer *icon;
+@property(nonatomic, strong) CALayer *icon_halo;  // a soft dark ring under the icon (bat_icon_halo)
 @property(nonatomic) int holders;
 @property(nonatomic) BOOL shown;           // drawn and taking touches now
 @property(nonatomic) BOOL hiddenByPlayer;  // hidden in the layout editor
 @property(nonatomic, strong) CALayer *icon_mask;  // the icon's shape; the icon layer's own colour shows through it
 @property(nonatomic) int kind;                    // what's drawn: one of the KIND_ below
 @property(nonatomic) int tint;                    // the colour of a PlayStation symbol or an Xbox letter, or 0 for the button's ink
-@property(nonatomic) float ink, ink_shown;        // 0 light on a dark picture, 1 dark on a light one, and what it was last drawn with
+@property(nonatomic) float ink, ink_shown;        // 0, white lines; what it was last drawn with (ink_color can also draw dark lines, which nothing asks for now)
 @end
 enum { KIND_PS_SHAPE, KIND_TEXT, KIND_ICON, KIND_BAT };
 @implementation PadButton
@@ -231,6 +249,17 @@ static void open_settings(void);
 @implementation TouchControlsView {
     NSMutableArray<PadButton *> *buttons;
     PadButton *close_button;
+    PadButton *findbat_button;  // on the map only
+    // The map: opened with the map button in play, over when play comes back or the back button closes it.
+    // There a drag moves the map as far as the finger went, and two fingers zoom it.
+    BOOL map_open;
+    UITouch *pinch_touch;   // the second finger on the map
+    CGPoint pinch_point;    // where it is
+    CGFloat pinch_last;     // the two fingers' distance at the last display frame
+    double zoom_debt;       // the pinch's zoom still to make, as the logarithm of its scale: more than 0 in, less than 0 out
+    CGPoint pan_debt;       // how far the map has still to go to have followed the finger, in points
+    float zoom_lt, zoom_rt; // the triggers that zoom it this frame
+    CFTimeInterval map_opened_at;
     NSMapTable<UITouch *, id> *owners;
     NSMapTable<UITouch *, NSValue *> *tap_start;
     NSMapTable<UITouch *, NSNumber *> *tap_time;
@@ -285,7 +314,9 @@ static void open_settings(void);
         t.alignmentMode = kCAAlignmentCenter;
         t.contentsScale = UIScreen.mainScreen.scale;
     }
-    for (CALayer *l in @[b.back, b.symbol, b.text, b.icon]) [b.group addSublayer:l];
+    b.icon_halo = [CALayer layer];
+    b.icon_halo.contentsGravity = kCAGravityResizeAspect;
+    for (CALayer *l in @[b.back, b.symbol, b.text, b.icon_halo, b.icon]) [b.group addSublayer:l];
     [self.layer addSublayer:b.group];
     // The badge's symbol goes over its dark disc. It used to share the button's symbol layer, which lay under the disc, so only a trace of it showed through.
     b.badge_group = [CALayer layer];
@@ -307,6 +338,7 @@ static void open_settings(void);
     buttons = [NSMutableArray array];
     for (size_t i = 0; i < N_DEFS; i++) [buttons addObject:[self makeButton:&defs[i]]];
     close_button = [self makeButton:&close_def];
+    findbat_button = [self makeButton:&findbat_def];
     stick_base = [CAShapeLayer layer];
     stick_knob = [CAShapeLayer layer];
     for (CAShapeLayer *l in @[stick_base, stick_knob]) {
@@ -380,6 +412,11 @@ static void open_settings(void);
     if (b == close_button) {
         b.center = CGPointMake(MAX(in.left, 8) + 34, MAX(in.top, 8) + 28);
         b.radius = 22;
+        return;
+    }
+    if (b == findbat_button) {
+        b.radius = 30;
+        b.center = CGPointMake(vs.width - MAX(in.right, 8) - 48, vs.height - MAX(in.bottom, 8) - 44);
         return;
     }
     CGRect a = [self padArea];
@@ -460,8 +497,7 @@ static void open_settings(void);
     [super layoutSubviews];
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    for (PadButton *b in buttons) b.group.frame = b.badge_group.frame = self.bounds;
-    close_button.group.frame = close_button.badge_group.frame = self.bounds;
+    for (PadButton *b in [self allButtons]) b.group.frame = b.badge_group.frame = self.bounds;
     [CATransaction commit];
     if (!CGSizeEqualToSize(self.bounds.size, laid_out)) {
         laid_out = self.bounds.size;
@@ -473,9 +509,9 @@ static void open_settings(void);
 }
 
 // ---------- drawing ----------
-// Each button is drawn in two steps: its shape and what's on it (drawButton), and its colours (colorButton), which follow how light the game's
-// picture is under it: light lines on a dark picture, dark ones on a light picture, each button on its own and gliding from one to the other.
-// Over the black around the picture (upright, below it) they're light.
+// Each button is drawn in two steps: its shape and what's on it (drawButton), and its colours (colorButton).
+// It is white lines on a dark disc. A soft dark ring round the icon and a shadow round the disc let it read over a light picture too.
+// (v14 to v16 could also follow the picture, dark over light; the user found that unreadable on white and it is gone.)
 - (void)drawButton:(PadButton *)b style:(int)style {
     const Def *d = b.def;
     CGPoint c = b.center;
@@ -483,7 +519,13 @@ static void open_settings(void);
     b.back.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.x - r, c.y - r, r * 2, r * 2)].CGPath;
     b.back.lineWidth = self.editing && b == selected ? 3 : MAX(1.5, r * 0.05);
     b.back.lineDashPattern = self.editing ? @[@6, @4] : nil;
-    b.symbol.hidden = b.text.hidden = b.icon.hidden = b.badge.hidden = b.badge_symbol.hidden = b.badge_text.hidden = YES;
+    b.symbol.hidden = b.text.hidden = b.icon.hidden = b.icon_halo.hidden = b.badge.hidden = b.badge_symbol.hidden = b.badge_text.hidden = YES;
+    // A soft shadow round the disc, so that its rim shows over a light picture too.
+    b.back.shadowPath = b.back.path;
+    b.back.shadowColor = UIColor.blackColor.CGColor;
+    b.back.shadowOffset = CGSizeZero;
+    b.back.shadowRadius = MAX(2, r * 0.08);
+    b.back.shadowOpacity = 0.45;
     b.tint = 0;
     BOOL aiming = NO;
     for (PadButton *o in buttons)
@@ -524,6 +566,14 @@ static void open_settings(void);
             b.icon.frame = CGRectMake(c.x - w / 2, c.y - w / 2, w, w);
             b.icon_mask.frame = b.icon.bounds;
             b.icon_mask.contents = (__bridge id)img.CGImage;
+            CGFloat pad = MAX(3, w * 0.09);
+            UIImage *halo = bat_icon_halo(d->ident, w, pad);
+            if (halo) {
+                b.icon_halo.hidden = NO;
+                b.icon_halo.frame = CGRectMake(c.x - w / 2 - pad, c.y - w / 2 - pad, w + pad * 2, w + pad * 2);
+                b.icon_halo.contents = (__bridge id)halo.CGImage;
+                b.icon_halo.opacity = 0.75;
+            }
         }
         if (style == STYLE_ICONS && (d->shape != SH_NONE || *d->ps)) {
             // A dark disc with a light rim: the rim shows it on a dark picture, the disc on a light one.
@@ -560,21 +610,17 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
 - (CGFloat)opacityOf:(PadButton *)b {
     if (self.editing) return b.hiddenByPlayer ? 0.35 : 1;
     CGFloat o = setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.8);
-    if (b == close_button) o = MAX(0.7, o);
+    if (b == close_button || b == findbat_button) o = MAX(0.7, o);
     return b.holders > 0 ? MAX(o, 0.95) : o;
 }
-// The badge in the corner fades less than its button, so it still says which of the pad's buttons this is.
-- (CGFloat)badgeOpacityOf:(PadButton *)b {
-    CGFloat o = [self opacityOf:b];
-    return self.editing ? o : MAX(o, 0.9);
-}
+// The pad's buttons, then the two shown only outside play: back, and on the map, Show Batman.
+- (NSArray<PadButton *> *)allButtons { return [buttons arrayByAddingObjectsFromArray:@[close_button, findbat_button]]; }
 - (void)colorButton:(PadButton *)b {
     BOOL down = b.holders > 0;
     float ink = b.ink;
     BOOL lit = b.def->control == C_RT && b.kind == KIND_BAT;  // R2 while aiming: lit up, to show where to throw
     UIColor *fg = ink_color(ink, 1);
-    b.group.opacity = [self opacityOf:b];
-    b.badge_group.opacity = [self badgeOpacityOf:b];
+    b.group.opacity = b.badge_group.opacity = [self opacityOf:b];
     b.back.fillColor = (down ? ink_color(ink, 0.55) : ink_color(1 - ink, 0.5)).CGColor;
     b.back.strokeColor = (self.editing && b.hiddenByPlayer ? rgb(0xE86A6A, 0.95)
                           : lit                          ? rgb(0x7FB2E5, 1)
@@ -599,56 +645,22 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
     rt_touch_pad_playstation(style != STYLE_XBOX);
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    for (PadButton *b in [buttons arrayByAddingObject:close_button]) {
+    for (PadButton *b in [self allButtons]) {
         [self placeButton:b];
-        BOOL show = b == close_button ? in_menu && !self.editing && !photo : self.editing || (!in_menu && !photo && !b.hiddenByPlayer);
+        BOOL show = b == close_button     ? in_menu && !self.editing && !photo
+                    : b == findbat_button ? in_menu && map_open && !self.editing && !photo
+                                          : self.editing || (!in_menu && !photo && !b.hiddenByPlayer);
         b.shown = show;
         b.group.hidden = b.badge_group.hidden = !show;
         if (!show) {
             b.holders = 0;
             continue;
         }
-        b.group.opacity = [self opacityOf:b];
-        b.badge_group.opacity = [self badgeOpacityOf:b];
+        b.group.opacity = b.badge_group.opacity = [self opacityOf:b];
         [self drawButton:b style:style];
         [self colorButton:b];
     }
     [self colorStick];
-    [CATransaction commit];
-}
-// How light the picture is under a circle of the view: 0 off the picture, where the screen is black.
-- (float)lumaAt:(CGPoint)c radius:(CGFloat)r {
-    CGRect g = rt_ios_game_rect();
-    if (g.size.width < 1 || !CGRectContainsPoint(g, c)) return 0;
-    double l = rt_picture_luma((c.x - r - g.origin.x) / g.size.width, (c.y - r - g.origin.y) / g.size.height, (c.x + r - g.origin.x) / g.size.width,
-                               (c.y + r - g.origin.y) / g.size.height);
-    return l < 0 ? 0 : (float)l;
-}
-// Whether the buttons follow the picture under them (dark lines over a light picture) or stay white on their dark discs, the default.
-static BOOL ink_follows_picture(void) { return setting(@"buttonColour", "ARKHAM_TOUCH_ADAPTIVE", 0) > 0; }
-static float ink_for(float luma) {
-    float t = (luma - 0.42f) / 0.2f;  // light enough to need dark lines from about the middle grey
-    t = t < 0 ? 0 : t > 1 ? 1 : t;
-    return t * t * (3 - 2 * t);
-}
-// Each frame: every button's colour a little further towards what the picture under it wants, over about a quarter of a second.
-- (void)followPicture:(CFTimeInterval)dt {
-    float k = (float)MIN(1.0, dt * 4.5);
-    BOOL follow = ink_follows_picture();
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    for (PadButton *b in [buttons arrayByAddingObject:close_button]) {
-        if (!b.shown) continue;
-        float want = follow ? ink_for([self lumaAt:b.center radius:b.radius]) : 0;
-        b.ink += (want - b.ink) * k;
-        if (fabsf(b.ink - b.ink_shown) > 0.015f) [self colorButton:b];
-    }
-    if (!stick_base.hidden) {
-        float want = follow ? ink_for([self lumaAt:stick_center radius:[self stickRadius]]) : 0;
-        float was = stick_ink;
-        stick_ink += (want - stick_ink) * k;
-        if (fabsf(stick_ink - was) > 0.001f) [self colorStick];
-    }
     [CATransaction commit];
 }
 - (void)colorStick {
@@ -663,7 +675,7 @@ static float ink_for(float luma) {
 - (PadButton *)buttonAt:(CGPoint)p {
     PadButton *best = nil;
     CGFloat best_d = 1e9;
-    for (PadButton *b in [buttons arrayByAddingObject:close_button]) {
+    for (PadButton *b in [self allButtons]) {
         if (!b.shown) continue;
         CGFloat d = hypot(p.x - b.center.x, p.y - b.center.y);
         if (d < b.radius * 1.25 && d < best_d) {  // a little beyond what's drawn: thumbs are wide
@@ -677,7 +689,7 @@ static float ink_for(float luma) {
 - (void)send {
     unsigned bits = 0;
     float lt = 0, rt = 0;
-    for (PadButton *b in [buttons arrayByAddingObject:close_button]) {
+    for (PadButton *b in [self allButtons]) {
         if (!b.holders) continue;
         int k = b.def->control;
         if (k == C_LT) lt = 1;
@@ -686,6 +698,10 @@ static float ink_for(float luma) {
     }
     if (running) bits |= 1u << B_SOUTH;
     if (pulse_bits && CACurrentMediaTime() < pulse_until) bits |= pulse_bits;
+    if (in_menu && map_open) {
+        lt = MAX(lt, zoom_lt);  // a pinch on the map: R2 zooms in, L2 out
+        rt = MAX(rt, zoom_rt);
+    }
     rt_touch_pad(lx, ly, rx, ry, lt, rt, bits);
     rt_touch_move(lx, ly, !in_menu);  // in play walking goes straight to the engine (shims_sys.c); in menus the stick pans, through the pad
 }
@@ -697,7 +713,6 @@ static float ink_for(float luma) {
     CGFloat R = [self stickRadius], kr = R * 0.42;
     stick_base.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.x - R, c.y - R, R * 2, R * 2)].CGPath;
     stick_knob.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(k.x - kr, k.y - kr, kr * 2, kr * 2)].CGPath;
-    if (stick_base.hidden) stick_ink = ink_follows_picture() ? ink_for([self lumaAt:c radius:R]) : 0;
     stick_base.hidden = stick_knob.hidden = photo;
     [self colorStick];
     [CATransaction commit];
@@ -780,15 +795,21 @@ static float ink_for(float luma) {
         play_frame = frames;
     }
     BOOL menu = !seen_play || (frames - play_frame >= 20 && now - last_play > 0.3);
+    // The map button pressed, and no map after all ("MAP NOT AVAILABLE" in some places): the next menu isn't the map.
+    if (map_open && !in_menu && !menu && now - map_opened_at > 1.5) map_open = NO;
     if (menu == in_menu) return;
     [self releaseAll];
     in_menu = menu;
     if (menu) {
         rt_ios_park_cursor();
         [self setPhoto:NO];
+    } else {
+        map_open = NO;
     }
     [self restyle];
-    fprintf(stderr, "[touch] %s\n", menu ? "outside play: the back button only; taps click, drags are the left stick" : "in play: the pad is back");
+    fprintf(stderr, "[touch] %s\n", !menu ? "in play: the pad is back"
+                                    : map_open ? "on the map: a drag moves it as far as the finger, two fingers zoom, the corner button shows Batman"
+                                               : "outside play: the back button only; taps click, drags are the left stick");
 }
 // Hiding everything for a picture: the buttons, the gear and the frame rate line. The stick and the camera go on working, unseen; a tap brings them back.
 static UIView *gear_view;
@@ -808,6 +829,46 @@ static UIView *gear_view;
     [self restyle];
     fprintf(stderr, "[touch] %s\n", on ? "photo mode: everything hidden" : "photo mode over");
 }
+// The map, each display frame. Measured on the Mac (2026-11-08):
+// - The pad's left stick moves the map's view: full right moves it right, so the map itself goes left. At full tilt that is about a third of
+//   the picture's width a second at the map's first zoom, and twice that zoomed in. Half tilt is about two thirds as fast.
+// - L2 zooms out by 0.62 in a quarter of a second at full pull; R2 zooms in, and "Show Batman" (square) leaves it zoomed in all the way.
+// A drag adds how far the finger went to what the map has still to do, and the stick is tilted to do that within about a tenth of a second:
+// a quick swipe ends where the finger did, a moment later. A pinch does the same with the zoom, pulling a trigger all the way while there is
+// some left to do, since the interface may take the triggers as keys.
+#define MAP_PAN 0.45   // of the picture's width a second, at full tilt
+#define MAP_TAU 0.12   // seconds to catch up with the finger
+#define MAP_MIN 0.3    // the least tilt that moves it
+#define MAP_ZOOM 1.9   // the logarithm of the zoom a second, at full pull
+- (void)mapFrame:(CFTimeInterval)dt {
+    CGFloat width = MAX(100, rt_ios_game_rect().size.width), v = MAP_PAN * width;  // points a second at full tilt
+    if (pinch_touch && pan_touch) {
+        CGFloat d = hypot(pinch_point.x - pan_last.x, pinch_point.y - pan_last.y);
+        if (pinch_last > 10 && d > 10) zoom_debt += log(d / pinch_last);
+        pinch_last = d;
+    } else if (pan_touch && panning) {
+        pan_debt.x = MAX(-width * 1.5, MIN(width * 1.5, pan_debt.x + pan_sum.x));
+        pan_debt.y = MAX(-width * 1.5, MIN(width * 1.5, pan_debt.y + pan_sum.y));
+    }
+    pan_sum = CGPointZero;
+    // The view goes against the finger, so that the map goes with it. Up is positive on the stick and down on the screen.
+    double sx = -pan_debt.x / (v * MAP_TAU), sy = pan_debt.y / (v * MAP_TAU), m = hypot(sx, sy);
+    if (m > 1) sx /= m, sy /= m, m = 1;
+    if (hypot(pan_debt.x, pan_debt.y) < 3) sx = sy = m = 0;
+    else if (m < MAP_MIN) sx *= MAP_MIN / m, sy *= MAP_MIN / m;
+    lx = (float)sx;
+    ly = (float)sy;
+    pan_debt.x += sx * v * dt;  // what the tilt moves this frame comes off what's left: the map goes -sx * v sideways and +sy * v down
+    pan_debt.y -= sy * v * dt;
+    // The zoom: a trigger all the way while there's more than a little left to do.
+    zoom_lt = zoom_rt = 0;
+    if (fabs(zoom_debt) > 0.03) {
+        if (zoom_debt > 0) zoom_rt = 1;
+        else zoom_lt = 1;
+        double step = MAP_ZOOM * dt;
+        zoom_debt = zoom_debt > 0 ? MAX(0, zoom_debt - step) : MIN(0, zoom_debt + step);
+    }
+}
 // Each display frame: whether the game is in play, the buttons' colours, the map's drag outside play, the wheel's pulse. The camera isn't here: the
 // thumb's turning goes to the runtime as it moves (touchesMoved), which hands the game exactly each frame's share (shims_hid.m).
 - (void)frame:(CADisplayLink *)l {
@@ -815,11 +876,11 @@ static UIView *gear_view;
     last_frame = now;
     if (dt <= 0 || dt > 0.1) dt = 1.0 / 60;
     [self updatePlay:now];
-    rt_want_picture_luma(!self.hidden && !photo && ink_follows_picture());  // the picture's lightness is read back only for buttons that follow it
-    [self followPicture:dt];
     rx = ry = 0;
-    // Outside play a drag is the left stick, the other way from the finger: the map goes with it, as on a phone's map.
-    if (in_menu) {
+    if (in_menu && map_open) {
+        [self mapFrame:dt];
+    } else if (in_menu) {
+        // Elsewhere outside play a drag is the left stick, the other way from the finger, at a tilt from its speed.
         float px = 0, py = 0;
         if (pan_touch && panning) {
             double vx = pan_sum.x / dt, vy = pan_sum.y / dt, v = hypot(vx, vy);
@@ -884,6 +945,13 @@ static UIView *gear_view;
             continue;
         }
         if (b) {
+            if (b.def->control == B_BACK && !in_menu) {  // the map button in play: what comes next is the map
+                map_open = YES;
+                map_opened_at = CACurrentMediaTime();
+                pan_debt = CGPointZero;
+                zoom_debt = 0;
+            }
+            if (b == close_button && map_open) map_open = NO;  // the back button closes the map
             [owners setObject:b forKey:t];
             b.holders++;
             [self restyle];
@@ -899,6 +967,15 @@ static UIView *gear_view;
                 pan_sum = CGPointZero;
                 panning = NO;
                 [owners setObject:@"pan" forKey:t];
+            } else if (map_open && !pinch_touch) {
+                // A second finger on the map: the two zoom it, and neither is a tap.
+                pinch_touch = t;
+                pinch_point = p;
+                pinch_last = hypot(p.x - pan_last.x, p.y - pan_last.y);
+                pan_debt = CGPointZero;
+                [tap_start removeObjectForKey:t];
+                [tap_start removeObjectForKey:pan_touch];
+                [owners setObject:@"pinch" forKey:t];
             }
             continue;
         }
@@ -934,8 +1011,11 @@ static UIView *gear_view;
                 pan_sum.y += q.y - pan_last.y;
                 pan_last = q;
             }
-            CGPoint s0 = [tap_start objectForKey:t].CGPointValue;
-            if (!panning && hypot(p.x - s0.x, p.y - s0.y) > 14) panning = YES;
+            NSValue *start = [tap_start objectForKey:t];
+            CGPoint s0 = start.CGPointValue;
+            if (!panning && (!start || hypot(p.x - s0.x, p.y - s0.y) > 14)) panning = YES;
+        } else if (t == pinch_touch) {
+            pinch_point = p;
         } else if (t == stick_touch) {
             CGFloat R = [self stickRadius], dx = p.x - stick_center.x, dy = p.y - stick_center.y, d = hypot(dx, dy);
             BOOL run = setting(@"autoRun", "ARKHAM_TOUCH_RUN", 1) > 0 && d > R * 1.45;
@@ -1004,7 +1084,19 @@ static UIView *gear_view;
         }
         [tap_start removeObjectForKey:t];
         [tap_time removeObjectForKey:t];
-        if (t == pan_touch) {
+        if (t == pinch_touch) {
+            pinch_touch = nil;
+            pinch_last = 0;
+            pan_sum = CGPointZero;  // the finger left on the map goes on as a drag from here
+        } else if (t == pan_touch && pinch_touch) {
+            pan_touch = pinch_touch;  // the other finger of a pinch carries on as the drag
+            pan_last = pinch_point;
+            pan_sum = CGPointZero;
+            panning = YES;
+            pinch_touch = nil;
+            pinch_last = 0;
+            [owners setObject:@"pan" forKey:pan_touch];
+        } else if (t == pan_touch) {
             pan_touch = nil;
             panning = NO;
             pan_sum = CGPointZero;
@@ -1024,14 +1116,16 @@ static UIView *gear_view;
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self lift:touches tapped:NO]; }
 
 - (void)releaseAll {
-    for (PadButton *b in buttons) b.holders = 0;
-    close_button.holders = 0;
+    for (PadButton *b in [self allButtons]) b.holders = 0;
     [owners removeAllObjects];
     [tap_start removeAllObjects];
     [tap_time removeAllObjects];
-    stick_touch = look_touch = pan_touch = wheel_touch = nil;
+    stick_touch = look_touch = pan_touch = wheel_touch = pinch_touch = nil;
     lx = ly = rx = ry = 0;
-    pan_sum = CGPointZero;
+    pan_sum = pan_debt = CGPointZero;
+    pinch_last = 0;
+    zoom_debt = 0;
+    zoom_lt = zoom_rt = 0;
     running = panning = NO;
     pulse_bits = 0;
     stick_base.hidden = stick_knob.hidden = YES;
@@ -1161,7 +1255,7 @@ static UIView *gear_view;
 }
 - (void)editTouchBegan:(CGPoint)p {
     PadButton *b = [self buttonAt:p];
-    if (!b || b == close_button) return;
+    if (!b || b == close_button || b == findbat_button) return;
     dragged = b;
     drag_offset = CGPointMake(b.center.x - p.x, b.center.y - p.y);
     [self select:b];
@@ -1279,9 +1373,8 @@ static UIView *gear_view;
     [self toggle:@"Строка FPS и нагрева" on:setting(@"showFPS", "ARKHAM_FPS", 1) > 0 action:@selector(fpsLineChanged:)];
     [self toggle:@"Metal HUD (со следующего запуска)" on:setting(@"metalHUD", "ARKHAM_METAL_HUD", 0) > 0 action:@selector(hudChanged:)];
 
-    [self section:@"Кнопки" footer:@"Цвет: белые — на тёмной подложке, видны на любой картинке; под картинку — светлеют над тёмной картинкой и темнеют над светлой. Глаз в углу прячет все кнопки для скриншота; вернуть — коснуться экрана."];
+    [self section:@"Кнопки" footer:@"Глаз в углу прячет все кнопки для скриншота; вернуть — коснуться экрана."];
     [self choice:@"Вид" items:@[@"PlayStation", @"Xbox", @"Иконки"] value:(NSInteger)setting(@"buttonStyle", "ARKHAM_TOUCH_STYLE", STYLE_PS) action:@selector(styleChanged:)];
-    [self choice:@"Цвет" items:@[@"Белые", @"Под картинку"] value:ink_follows_picture() ? 1 : 0 action:@selector(colourChanged:)];
     size_value = [self slider:@"Размер" min:0.7 max:1.5 value:setting(@"buttonScale", "ARKHAM_TOUCH_SIZE", 1.0) action:@selector(sizeChanged:)];
     // Shown as transparency, as its name says; kept as the opacity, from 20% to all of it.
     opacity_value = [self slider:@"Прозрачность кнопок" min:0 max:0.8 value:1 - setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.8) action:@selector(opacityChanged:)];
@@ -1319,10 +1412,6 @@ static UIView *gear_view;
 }
 - (void)styleChanged:(UISegmentedControl *)s {
     set_setting(@"buttonStyle", s.selectedSegmentIndex);
-    [controls restyle];
-}
-- (void)colourChanged:(UISegmentedControl *)s {
-    set_setting(@"buttonColour", s.selectedSegmentIndex);
     [controls restyle];
 }
 - (void)sizeChanged:(UISlider *)s {

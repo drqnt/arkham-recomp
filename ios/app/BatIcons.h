@@ -76,28 +76,49 @@ static inline void bi_run(CGContextRef g) {
     }
     CGContextFillPath(g);
 }
-// Square: strike, the silent takedown. A clenched fist from the front, four knuckles over the hand, the thumb folded across.
+// Square: strike, the silent takedown. A clenched fist raised, from the palm's side: four curled fingers, the thumb across them, the wrist in
+// the glove's cuff.
 static inline void bi_fist(CGContextRef g) {
-    bi_rrect(g, 16, 30, 68, 60, 14);
+    static const CGFloat f[4][3] = {{20, 17, 17}, {37, 11, 18}, {55, 14, 17}, {72, 23, 14}};  // each finger's left, top, width; the middle one highest
+    for (int i = 0; i < 4; i++) bi_rrect(g, f[i][0], f[i][1], f[i][2], 60 - f[i][1], 6.5);
+    CGContextMoveToPoint(g, 20, 40);  // the palm, the thumb's root bulging out at the left, down into the wrist
+    CGContextAddLineToPoint(g, 86, 40);
+    CGContextAddLineToPoint(g, 86, 62);
+    CGContextAddCurveToPoint(g, 86, 72, 79, 77, 72, 79);
+    CGContextAddLineToPoint(g, 72, 98);
+    CGContextAddLineToPoint(g, 31, 98);
+    CGContextAddLineToPoint(g, 31, 80);
+    CGContextAddCurveToPoint(g, 19, 76, 12, 66, 13, 52);
+    CGContextAddLineToPoint(g, 13, 46);
+    CGContextClosePath(g);
     CGContextFillPath(g);
-    for (int i = 0; i < 4; i++) CGContextFillEllipseInRect(g, CGRectMake(16 + i * 17, 16, 17, 26));
     bi_cut(g, 1);
-    for (int i = 1; i < 4; i++) bi_line(g, 4, 16 + i * 17, 22, 16 + i * 17, 46);  // between the fingers
-    bi_rrect(g, 10, 50, 56, 22, 11);                                                    // the thumb's outline
-    CGContextSetLineWidth(g, 5);
+    for (int i = 1; i < 4; i++) bi_line(g, 4.5, f[i][0], f[i][1] + 8, f[i][0], i < 3 ? 41 : 54);  // between the fingers, down to the thumb
+    bi_round(g, 4.5);  // the thumb's top, in from the hand's edge, and round its tip
+    CGContextMoveToPoint(g, 10, 41);
+    CGContextAddLineToPoint(g, 52, 41);
+    CGContextAddCurveToPoint(g, 59, 41, 62, 45, 62, 50);
+    CGContextAddCurveToPoint(g, 62, 55, 58, 59, 52, 59);
+    CGContextAddLineToPoint(g, 47, 59);
     CGContextStrokePath(g);
+    bi_line(g, 4.5, 26, 86, 78, 86);  // the cuff
     bi_cut(g, 0);
 }
-// Triangle: counter. A lightning bolt, as the game marks the man about to hit.
-static inline void bi_bolt(CGContextRef g) {
-    CGContextMoveToPoint(g, 58, 2);
-    CGContextAddLineToPoint(g, 18, 56);
-    CGContextAddLineToPoint(g, 45, 56);
-    CGContextAddLineToPoint(g, 34, 98);
-    CGContextAddLineToPoint(g, 84, 38);
-    CGContextAddLineToPoint(g, 56, 38);
-    CGContextAddLineToPoint(g, 74, 2);
+// Triangle: counter. A shield, and the blow that comes at it sent straight back.
+static inline void bi_shield(CGContextRef g) {
+    CGContextMoveToPoint(g, 2, 6);  // the shield: its top dipping a little to the middle, the sides straight, then in to the point
+    CGContextAddQuadCurveToPoint(g, 27, 14.8, 52, 6);
+    CGContextAddLineToPoint(g, 52, 43);
+    CGContextAddCurveToPoint(g, 52, 69.4, 38, 85.2, 27, 94);
+    CGContextAddCurveToPoint(g, 16, 85.2, 2, 69.4, 2, 43);
     CGContextClosePath(g);
+    CGContextFillPath(g);
+    bi_round(g, 13);  // the blow: in from the bottom right to the shield's face, and back out, up and to the right
+    CGContextMoveToPoint(g, 90, 82);
+    CGContextAddLineToPoint(g, 64, 56);
+    CGContextAddLineToPoint(g, 79, 36);
+    CGContextStrokePath(g);
+    bi_tri(g, 94, 16, 92.6, 46.2, 65.4, 25.8);  // its head, along the way out
     CGContextFillPath(g);
 }
 // Circle: the cape's stun, back out. Batman from behind, the cape spread, its hem scalloped like the bat's wings.
@@ -266,6 +287,23 @@ static inline void bi_batarang(CGContextRef g) {
     CGPathRelease(p);
     CGContextFillPath(g);
 }
+// The map's "Show Batman": the bat in a target's ring, with its four ticks.
+static inline void bi_findbat(CGContextRef g) {
+    bi_round(g, 7);
+    CGContextStrokeEllipseInRect(g, CGRectMake(14, 14, 72, 72));
+    CGContextSetLineCap(g, kCGLineCapButt);
+    for (int i = 0; i < 4; i++) {
+        CGFloat a = i * (CGFloat)M_PI_2, dx = cos(a), dy = sin(a);
+        CGContextMoveToPoint(g, 50 + dx * 50, 50 + dy * 50);
+        CGContextAddLineToPoint(g, 50 + dx * 38, 50 + dy * 38);
+    }
+    CGContextStrokePath(g);
+    CGMutablePathRef p = CGPathCreateMutable();
+    bat_path_add(p, 50, 52, 27);
+    CGContextAddPath(g, p);
+    CGPathRelease(p);
+    CGContextFillPath(g);
+}
 
 
 
@@ -275,9 +313,9 @@ static inline int bat_icon_draw(CGContextRef g, const char *ident, CGFloat size)
         const char *ident;
         void (*draw)(CGContextRef);
     } icons[] = {
-        {"cross", bi_run},   {"square", bi_fist},  {"triangle", bi_bolt}, {"circle", bi_cape}, {"r1", bi_grapple},  {"r2", bi_crouch},  {"r3", bi_zoom},
-        {"l1", bi_cowl},     {"l2", bi_reticle},   {"l3", bi_recenter},   {"map", bi_map},     {"pause", bi_pause}, {"photo", bi_hide}, {"close", bi_close},
-        {"gadgets", bi_batarang},
+        {"cross", bi_run},   {"square", bi_fist},  {"triangle", bi_shield}, {"circle", bi_cape}, {"r1", bi_grapple},  {"r2", bi_crouch},  {"r3", bi_zoom},
+        {"l1", bi_cowl},     {"l2", bi_reticle},   {"l3", bi_recenter},     {"map", bi_map},     {"pause", bi_pause}, {"photo", bi_hide}, {"close", bi_close},
+        {"gadgets", bi_batarang}, {"findbat", bi_findbat},
     };
     for (size_t i = 0; i < sizeof icons / sizeof icons[0]; i++) {
         if (strcmp(icons[i].ident, ident)) continue;

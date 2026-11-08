@@ -1,8 +1,10 @@
 // Draws the touch controls' icons (ios/app/BatIcons.h) into a picture, as the app draws its buttons, to look at them on the Mac before they go on a
-// phone: white on their dark discs, as by default, and following the picture, as the settings' "Цвет" has them; big and at the small buttons' size.
+// phone: white on their dark discs with the soft dark ring under each icon (BatHalo.h) and the disc's shadow, over a dark, a light and a grey
+// picture, big and at the small buttons' size.
 // clang -O1 tools/bat_icons_preview.c -framework CoreGraphics -framework ImageIO -framework CoreText -framework CoreFoundation -o /tmp/bat_icons_preview
 // /tmp/bat_icons_preview out.png [bands]
 #include "../ios/app/BatIcons.h"
+#include "../ios/app/BatHalo.h"
 #include <CoreText/CoreText.h>
 #include <ImageIO/ImageIO.h>
 #include <stdio.h>
@@ -15,6 +17,7 @@ static const struct {
     {"cross", "Бег, действие", 1}, {"square", "Удар", 2},    {"triangle", "Контратака", 3}, {"circle", "Плащ", 4},   {"r1", "Крюк", 0},
     {"r2", "Присесть", 0},         {"r3", "Зум", 0},         {"l1", "Детектив", 0},        {"l2", "Прицел", 0},     {"l3", "Камера за спину", 0},
     {"gadgets", "Гаджеты", 0},     {"map", "Карта", 0},      {"pause", "Пауза", 0},         {"photo", "Скрыть кнопки", 0}, {"close", "Назад", 0},
+    {"findbat", "Показать Бэтмена", 2},
 };
 #define N (sizeof buttons / sizeof buttons[0])
 #define COLS 5
@@ -52,25 +55,47 @@ static void text(CGContextRef g, const char *s, CGFloat x, CGFloat y, CGFloat si
     CGContextRestoreGState(g);
     CFRelease(line), CFRelease(as), CFRelease(attrs), CGColorRelease(color), CFRelease(font), CFRelease(str);
 }
-// One button as drawTouch draws it: the disc, its ring, the icon over it, and the PlayStation symbol in a dark badge at its corner.
-static void button(CGContextRef g, int i, CGFloat cx, CGFloat cy, CGFloat r, float ink) {
-    CGFloat fg = 1 - ink;
-    CGContextSetGrayFillColor(g, ink, 0.5);
+// The soft dark ring under an icon, as the app makes it: w + pad * 2 across.
+static CGImageRef halo_image(const char *ident, int w, int pad) {
+    int px = w + pad * 2;
+    CGContextRef g = bitmap(px, px);
+    CGContextTranslateCTM(g, 0, px);
+    CGContextScaleCTM(g, 1, -1);
+    bat_icon_halo_draw(g, ident, w, pad);
+    CGImageRef img = CGBitmapContextCreateImage(g);
+    CGContextRelease(g);
+    return img;
+}
+// A mask image put down in the y down picture in a grey: it is y up in its own bitmap, so it's flipped back.
+static void put_mask(CGContextRef g, CGImageRef img, CGRect box, CGFloat grey, CGFloat alpha) {
+    CGContextSaveGState(g);
+    CGContextTranslateCTM(g, 0, box.origin.y * 2 + box.size.height);
+    CGContextScaleCTM(g, 1, -1);
+    CGContextClipToMask(g, box, img);
+    CGContextSetGrayFillColor(g, grey, alpha);
+    CGContextFillRect(g, box);
+    CGContextRestoreGState(g);
+}
+// One button as TouchControls.m draws it: the disc with its shadow and ring, the dark ring under the icon, the icon, and the PlayStation symbol
+// in a dark badge at its corner.
+static void button(CGContextRef g, int i, CGFloat cx, CGFloat cy, CGFloat r) {
+    CGContextSaveGState(g);
+    CGColorRef shadow = CGColorCreateGenericGray(0, 0.45);
+    CGContextSetShadowWithColor(g, CGSizeZero, fmax(2, r * 0.08), shadow);
+    CGColorRelease(shadow);
+    CGContextSetGrayFillColor(g, 0, 0.5);
     CGContextFillEllipseInRect(g, CGRectMake(cx - r, cy - r, r * 2, r * 2));
-    CGContextSetGrayStrokeColor(g, fg, 0.9);
+    CGContextRestoreGState(g);
+    CGContextSetGrayStrokeColor(g, 1, 0.9);
     CGContextSetLineWidth(g, fmax(1.5, r * 0.05));
     CGContextStrokeEllipseInRect(g, CGRectMake(cx - r, cy - r, r * 2, r * 2));
     CGFloat w = !strcmp(buttons[i].ident, "gadgets") ? r * 1.32 : r * 1.15;
-    CGImageRef img = icon_image(buttons[i].ident, (int)ceil(w));
-    CGContextSaveGState(g);
-    CGRect box = CGRectMake(cx - w / 2, cy - w / 2, w, w);
-    // the image is y up in its own bitmap; flip it back into the y down picture
-    CGContextTranslateCTM(g, 0, box.origin.y * 2 + w);
-    CGContextScaleCTM(g, 1, -1);
-    CGContextClipToMask(g, box, img);
-    CGContextSetGrayFillColor(g, fg, 1);
-    CGContextFillRect(g, box);
-    CGContextRestoreGState(g);
+    int wi = (int)ceil(w), pad = (int)ceil(fmax(3, w * 0.09));
+    CGImageRef halo = halo_image(buttons[i].ident, wi, pad);
+    put_mask(g, halo, CGRectMake(cx - wi / 2.0 - pad, cy - wi / 2.0 - pad, wi + pad * 2, wi + pad * 2), 0, 0.75);
+    CGImageRelease(halo);
+    CGImageRef img = icon_image(buttons[i].ident, wi);
+    put_mask(g, img, CGRectMake(cx - wi / 2.0, cy - wi / 2.0, wi, wi), 1, 1);
     CGImageRelease(img);
     if (!buttons[i].ps) return;
     // As TouchControls.m draws the badge: a dark disc with a light rim, the symbol over it in its colour.
@@ -99,17 +124,13 @@ static void button(CGContextRef g, int i, CGFloat cx, CGFloat cy, CGFloat r, flo
 }
 int main(int argc, char **argv) {
     const char *out = argc > 1 ? argv[1] : "bat_icons.png";
-    // the bands: the buttons as the settings' "Цвет" draws them, white by default, or following the picture; big, and at the small buttons' size
+    // the bands: over a dark, a light and a grey picture, big, and at the small buttons' size
     static const struct {
-        int light_picture, dark_ink, tiny;
+        int picture, tiny;  // picture: 0 dark, 1 light, 2 grey
         const char *title;
     } bands[] = {
-        {0, 0, 0, "Белые (по умолчанию), на тёмной картинке"},
-        {1, 0, 0, "Белые (по умолчанию), на светлой картинке"},
-        {1, 1, 0, "«Под картинку», на светлой картинке"},
-        {0, 0, 1, "Маленькие, белые, на тёмной"},
-        {1, 0, 1, "Маленькие, белые, на светлой"},
-        {1, 1, 1, "Маленькие, «под картинку», на светлой"},
+        {0, 0, "На тёмной картинке"}, {1, 0, "На светлой картинке"}, {2, 0, "На серой картинке"},
+        {0, 1, "Маленькие, на тёмной"}, {1, 1, "Маленькие, на светлой"}, {2, 1, "Маленькие, на серой"},
     };
     const int passes = argc > 2 ? atoi(argv[2]) : (int)(sizeof bands / sizeof bands[0]);  // how many of the bands to draw
     const CGFloat cell = 190, big = 62, small = 30;
@@ -121,16 +142,17 @@ int main(int argc, char **argv) {
     CGContextScaleCTM(g, 1, -1);
     CGFloat y0 = 0;
     for (int pass = 0; pass < passes; pass++) {
-        int light = bands[pass].light_picture, tiny = bands[pass].tiny;
+        int light = bands[pass].picture > 0, tiny = bands[pass].tiny;
         CGFloat r = tiny ? small : big, h = rows * (tiny ? 110 : cell) + 36;
-        // a picture's colours behind them: dark blue-grey like the asylum at night, or a pale stone
-        if (light) CGContextSetRGBFillColor(g, 0.80, 0.78, 0.74, 1);
+        // a picture's colours behind them: dark blue-grey like the asylum at night, a pale stone, or the grey of a concrete pillar
+        if (bands[pass].picture == 1) CGContextSetRGBFillColor(g, 0.80, 0.78, 0.74, 1);
+        else if (bands[pass].picture == 2) CGContextSetRGBFillColor(g, 0.52, 0.51, 0.48, 1);
         else CGContextSetRGBFillColor(g, 0.10, 0.12, 0.15, 1);
         CGContextFillRect(g, CGRectMake(0, y0, W, h));
         text(g, bands[pass].title, W / 2, y0 + 24, 17, light ? 0.15 : 0.85);
         for (unsigned i = 0; i < N; i++) {
             CGFloat cx = (i % COLS + 0.5) * cell, cy = y0 + 36 + (i / COLS) * (tiny ? 110 : cell) + (tiny ? 44 : 78);
-            button(g, (int)i, cx, cy, r, bands[pass].dark_ink);
+            button(g, (int)i, cx, cy, r);
             text(g, buttons[i].label, cx, cy + r + 24, 14, light ? 0.1 : 0.9);
         }
         y0 += h;
