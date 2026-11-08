@@ -452,6 +452,25 @@ INLINE_IMPORTS = {
     "_memcmp": "eax=(u32)memcmp(M+R32(esp),M+R32(esp+4),R32(esp+8));",
     "_strlen": "eax=(u32)strlen((const char*)(M+R32(esp)));",
     "_wcscmp": "eax=(u32)wcscmp((const wchar_t*)(M+R32(esp)),(const wchar_t*)(M+R32(esp+4)));",
+    # The same as the shims in runtime/shims_libc.c do, without the trip through rt_imp: these are called hundreds of thousands of times a
+    # second in play (ARKHAM_TRACE_IMPORTS, 2026-11-08). Floats and doubles come in on the stack and go out on the x87 stack, as there.
+    "___tolower": "eax=(u32)tolower((int)R32(esp));",
+    "___toupper": "eax=(u32)toupper((int)R32(esp));",
+    "___isnanf": "eax=(u32)isnan(RF(esp));",
+    "___isinff": "eax=(u32)isinf(RF(esp));",
+    "___isnand": "eax=(u32)isnan(RD(esp));",
+    "___isinfd": "eax=(u32)isinf(RD(esp));",
+    "_strcmp": "eax=(u32)strcmp((const char*)(M+R32(esp)),(const char*)(M+R32(esp+4)));",
+    "_strncmp": "eax=(u32)strncmp((const char*)(M+R32(esp)),(const char*)(M+R32(esp+4)),R32(esp+8));",
+    "_strcasecmp": "eax=(u32)strcasecmp((const char*)(M+R32(esp)),(const char*)(M+R32(esp+4)));",
+    "_malloc_size": "eax=rt_guest_block_size(R32(esp));",
+    "_pthread_self": "eax=rt_pthread_self_id();",
+    **{f"_{n}": f"FPUSH((double){n}(RF(esp)));" for n in ("sinf", "cosf", "tanf", "asinf", "acosf", "atanf", "expf", "logf", "log10f",
+                                                        "floorf", "ceilf", "roundf", "rintf")},
+    **{f"_{n}": f"FPUSH((double){n}(RF(esp),RF(esp+4)));" for n in ("atan2f", "powf", "fmodf", "fmaxf", "fminf")},
+    **{f"_{n}": f"FPUSH({n}(RD(esp)));" for n in ("sin", "cos", "tan", "asin", "acos", "atan", "exp", "log", "log10", "floor", "ceil",
+                                                "round", "rint")},
+    **{f"_{n}": f"FPUSH({n}(RD(esp),RD(esp+8)));" for n in ("atan2", "pow", "fmod")},
 }
 # These unwind through guest frames, so they need every register in memory.
 NOT_LEAF = {"___cxa_throw", "___cxa_rethrow", "__Unwind_Resume", "___cxa_begin_catch", "___cxa_end_catch", "___cxa_free_exception",
@@ -506,6 +525,11 @@ class Emitter:
         if lo <= t < hi:
             st = W.stubs.get(t)
             if st and st[0] == "imp":
+                name = W.import_names().get(st[1], "")
+                if name in INLINE_IMPORTS:
+                    # A jump to the import, as at the end of a wrapper: its ret pops our caller's return address, and the arguments are
+                    # then at esp, where the inline form reads them. Feral's string compare ends this way, 3.4 million times a second.
+                    return f"esp+=4u;{INLINE_IMPORTS[name]}SAVE;return;"
                 return f"SAVE;rt_imp(c,{st[1]});return;"
             if st and st[0] == "fn":
                 t = st[1]

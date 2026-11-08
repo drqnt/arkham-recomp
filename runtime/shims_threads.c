@@ -124,6 +124,8 @@ static GThread *from_tid(u32 h) {
     return k < 4096 ? threads[k] : NULL;
 }
 static u32 to_tid(GThread *t) { return TID_BASE + t->id * 16; }
+// pthread_self for translated code, which calls it in place of the import (tools/lift.py, INLINE_IMPORTS): about 250,000 times a second in play.
+u32 rt_pthread_self_id(void) { return to_tid(self_thread()); }
 
 // ---------- mutexes: {sig, owner, count, type, ...} in the guest pthread_mutex_t ----------
 #define M_OWNER(m) G32((m) + 4)

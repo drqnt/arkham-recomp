@@ -1,5 +1,6 @@
 // Core definitions shared by generated code and the runtime.
 #pragma once
+#include <ctype.h>
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
@@ -90,6 +91,8 @@ void rt_hook_enter(CPU *c, u32 addr);
 void rt_hook_leave(CPU *c, u32 addr);
 void rt_ldmxcsr(CPU *c, u32 v);
 void rt_cpuid(CPU *c);
+u32 rt_guest_block_size(u32 a);  // heap.c: malloc_size, called from translated code (tools/lift.py, INLINE_IMPORTS)
+u32 rt_pthread_self_id(void);    // shims_threads.c: pthread_self, the same
 void rt_fninit(CPU *c);
 double rt_ld80(const u8 *p);
 void rt_st80(u8 *p, double v);

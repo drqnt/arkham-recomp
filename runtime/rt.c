@@ -374,6 +374,34 @@ static void imp_missing(CPU *c, u32 idx) {
 
 // ARKHAM_TRACE_IMPORTS: calls per second of each import, to see which shims are hot.
 static u32 *imp_counts;
+// ARKHAM_TRACE_IMPORT_FROM=_wcscmp,___tolower (with ARKHAM_TRACE_IMPORTS): where calls to those imports come from, by return address, with
+// the [imports] report every 10 s. A return address in the import window means a call through a function pointer or a table.
+#define FROM_N 512u
+static struct { u32 idx, from, n; } from_table[FROM_N];
+static u8 *from_watch;
+static void from_count(u32 idx, u32 from) {
+    for (u32 i = ((from * 0x9E3779B1u) ^ idx) % FROM_N, tries = 0; tries < 16; i = (i + 1) % FROM_N, tries++) {
+        if (!from_table[i].n) {
+            from_table[i].idx = idx;
+            from_table[i].from = from;
+        }
+        if (from_table[i].idx == idx && from_table[i].from == from) {
+            from_table[i].n++;
+            return;
+        }
+    }
+}
+static void from_report(void) {
+    for (int k = 0; k < 24; k++) {
+        u32 best = FROM_N;
+        for (u32 i = 0; i < FROM_N; i++)
+            if (from_table[i].n && (best == FROM_N || from_table[i].n > from_table[best].n)) best = i;
+        if (best == FROM_N) break;
+        fprintf(stderr, "[imports]   %s from %08x: %u a second\n", rt_import_names[from_table[best].idx], from_table[best].from, from_table[best].n / 10);
+        from_table[best].n = 0;
+    }
+    memset(from_table, 0, sizeof from_table);
+}
 static void imp_count(u32 idx) {
     imp_counts[idx]++;
     // ARKHAM_TRACE_IMPORTS=CF also logs each call to an import whose name starts with that.
@@ -399,6 +427,7 @@ static void imp_count(u32 idx) {
     }
     fprintf(stderr, "\n");
     memset(imp_counts, 0, rt_import_n * sizeof(u32));
+    if (from_watch) from_report();
 }
 static u8 *imp_no_gate;
 static u8 *imp_glq;
@@ -406,7 +435,10 @@ u8 rt_glq_kind(const char *name);
 int rt_glq_route(CPU *c, void (*f)(CPU *), u8 kind, int gated, const char *name);
 void rt_imp(CPU *c, u32 idx) {
     shim_fn f = imp_table[idx];
-    if (__builtin_expect(imp_counts != NULL, 0)) imp_count(idx);
+    if (__builtin_expect(imp_counts != NULL, 0)) {
+        if (from_watch && idx < rt_import_n && from_watch[idx]) from_count(idx, G32(c->esp));
+        imp_count(idx);
+    }
     if (imp_glq[idx] && f && rt_glq_route(c, f, imp_glq[idx], !imp_no_gate[idx], rt_import_names[idx])) {
         c->esp += 4;
         return;
@@ -839,6 +871,14 @@ int main(int argc, char **argv) {
     rt_register_shims(imp_table);
     stub_all = getenv("ARKHAM_STUB_ALL") != NULL;
     if (getenv("ARKHAM_TRACE_IMPORTS")) imp_counts = calloc(rt_import_n + 1, sizeof(u32));
+    if (imp_counts && getenv("ARKHAM_TRACE_IMPORT_FROM")) {
+        from_watch = calloc(rt_import_n + 1, 1);
+        char *list = strdup(getenv("ARKHAM_TRACE_IMPORT_FROM"));
+        for (char *t = strtok(list, ","); t; t = strtok(NULL, ","))
+            for (u32 i = 0; i < rt_import_n; i++)
+                if (!strcmp(rt_import_names[i], t)) from_watch[i] = 1;
+        free(list);
+    }
     imp_no_gate = calloc(rt_import_n + 1, 1);
     imp_glq = calloc(rt_import_n + 1, 1);
     for (unsigned i = 0; i < rt_import_n; i++) {
