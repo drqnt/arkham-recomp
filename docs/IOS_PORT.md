@@ -442,3 +442,38 @@ app goes to the background.
   films back would need them written in again). The Mac check kept MacInit's copy and put it back after the run.
   - Mac, no films: the engine starts at 7.2 s (after the launcher's scripted Play at 6 s), the first frame is at 11.7 s, and that is
     already the title screen, Batman on the tower and "Щелкните, чтобы начать", with no black wait.
+
+## v17: frames after turning the phone, the map by touch, readable buttons, 2026-11-08
+
+- **Uneven frames came back after turning the phone.** In the v16 log the limit of 60 held every frame for 16.7 ms, and none were off the step
+  for a minute (present to screen 25.5 ms, one frame waiting in the display's queue). Then the phone was turned upright and back (106 to 110 s).
+  From then to the end, about 40 frames a second were off the step again (25 and 8.3 ms apart), with present to screen 21 ms: iOS no longer held
+  the layer's frames for the minimum duration, though it kept its place and size. The user had put it down to switching the limit to 120 and back;
+  the log says the turn. Now the app makes a new layer for the game once the view has settled at a new size (`rt_mtl_new_layer`): the new one goes
+  under the old, which leaves 150 ms later. Not yet seen on the phone.
+- **Tried and dropped: keeping the processor fast at the limit.** Spending the last 4 ms of the limit's wait busy rather than asleep (so that
+  iOS wouldn't lower the clock) changed nothing on the Mac. The game's busiest thread uses about 95% of each frame whatever the limit, 5.9 ms
+  at 159 FPS and 16.3 ms at 60, waiting busily, so its CPU time a frame says nothing about the clock. v16 held 60 while running on the phone;
+  the 53 to 55 of the user's v15 screenshot doesn't recur in the v16 log.
+- **Badges** in the buttons' corners are at the button's opacity again (v16 kept them at least 90% opaque; the user wants them to fade with it).
+- **Buttons over a light picture:** the picture-following colour is gone (the user found it unreadable on white). Each icon has a soft dark ring
+  under it (`ios/app/BatHalo.h`: the icon drawn round two circles in its own layers, made black, the icon itself knocked out), and the disc a
+  shadow round it.
+- **The map** (found on the Mac, from a read-only copy of a later save given as slot 3 through `ARKHAM_FROZEN_DIR`): its hints say Select closes
+  it, R2 and L2 zoom in and out, square is "Show Batman", and L1 and R1 change tab. The left stick moves the map's view, so the map goes the other
+  way. At full tilt that is about a third of the picture's width a second at the first zoom, and twice that zoomed in. Half tilt is about two thirds
+  as fast. L2 zooms out by 0.62 in a quarter of a second. Show Batman zooms all the way in.
+  - On the phone, after the map button the controls know the map is open. A drag adds the finger's travel to what the map has still to do, and the
+    stick is tilted to do that within about a tenth of a second, at least 0.3, so that a swipe ends where the finger did. Two fingers zoom, a
+    trigger held while there's zoom left to do. A "Показать Бэтмена" button (square) shows at the bottom right.
+  - The map is over when play comes back, or with the back button. If the map button brought no map within 1.5 s, it isn't taken as open.
+- **The startup's 2.5 s**, with more to go on at the next first launch.
+  - `[eh] a throw of ... reaches its handler` gives the time from the throw to its handler, the cleanups on the way, and the walk over running
+    handlers (`run_top`), the one loop in phase2 that calls nothing.
+  - The profiler now gives the innermost frame in the runtime's own code as function+offset.
+  - On the Mac the throw reaches its handler one frame up, 7.7 ms after it was thrown, with 0 steps.
+- **The first launch of a build** also profiles from 90 to 110 s, once every 2 s (`ARKHAM_TRACE_PROFILE_PLAY=90:20:2`). The Mac's profile shows
+  "?" for the busiest threads, so the phone's is the one that names the translated functions to make faster.
+- **Icons:** the counter is now a shield with the blow sent back (`bi_shield`), where the lightning didn't read as counter. The fist is drawn
+  again from the front, with its finger segments, the thumb across them and a cuff. The map's "Показать Бэтмена" is the bat in a target's ring
+  (`bi_findbat`). `tools/bat_icons_preview.c` draws them as the app now does: the halo, the disc's shadow, the badge, over dark, light and grey.
