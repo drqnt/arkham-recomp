@@ -15,8 +15,10 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
 - **The inner screen upright both ways.** iOS refuses upside-down portrait on iPhone whatever the app allows, and on the foldable's inner screen
   that is one of the two upright ways (v19's log). Only the game turning itself could do it.
 - **The gadgets' button showing the gadget chosen** (the game's choice isn't known outside it yet).
-- **DualSense rumble on the phone.** Feral's code goes through IOHIDDevice and ForceFeedback; it has to become GameController haptics. On the
-  Mac the haptics engine is now retried, unverified.
+- **Rumble, Mac and phone** (the owner confirmed it's wanted, 2026-11-08, for later). Nobody knows yet whether it works on the Mac: the
+  haptics engine is retried there since 2026-11-07, never felt with a pad connected. Then the phone: Feral's code goes through IOHIDDevice and
+  ForceFeedback, which has to become GameController haptics.
+- **MetalFX** (confirmed wanted, 2026-11-08, for later): spatial upscaling first, the phone rendering below its 1424 x 1000.
 - **The cryptographic sequencer by touch.**
 - **Resolution and MSAA as settings** (the phone renders at half its screen's pixels, 1424 x 1000).
 - **Better anti-aliasing and upscaling:** FXAA with the game's MSAA (FXAA is in), MetalFX (spatial first; temporal needs jitter and motion
