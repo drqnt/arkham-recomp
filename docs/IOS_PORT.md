@@ -638,7 +638,7 @@ app goes to the background.
 - A scripted run's `pad:57:<hat>` steps need `ARKHAM_FAKE_PAD_TYPE=ps`: the default pad is the Xbox one, which has no hat, and the steps did
   nothing at all in the first try (a "[pad] scripted 1:57" line is logged either way).
 
-## v27: the game's size from the inner screen even when started folded; the resolution in pixels, up to full, 2026-11-08
+## v27: the game's size from the inner screen even when started folded; the resolution in pixels, up to full, 2026-11-08 (installed 14:12)
 
 - The owner saw a very low picture in v26: the game had started with the phone folded, on the outer screen (466 x 678 points), and took its
   size from it, 1016 x 696, for the whole run; unfolded, that went up to 2853 x 2007 pixels. MetalFX only scaled it up better.
