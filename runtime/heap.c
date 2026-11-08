@@ -3,6 +3,7 @@
 #include "shim.h"
 
 #include <os/lock.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -378,12 +379,127 @@ u32 rt_guest_strdup(const char *s) {
 #undef rt_guest_realloc
 #undef rt_guest_strdup
 #define LOCKED(expr) do { os_unfair_lock_lock(&heap_lock); expr; os_unfair_lock_unlock(&heap_lock); } while (0)
+
+// ---------- each thread's own small blocks ----------
+// The game allocates and frees over a million blocks a second in play (2026-11-08), from the game thread, the render thread and others at
+// once, and every one took the heap's lock. Each thread now keeps up to TC_MAX freed blocks of each class up to 1 KB, and takes them back
+// without the lock; it goes to the shared lists only for a batch at a time. A kept block looks freed (FREE_MAGIC), so a double free is still
+// ignored as before. With ARKHAM_TRACE_HEAP everything goes through the shared lists, which keep the accounting. ARKHAM_HEAP_SHARED=1 turns
+// the threads' blocks off.
+#define TC_CLASSES 64  // up to 1024 bytes
+#define TC_MAX 32
+#define TC_BATCH 16
+typedef struct { u32 n; u32 b[TC_MAX]; } TCClass;
+static __thread TCClass *tcache;
+static pthread_key_t tc_key;
+static int tc_state;  // 0 not decided, 1 on, -1 off
+static void tc_flush(void *p) {
+    TCClass *tc = p;
+    os_unfair_lock_lock(&heap_lock);
+    for (int k = 1; k <= TC_CLASSES; k++)
+        for (u32 i = 0; i < tc[k].n; i++) {
+            u32 a = tc[k].b[i];
+            G32(a - HDR + 12) = class_head[k];
+            class_head[k] = a;
+        }
+    os_unfair_lock_unlock(&heap_lock);
+    free(tc);
+}
+static TCClass *tc_get(void) {
+    TCClass *tc = tcache;
+    if (__builtin_expect(tc != NULL, 1)) return tc;
+    if (tc_state == 0) {
+        os_unfair_lock_lock(&heap_lock);
+        if (tc_state == 0) {
+            int off = getenv("ARKHAM_HEAP_SHARED") != NULL || getenv("ARKHAM_TRACE_HEAP") != NULL;
+            if (!off) pthread_key_create(&tc_key, tc_flush);
+            __atomic_store_n(&tc_state, off ? -1 : 1, __ATOMIC_RELEASE);
+        }
+        os_unfair_lock_unlock(&heap_lock);
+    }
+    if (__atomic_load_n(&tc_state, __ATOMIC_ACQUIRE) < 0) return NULL;
+    tc = calloc(TC_CLASSES + 1, sizeof *tc);
+    tcache = tc;
+    pthread_setspecific(tc_key, tc);  // given back to the shared lists when the thread ends
+    return tc;
+}
+u32 rt_guest_malloc(u32 size) {
+    u32 n = size ? size : 1;
+    TCClass *tc = n <= 16u * TC_CLASSES ? tc_get() : NULL;
+    if (tc) {
+        int k = class_of(n);
+        TCClass *t = &tc[k];
+        if (!t->n) {
+            // A batch from the shared list, or carved from the current chunk as h_malloc does.
+            os_unfair_lock_lock(&heap_lock);
+            u32 cls_size = class_size(k);
+            while (t->n < TC_BATCH) {
+                u32 a = class_head[k];
+                if (a && G32(a - HDR) != FREE_MAGIC) {
+                    fprintf(stderr, "[heap] corrupt free block header at %08x in class %d, discarding that list\n", a, k);
+                    class_head[k] = a = 0;
+                }
+                if (a) {
+                    class_head[k] = G32(a - HDR + 12);
+                } else {
+                    u32 need = cls_size + HDR;
+                    if (chunk_cur + need > chunk_end) {
+                        chunk_cur = h_alloc_pages(1u << 20);
+                        chunk_end = chunk_cur + (1u << 20);
+                        chunk_total += 1u << 20;
+                    }
+                    a = chunk_cur + HDR;
+                    chunk_cur += need;
+                    G32(a - HDR) = FREE_MAGIC;
+                }
+                t->b[t->n++] = a;
+            }
+            os_unfair_lock_unlock(&heap_lock);
+        }
+        u32 a = t->b[--t->n];
+        u32 h = a - HDR;
+        G32(h) = MAGIC;
+        G32(h + 4) = (u32)k;
+        G32(h + 8) = n;
+        G32(h + 12) = 0;
+        return a;
+    }
+    u32 r;
+    LOCKED(r = h_malloc(size));
+    return r;
+}
+void rt_guest_free(u32 a) {
+    if (!a) return;
+    u32 h = a - HDR;
+    TCClass *tc;
+    if (G32(h) == MAGIC && G32(h + 4) >= 1u && G32(h + 4) <= TC_CLASSES && (tc = tc_get()) != NULL) {
+        u32 k = G32(h + 4);
+        TCClass *t = &tc[k];
+        if (t->n == TC_MAX) {
+            // Half of them back to the shared list.
+            os_unfair_lock_lock(&heap_lock);
+            while (t->n > TC_MAX - TC_BATCH) {
+                u32 b = t->b[--t->n];
+                G32(b - HDR + 12) = class_head[k];
+                class_head[k] = b;
+            }
+            os_unfair_lock_unlock(&heap_lock);
+        }
+        G32(h) = FREE_MAGIC;
+        t->b[t->n++] = a;
+        return;
+    }
+    LOCKED(h_free(a));
+}
 u32 rt_guest_alloc_pages(u32 size) { u32 r; LOCKED(r = h_alloc_pages(size)); return r; }
 void rt_guest_free_pages(u32 addr, u32 size) { LOCKED(h_free_pages(addr, size)); }
-u32 rt_guest_malloc(u32 size) { u32 r; LOCKED(r = h_malloc(size)); return r; }
-u32 rt_guest_memalign(u32 align, u32 size) { u32 r; LOCKED(r = h_memalign(align, size)); return r; }
+u32 rt_guest_memalign(u32 align, u32 size) {
+    if (align <= 16) return rt_guest_malloc(size);
+    u32 r;
+    LOCKED(r = h_memalign(align, size));
+    return r;
+}
 u32 rt_guest_block_size(u32 a) { u32 r; LOCKED(r = h_block_size(a)); return r; }
-void rt_guest_free(u32 a) { LOCKED(h_free(a)); }
 u32 rt_guest_calloc(u32 n, u32 size) { u32 r; LOCKED(r = h_calloc(n, size)); return r; }
 u32 rt_guest_realloc(u32 a, u32 size) { u32 r; LOCKED(r = h_realloc(a, size)); return r; }
 u32 rt_guest_strdup(const char *s) { u32 r; LOCKED(r = h_strdup(s)); return r; }

@@ -1,6 +1,7 @@
 // CoreFoundation: real host objects behind 32-bit guest handles. Guest constant strings from the
 // __cfstring section are converted to host strings on first use.
 #include "shim.h"
+#include <pthread.h>
 #include "shim_reg.h"
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -255,7 +256,92 @@ SHIM(CFURLCreateWithFileSystemPathRelativeToBase) {
     RET(cf_wrap(CFURLCreateWithFileSystemPathRelativeToBase(NULL, S(1), ARG(2), (Boolean)ARG(3), U(4))));
 }
 #else
-SHIM(CFURLCreateWithFileSystemPath) { RET(cf_wrap(CFURLCreateWithFileSystemPath(NULL, S(1), ARG(2), (Boolean)ARG(3)))); }
+// ARKHAM_TRACE_URLS=1: the paths made into URLs most often, every 5 s, with where the call came from.
+#define UC_N 512u
+static struct { u64 hash; u32 from, n; char text[96]; } uc_table[UC_N];
+static pthread_mutex_t uc_mu = PTHREAD_MUTEX_INITIALIZER;
+static int uc_on = -1;
+static void *uc_report(void *arg) {
+    (void)arg;
+    for (;;) {
+        sleep(5);
+        pthread_mutex_lock(&uc_mu);
+        u64 total = 0;
+        for (u32 i = 0; i < UC_N; i++) total += uc_table[i].n;
+        if (total) fprintf(stderr, "[urls] %llu made in 5 s\n", total);
+        for (int k = 0; k < 12 && total; k++) {
+            u32 best = UC_N;
+            for (u32 i = 0; i < UC_N; i++)
+                if (uc_table[i].n && (best == UC_N || uc_table[i].n > uc_table[best].n)) best = i;
+            if (best == UC_N) break;
+            fprintf(stderr, "[urls]   %7u from %08x %s\n", uc_table[best].n, uc_table[best].from, uc_table[best].text);
+            uc_table[best].n = 0;
+        }
+        memset(uc_table, 0, sizeof uc_table);
+        pthread_mutex_unlock(&uc_mu);
+    }
+    return NULL;
+}
+static void uc_count(CFStringRef path, u32 from) {
+    if (uc_on < 0) {
+        uc_on = getenv("ARKHAM_TRACE_URLS") != NULL;
+        if (uc_on) {
+            pthread_t t;
+            pthread_create(&t, NULL, uc_report, NULL);
+            pthread_detach(t);
+        }
+    }
+    if (!uc_on || !path) return;
+    char text[96] = "";
+    CFIndex used = 0, len = CFStringGetLength(path);
+    CFStringGetBytes(path, CFRangeMake(len > 95 ? len - 95 : 0, len > 95 ? 95 : len), kCFStringEncodingUTF8, '?', false, (UInt8 *)text, 95, &used);
+    text[used] = 0;  // the end of the path, which tells most
+    u64 h = 1469598103934665603ull;
+    for (const char *t = text; *t; t++) h = (h ^ (u8)*t) * 1099511628211ull;
+    h ^= from;
+    pthread_mutex_lock(&uc_mu);
+    for (u32 i = (u32)(h % UC_N), tries = 0; tries < 32; i = (i + 1) % UC_N, tries++) {
+        if (!uc_table[i].n) {
+            uc_table[i].hash = h;
+            uc_table[i].from = from;
+            memcpy(uc_table[i].text, text, sizeof text);
+        }
+        if (uc_table[i].hash == h) {
+            uc_table[i].n++;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&uc_mu);
+}
+// Feral's file layer turns HFS paths ("Volume:Folder:File") into URLs over and over, a dozen times a second in play, and each conversion
+// looks the volume up through CarbonCore: about 3-5% of the game thread's time (2026-11-08). The answer for a path doesn't change, so each one
+// is kept and handed out again, retained as a new one would be.
+static CFMutableDictionaryRef hfs_urls;
+static pthread_mutex_t hfs_mu = PTHREAD_MUTEX_INITIALIZER;
+SHIM(CFURLCreateWithFileSystemPath) {
+    CFStringRef path = S(1);
+    uc_count(path, G32(c->esp));
+    if (path && ARG(2) == kCFURLHFSPathStyle) {
+        CFStringRef key = CFStringCreateWithFormat(NULL, NULL, CFSTR("%u|%@"), (unsigned)(ARG(3) & 0xFF), path);
+        pthread_mutex_lock(&hfs_mu);
+        if (!hfs_urls) hfs_urls = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFURLRef url = CFDictionaryGetValue(hfs_urls, key);
+        if (url) CFRetain(url);
+        pthread_mutex_unlock(&hfs_mu);
+        if (!url) {
+            url = CFURLCreateWithFileSystemPath(NULL, path, kCFURLHFSPathStyle, (Boolean)ARG(3));
+            if (url) {
+                pthread_mutex_lock(&hfs_mu);
+                if (CFDictionaryGetCount(hfs_urls) < 4096) CFDictionarySetValue(hfs_urls, key, url);
+                pthread_mutex_unlock(&hfs_mu);
+            }
+        }
+        CFRelease(key);
+        RET(cf_wrap(url));
+        return;
+    }
+    RET(cf_wrap(CFURLCreateWithFileSystemPath(NULL, path, ARG(2), (Boolean)ARG(3))));
+}
 SHIM(CFURLCreateWithFileSystemPathRelativeToBase) { RET(cf_wrap(CFURLCreateWithFileSystemPathRelativeToBase(NULL, S(1), ARG(2), (Boolean)ARG(3), U(4)))); }
 #endif
 SHIM(CFURLCreateFromFileSystemRepresentation) { RET(cf_wrap(CFURLCreateFromFileSystemRepresentation(NULL, GP(ARG(1)), (i32)ARG(2), (Boolean)ARG(3)))); }
