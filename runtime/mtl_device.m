@@ -2590,7 +2590,9 @@ static void make_layer_on_main(void) {
     l.pixelFormat = MTLPixelFormatBGRA8Unorm;
     l.framebufferOnly = NO;
     l.opaque = YES;
-    l.displaySyncEnabled = NO;
+    // Without a frame rate limit the game runs as fast as it can and tears. With one, frames wait for the display, so each can be held a whole step (present_paced).
+    const char *cap_env = getenv("ARKHAM_FPS_CAP");
+    l.displaySyncEnabled = cap_env && atof(cap_env) > 0;
     l.maximumDrawableCount = 3;
     v.wantsLayer = YES;
     v.layer = l;
@@ -2818,6 +2820,22 @@ static void dump_target(Obj *rt) {
 // The layer makes whoever asks for a drawable wait until the display has room for another frame. If that were the Direct3D thread, the game could never run faster than the display.
 // So another thread does the waiting and leaves the drawable here. A frame that finds one goes on screen, and any other frame is simply not shown.
 // ARKHAM_MTL_VSYNC=1 makes the Direct3D thread wait instead, which holds the game to the display's rate.
+static _Atomic double fps_cap = -1;  // frames a second at most; 0 for no limit, -1 until ARKHAM_FPS_CAP has been read
+void rt_set_fps_cap(double n) { atomic_store(&fps_cap, n > 0 ? n : 0); }
+// With a frame rate limit, each frame is held on screen for a whole step of it.
+// The phone's display can show a frame for 8.3, 12.5, 16.7, 20.8 or 25 ms. A frame only waited for by the clock reached it a little early or late.
+// A late one stayed up 25 ms and the next only 8.3, and that was the uneven line in the Metal HUD and on screen.
+// ARKHAM_MTL_PACE=0 presents each frame as soon as it's ready, the old way.
+static void present_paced(id<MTLCommandBuffer> p, id<CAMetalDrawable> dr) {
+    static int pace = -1;
+    if (pace < 0) {
+        const char *v = getenv("ARKHAM_MTL_PACE");
+        pace = !(v && *v == '0');
+    }
+    double cap = atomic_load(&fps_cap);
+    if (pace && cap > 0) [p presentDrawable:dr afterMinimumDuration:1.0 / cap];
+    else [p presentDrawable:dr];
+}
 static _Atomic u32 drawable_w, drawable_h;
 static _Atomic(void *) ready_drawable;
 static dispatch_semaphore_t drawable_wanted;
@@ -2895,7 +2913,7 @@ static void present_on_its_own_queue(void) {
     [b copyFromTexture:copy toTexture:dr.texture];
     [b endEncoding];
     watch_shown(dr);
-    [p presentDrawable:dr];
+    present_paced(p, dr);
     [p addCompletedHandler:^(id<MTLCommandBuffer> done) {
         (void)done;
         atomic_store(&present_busy[slot], 0);
@@ -2926,7 +2944,7 @@ static id<CAMetalDrawable> take_drawable(void) {
     return dr;
 }
 // What really reached the screen, for the [fps] line.
-static _Atomic u64 n_shown, n_not_shown, shown_worst_us, shown_wait_us;
+static _Atomic u64 n_shown, n_not_shown, shown_worst_us, shown_wait_us, shown_off_step;
 static _Atomic double shown_prev;
 static void watch_shown(id<CAMetalDrawable> dr) {
     double asked = CACurrentMediaTime();
@@ -2940,6 +2958,9 @@ static void watch_shown(id<CAMetalDrawable> dr) {
         if (was > 0) {
             u64 gap = (u64)((at - was) * 1e6);
             if (gap > atomic_load(&shown_worst_us)) atomic_store(&shown_worst_us, gap);
+            // With a limit, how many frames stayed up longer or shorter than its step, by more than 2 ms.
+            double cap = atomic_load(&fps_cap);
+            if (cap > 0 && fabs((at - was) - 1.0 / cap) > 0.002) atomic_fetch_add(&shown_off_step, 1);
         }
         atomic_fetch_add(&shown_wait_us, (u64)((at - asked) * 1e6));
         atomic_fetch_add(&n_shown, 1);
@@ -2948,8 +2969,6 @@ static void watch_shown(id<CAMetalDrawable> dr) {
 void rt_hitch_tick(void);
 void rt_fps_overlay(double fps, double worst_ms);
 static void *frame_pool;
-static _Atomic double fps_cap = -1;  // frames a second at most; 0 for no limit, -1 until ARKHAM_FPS_CAP has been read
-void rt_set_fps_cap(double n) { atomic_store(&fps_cap, n > 0 ? n : 0); }
 // Apple's Metal HUD on the game's layer, switched as the game runs (the phone's settings) or by ARKHAM_METAL_HUD=1 at start (hud_wanted, above).
 void rt_set_metal_hud(int on) {
     atomic_store(&hud_wanted, on);
@@ -2986,10 +3005,10 @@ static void note_frame(u64 draws) {
         rt_thread_cpu_report(threads, sizeof threads, (double)fps_frames);
         rt_eh_report();
         double gpu_ms = (double)atomic_exchange(&gpu_ns, 0) / 1e6 / (double)fps_frames;
-        fprintf(stderr, "[fps] %.1f, worst frame %.1f ms, %llu draws, %llu passes; ms a frame: thread busy %.1f, gpu %.1f, drawable %.2f, waiting for gpu %.2f, engine waiting for queries %.1f; %llu quad clears, %llu not needed, %llu resolves in pass; %llu of %llu shaders compiled in %.0f ms, %llu not from the cache, %llu built ahead, %u pipelines in %.0f ms (%llu draws left out waiting for one); on screen %.1f a second, %llu dropped, longest gap %.1f ms, %.1f ms from present; guest threads, CPU ms a frame: %s\n",
+        fprintf(stderr, "[fps] %.1f, worst frame %.1f ms, %llu draws, %llu passes; ms a frame: thread busy %.1f, gpu %.1f, drawable %.2f, waiting for gpu %.2f, engine waiting for queries %.1f; %llu quad clears, %llu not needed, %llu resolves in pass; %llu of %llu shaders compiled in %.0f ms, %llu not from the cache, %llu built ahead, %u pipelines in %.0f ms (%llu draws left out waiting for one); on screen %.1f a second, %llu dropped, longest gap %.1f ms, %.1f ms from present, %llu off the limit's step; guest threads, CPU ms a frame: %s\n",
                 fps, (double)fps_worst / 1e6, draws_seen, n_passes / fps_frames, (double)rt_d3dq_busy_ticks * per_frame, gpu_ms, (double)ticks_drawable * per_frame,
                 (double)ticks_inflight * per_frame, (double)ticks_query_wait * per_frame, n_quad_clears / fps_frames, n_skipped_clears / fps_frames, n_resolves_in_pass / fps_frames, n_compiled, n_created, (double)compile_ticks * 125.0 / 3.0 / 1e6, n_uncached, n_prebuilt, n_pipes, (double)pipe_ticks * 125.0 / 3.0 / 1e6, n_pipe_waits,
-                (double)shown / secs, atomic_exchange(&n_not_shown, 0), (double)atomic_exchange(&shown_worst_us, 0) / 1e3, shown ? (double)atomic_exchange(&shown_wait_us, 0) / 1e3 / (double)shown : 0.0, threads);
+                (double)shown / secs, atomic_exchange(&n_not_shown, 0), (double)atomic_exchange(&shown_worst_us, 0) / 1e3, shown ? (double)atomic_exchange(&shown_wait_us, 0) / 1e3 / (double)shown : 0.0, atomic_exchange(&shown_off_step, 0), threads);
         rt_d3dq_busy_ticks = ticks_drawable = ticks_inflight = ticks_query_wait = 0;
         n_passes = n_quad_clears = n_skipped_clears = n_resolves_in_pass = 0;
         rt_fps_overlay(fps, (double)fps_worst / 1e6);
@@ -3232,7 +3251,7 @@ static void m_Present(CPU *c) {
             [b copyFromTexture:back_buffer->tex toTexture:dr.texture];
             [b endEncoding];
             watch_shown(dr);
-            [cb presentDrawable:dr];
+            present_paced(cb, dr);
         }
         [dr release];
     } else if (atomic_load(&layer_ready) && back_buffer && !no_present) {
