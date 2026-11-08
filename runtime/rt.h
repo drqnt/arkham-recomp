@@ -85,6 +85,7 @@ _Noreturn void rt_trap(CPU *c, u32 addr, const char *msg);
 _Noreturn void rt_unimpl(CPU *c, u32 addr, const char *msg);
 void rt_imp(CPU *c, u32 idx);
 void rt_dispatch(CPU *c, u32 target);
+void rt_dispatch_ic(CPU *c, u32 target, const rt_fn_entry **site);  // a call site's own cache of where it went last (tools/lift.py)
 void rt_dispatch_jt(CPU *restrict c, u8 *restrict M);
 void rt_gate_yield(void);
 void rt_hook_enter(CPU *c, u32 addr);

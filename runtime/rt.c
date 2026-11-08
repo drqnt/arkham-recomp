@@ -244,7 +244,7 @@ u32 rt_dyn_import(const char *name, shim_fn fn) {
 
 #define HT_BITS 20
 #define HT_SIZE (1u << HT_BITS)
-static struct { u32 addr; guest_fn fn; } *ht;
+static rt_fn_entry *ht;  // entries are handed to call sites (rt_dispatch_ic), so the table is built once and never moves
 
 static inline u32 ht_hash(u32 a) { return (a * 0x9E3779B1u) >> (32 - HT_BITS); }
 
@@ -322,6 +322,28 @@ void rt_dispatch(CPU *c, u32 t) {
     rt_trap(c, t, "indirect transfer to an unknown address (add it to config/roots.json)");
 }
 
+// The slow way for a call site that keeps where it went last: the table's entry for a translated function is kept at the site, and its next call
+// with the same target goes straight there. Entries never move; one changed by rt_ht_add keeps its address. Anything else (an import, a host
+// callback) goes the usual way and isn't kept.
+void rt_dispatch_ic(CPU *c, u32 t, const rt_fn_entry **site) {
+    u32 h = ht_hash(t);
+    for (;;) {
+        u32 k = ht[h].addr;
+        if (k == t) {
+            guest_fn f = ht[h].fn;
+            if (f) {
+                __atomic_store_n(site, &ht[h], __ATOMIC_RELAXED);
+                c->jt = t;
+                f(c, RT_M);
+                return;
+            }
+            break;
+        }
+        if (!k) break;
+        h = (h + 1) & (HT_SIZE - 1);
+    }
+    rt_dispatch(c, t);
+}
 void rt_dispatch_jt(CPU *restrict c, u8 *restrict M) {
     (void)M;
     rt_dispatch(c, c->jt);

@@ -101,6 +101,8 @@ class World:
         # Function extents come only from the linker's table. An extra root (say, a jump into the middle of a
         # function, or one derived from data decoded as code) gets its own copy and never cuts a real function short.
         self.hard_starts = sorted({r for r in hard if self.in_code(r)})
+        self.hard_set = set(self.hard_starts)
+        self.landing_pad_index = (sorted(self.landing_pads), None)
         # imports
         self.imports: dict[str, int] = {}
         self._import_names: dict[int, str] = {}
@@ -646,7 +648,13 @@ class Emitter:
                 if t == i.next:  # PIC base idiom: push only
                     return f"esp-=4;R32(esp)={hx(t)};"
                 return self.call(t, i.next)
-            return f"{{u32 t={rd(o, 4)};esp-=4;R32(esp)={hx(i.next)};SAVE;rt_dispatch(c,t);LOAD;}}"
+            # A call through a pointer, mostly a virtual method: the site keeps the table entry of the last function it reached, and calls it
+            # straight when the target is the same again. Each site then has its own indirect branch, which the processor predicts well, and
+            # skips the dispatcher's search of its 16 MB table (rt_dispatch_ic in runtime/rt.c).
+            ic = f"ic_{i.addr:x}"
+            return (f"{{u32 t={rd(o, 4)};esp-=4;R32(esp)={hx(i.next)};SAVE;static const rt_fn_entry *{ic};"
+                    f"const rt_fn_entry *e_=__atomic_load_n(&{ic},__ATOMIC_RELAXED);"
+                    f"if(__builtin_expect(e_&&e_->addr==t,1)){{c->jt=t;e_->fn(c,M);}}else rt_dispatch_ic(c,t,&{ic});LOAD;}}")
         if mn == "jmp":
             o = i.ops[0]
             if o.kind == "imm":
@@ -694,6 +702,131 @@ def reader_cc(i: Ins) -> str | None:
     return None
 
 
+# ---------- a function's own locals ----------
+# Most functions here keep a frame pointer: push ebp; mov ebp, esp; pushes of the registers they keep; sub esp, N. Their locals sit at fixed
+# offsets below ebp and, unless the function lets their address out, nothing else can reach them. For such a function the translated code
+# reads and writes those slots through a pointer of its own (S in rt.h), which the compiler knows no other access aliases: it can then keep
+# their values in registers across guest stores and calls instead of storing and reloading them. Native x86 does this in hardware (memory
+# renaming); translated, it was loads and stores, and the waits between them.
+FRAME_MARGIN = 16  # an esp-based access may reach this much above where the prologue left esp (a callee that popped its struct return pointer)
+SETJMPS = {"_setjmp", "__setjmp", "_sigsetjmp", "__sigsetjmp", "__longjmp", "_longjmp"}
+
+
+def _signed(v: int) -> int:
+    v &= 0xFFFFFFFF
+    return v - (1 << 32) if v & 0x80000000 else v
+
+
+def frame_window(fn: Fn) -> tuple[int, int] | str:
+    """The offsets from ebp, [lo, hi), of the locals only this function's own ebp-based accesses touch, or why there are none."""
+    if fn.addr not in W.hard_set:
+        return "copy"
+    order = sorted(fn.reach)
+    if len(order) < 3:
+        return "short"
+    i0, i1 = fn.reach[order[0]], fn.reach[order[1]]
+    if not (i0.mn == "push" and i0.ops and i0.ops[0].kind == "r32" and i0.ops[0].reg == "ebp"):
+        return "no-frame"
+    if not (i1.mn == "mov" and len(i1.ops) == 2 and i1.ops[0].kind == "r32" and i1.ops[0].reg == "ebp"
+            and i1.ops[1].kind == "r32" and i1.ops[1].reg == "esp"):
+        return "no-frame"
+    n_saved, size = 0, 0
+    k = 2
+    while k < len(order):
+        i = fn.reach[order[k]]
+        if i.mn == "push" and i.ops and i.ops[0].kind == "r32" and i.ops[0].reg in ("ebx", "esi", "edi"):
+            n_saved += 1
+            k += 1
+            continue
+        if i.mn == "sub" and len(i.ops) == 2 and i.ops[0].kind == "r32" and i.ops[0].reg == "esp" and i.ops[1].kind == "imm":
+            size = i.ops[1].val & 0xFFFFFFFF
+        break
+    if size > 0x100000:
+        return "huge"
+    lo_pad, hi_pad = W.landing_pad_index
+    a, b = bisect.bisect_left(lo_pad, fn.addr), bisect.bisect_left(lo_pad, fn.end)
+    if b > a:
+        return "pads"
+    if fn.tables:
+        return "tables"
+    esp_reach = 0
+    accesses: list[tuple[int, int]] = []
+    for idx, a in enumerate(order):
+        i = fn.reach[a]
+        mn = i.mn
+        try:
+            ops = i.ops
+        except ValueError:
+            return "parse"
+        if mn in ("jmp", "call") and ops and ops[0].kind != "imm":
+            if mn == "jmp":
+                return "jmp-indirect"
+        if mn in ("jmp",) or mn in JCC:
+            t = imm_target(i)
+            if t is not None and t not in fn.reach and fn.addr <= t < fn.end:
+                return "self-tail"
+        if mn == "call":
+            t = imm_target(i)
+            if t is not None:
+                lo, hi = W.stub_section
+                if lo <= t < hi:
+                    st = W.stubs.get(t)
+                    if st and st[0] == "imp" and W.import_names().get(st[1], "") in SETJMPS:
+                        return "setjmp"
+        for n, o in enumerate(ops):
+            if o.kind in ("r32", "r16", "r8") and o.reg == "ebp":
+                ok = (idx == 0) or (idx == 1) or (mn == "pop") or (mn == "mov" and n == 1 and ops[0].kind == "r32" and ops[0].reg == "esp")
+                if not ok:
+                    return "ebp-use"
+            if o.kind in ("r32",) and o.reg == "esp":
+                if mn in ("push", "pop", "call", "ret"):
+                    continue
+                if mn == "sub" and n == 0 and ops[1].kind == "imm":
+                    continue
+                if mn == "add" and n == 0 and ops[1].kind == "imm":
+                    # only on the way out: nothing but pops (and leave) until a ret or a jump
+                    j = idx + 1
+                    while j < len(order) and fn.reach[order[j]].mn in ("pop", "leave"):
+                        j += 1
+                    if j < len(order) and fn.reach[order[j]].mn in ("ret", "retn", "jmp"):
+                        continue
+                    return "esp-raise"
+                if mn == "mov" and n == 0 and len(ops) == 2 and ops[1].kind == "r32" and ops[1].reg == "ebp":
+                    continue  # mov esp, ebp: the way out
+                if idx == 1 and mn == "mov" and n == 1:
+                    continue  # mov ebp, esp
+                if mn == "lea" and n == 0 and len(ops) == 2 and ops[1].kind == "mem" and ops[1].base == "ebp" and not ops[1].index:
+                    continue  # lea esp, [ebp - k]: the way out
+                return "esp-use"
+            if o.kind == "mem":
+                if o.index in ("ebp", "esp") or (o.base in ("ebp", "esp") and o.index):
+                    return "frame-index"
+                if mn == "lea":
+                    if o.base == "ebp" and ops[0].kind == "r32" and ops[0].reg == "esp":
+                        continue
+                    if o.base in ("ebp", "esp"):
+                        return "lea-frame"
+                    continue
+                if o.seg:
+                    continue
+                if o.base == "ebp":
+                    sz = o.size or 0
+                    if not sz:
+                        return "unsized"
+                    accesses.append((_signed(o.disp), sz))
+                elif o.base == "esp":
+                    sz = o.size or 4
+                    esp_reach = max(esp_reach, _signed(o.disp) + sz)
+    hi = -4 * n_saved
+    lo = -(4 * n_saved + size) + esp_reach + FRAME_MARGIN
+    if lo >= hi:
+        return "no-room"
+    for d, sz in accesses:
+        if d < hi and d + sz > hi or d < lo and d + sz > lo:
+            return "straddle"
+    return (lo, hi)
+
+
 def lift_shard(job):
     shard, funcs = job
     fh = open(W.dis, "rb")
@@ -714,6 +847,21 @@ def lift_shard(job):
         redecodes += fn.redecodes
         external |= fn.external
         unresolved += fn.unresolved
+        fw = frame_window(fn)
+        n_local = 0
+        for i in fn.reach.values():
+            if i.mn == "lea":
+                continue
+            try:
+                n_local += sum(1 for o in i.ops if o.kind == "mem" and o.base == "ebp" and not o.index and (o.disp & 0x80000000))
+            except ValueError:
+                pass
+        if isinstance(fw, tuple):
+            stats["frame:ok"] += 1
+            stats["frame:acc-ok"] += n_local
+        else:
+            stats[f"frame:no-{fw}"] += 1
+            stats[f"frame:acc-no-{fw}"] += n_local
         em = Emitter(fn, stats)
         emit_module.plain_memory = f in UNALIGNED_FUNCTIONS or any(lo <= f < hi for lo, hi in UNALIGNED_RANGES)
         body = em.run()

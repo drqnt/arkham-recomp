@@ -57,9 +57,12 @@ typedef struct {
     pthread_cond_t cv;
     u32 waiters;
 } Park;
-#define PARK_N 64
+// Many buckets, so that a hot mutex rarely shares one with a thread asleep on something else: with 64 the game thread's unlocks often found
+// some sleeper there (the sound's, a loader's) and paid a lock and a broadcast for nothing, 1-3% of its time (2026-11-08).
+#define PARK_BITS 12
+#define PARK_N (1u << PARK_BITS)
 static Park parks[PARK_N] = {[0 ... PARK_N - 1] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0}};
-static inline Park *park_of(u64 a) { return &parks[((u32)(a >> 2) * 2654435761u) >> 26]; }
+static inline Park *park_of(u64 a) { return &parks[((u32)(a >> 2) * 2654435761u) >> (32 - PARK_BITS)]; }
 static inline void park_wake(u64 a) {
     Park *p = park_of(a);
     if (__atomic_load_n(&p->waiters, __ATOMIC_SEQ_CST)) {
