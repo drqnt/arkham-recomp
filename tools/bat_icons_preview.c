@@ -73,13 +73,19 @@ static void button(CGContextRef g, int i, CGFloat cx, CGFloat cy, CGFloat r, flo
     CGContextRestoreGState(g);
     CGImageRelease(img);
     if (!buttons[i].ps) return;
-    CGFloat bx = cx + r * 0.72, by = cy + r * 0.72, br = fmax(8, r * 0.3), s = br * 0.48;
-    CGContextSetGrayFillColor(g, 0, 0.75);
+    // As TouchControls.m draws the badge: a dark disc with a light rim, the symbol over it in its colour.
+    CGFloat bx = cx + r * 0.72, by = cy + r * 0.72, br = fmax(10, r * 0.36), s = br * 0.5;
+    CGContextSetGrayFillColor(g, 0, 0.85);
     CGContextFillEllipseInRect(g, CGRectMake(bx - br, by - br, br * 2, br * 2));
+    CGContextSetGrayStrokeColor(g, 1, 0.6);
+    CGContextSetLineWidth(g, 1);
+    CGContextStrokeEllipseInRect(g, CGRectMake(bx - br, by - br, br * 2, br * 2));
     static const CGFloat colors[][3] = {{0, 0, 0}, {0x7F, 0xB2, 0xE5}, {0xE4, 0x8A, 0xD6}, {0x5C, 0xC4, 0x9A}, {0xE8, 0x6A, 0x6A}};
     const CGFloat *c = colors[buttons[i].ps];
     CGContextSetRGBStrokeColor(g, c[0] / 255, c[1] / 255, c[2] / 255, 1);
-    CGContextSetLineWidth(g, 1.6);
+    CGContextSetLineWidth(g, fmax(2, br * 0.18));
+    CGContextSetLineCap(g, kCGLineCapRound);
+    CGContextSetLineJoin(g, kCGLineJoinRound);
     switch (buttons[i].ps) {
         case 1:
             CGContextMoveToPoint(g, bx - s, by - s), CGContextAddLineToPoint(g, bx + s, by + s);

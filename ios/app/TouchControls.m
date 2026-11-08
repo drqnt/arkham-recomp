@@ -201,6 +201,9 @@ static UIImage *symbol(NSString *name, CGFloat size, UIColor *color) {
 @property(nonatomic) CGPoint center;
 @property(nonatomic) CGFloat radius;
 @property(nonatomic, strong) CALayer *group;
+// The badge in the corner (the PlayStation symbol or name) sits in a layer of its own over the button. The button's transparency doesn't fade it as much.
+@property(nonatomic, strong) CALayer *badge_group;
+@property(nonatomic, strong) CAShapeLayer *badge_symbol;
 @property(nonatomic, strong) CAShapeLayer *back, *symbol, *badge;
 @property(nonatomic, strong) CATextLayer *text, *badge_text;
 @property(nonatomic, strong) CALayer *icon;
@@ -282,8 +285,13 @@ static void open_settings(void);
         t.alignmentMode = kCAAlignmentCenter;
         t.contentsScale = UIScreen.mainScreen.scale;
     }
-    for (CALayer *l in @[b.back, b.symbol, b.text, b.icon, b.badge, b.badge_text]) [b.group addSublayer:l];
+    for (CALayer *l in @[b.back, b.symbol, b.text, b.icon]) [b.group addSublayer:l];
     [self.layer addSublayer:b.group];
+    // The badge's symbol goes over its dark disc. It used to share the button's symbol layer, which lay under the disc, so only a trace of it showed through.
+    b.badge_group = [CALayer layer];
+    b.badge_symbol = [CAShapeLayer layer];
+    for (CALayer *l in @[b.badge, b.badge_symbol, b.badge_text]) [b.badge_group addSublayer:l];
+    [self.layer addSublayer:b.badge_group];
     return b;
 }
 
@@ -452,8 +460,8 @@ static void open_settings(void);
     [super layoutSubviews];
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    for (PadButton *b in buttons) b.group.frame = self.bounds;
-    close_button.group.frame = self.bounds;
+    for (PadButton *b in buttons) b.group.frame = b.badge_group.frame = self.bounds;
+    close_button.group.frame = close_button.badge_group.frame = self.bounds;
     [CATransaction commit];
     if (!CGSizeEqualToSize(self.bounds.size, laid_out)) {
         laid_out = self.bounds.size;
@@ -475,7 +483,7 @@ static void open_settings(void);
     b.back.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.x - r, c.y - r, r * 2, r * 2)].CGPath;
     b.back.lineWidth = self.editing && b == selected ? 3 : MAX(1.5, r * 0.05);
     b.back.lineDashPattern = self.editing ? @[@6, @4] : nil;
-    b.symbol.hidden = b.text.hidden = b.icon.hidden = b.badge.hidden = b.badge_text.hidden = YES;
+    b.symbol.hidden = b.text.hidden = b.icon.hidden = b.badge.hidden = b.badge_symbol.hidden = b.badge_text.hidden = YES;
     b.tint = 0;
     BOOL aiming = NO;
     for (PadButton *o in buttons)
@@ -518,25 +526,30 @@ static void open_settings(void);
             b.icon_mask.contents = (__bridge id)img.CGImage;
         }
         if (style == STYLE_ICONS && (d->shape != SH_NONE || *d->ps)) {
+            // A dark disc with a light rim: the rim shows it on a dark picture, the disc on a light one.
             CGPoint bc = CGPointMake(c.x + r * 0.72, c.y + r * 0.72);
-            CGFloat br = MAX(8, r * 0.3);
+            CGFloat br = MAX(10, r * 0.36);
             b.badge.hidden = NO;
             b.badge.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(bc.x - br, bc.y - br, br * 2, br * 2)].CGPath;
-            b.badge.fillColor = [UIColor colorWithWhite:0 alpha:0.75].CGColor;
-            b.badge.strokeColor = UIColor.clearColor.CGColor;
+            b.badge.fillColor = [UIColor colorWithWhite:0 alpha:0.85].CGColor;
+            b.badge.strokeColor = [UIColor colorWithWhite:1 alpha:0.6].CGColor;
+            b.badge.lineWidth = 1;
             if (d->shape != SH_NONE) {
-                b.symbol.hidden = NO;
-                b.symbol.path = ps_shape(d->shape, bc, br * 0.48).CGPath;
-                b.symbol.fillColor = UIColor.clearColor.CGColor;
-                b.symbol.strokeColor = rgb(d->ps_color, 1).CGColor;
-                b.symbol.lineWidth = 1.6;
+                b.badge_symbol.hidden = NO;
+                b.badge_symbol.path = ps_shape(d->shape, bc, br * 0.5).CGPath;
+                b.badge_symbol.fillColor = UIColor.clearColor.CGColor;
+                b.badge_symbol.strokeColor = rgb(d->ps_color, 1).CGColor;
+                b.badge_symbol.lineWidth = MAX(2, br * 0.18);
+                b.badge_symbol.lineCap = kCALineCapRound;
+                b.badge_symbol.lineJoin = kCALineJoinRound;
             } else {
+                CGFloat font = strlen(d->ps) > 1 ? br * 0.95 : br * 1.1;
                 b.badge_text.hidden = NO;
                 b.badge_text.string = @(d->ps);
-                b.badge_text.fontSize = br * 0.9;
-                b.badge_text.font = (__bridge CFTypeRef)[UIFont systemFontOfSize:br * 0.9 weight:UIFontWeightBold];
+                b.badge_text.fontSize = font;
+                b.badge_text.font = (__bridge CFTypeRef)[UIFont systemFontOfSize:font weight:UIFontWeightHeavy];
                 b.badge_text.foregroundColor = UIColor.whiteColor.CGColor;
-                b.badge_text.frame = CGRectMake(bc.x - br, bc.y - br * 0.6, br * 2, br * 1.3);
+                b.badge_text.frame = CGRectMake(bc.x - br, bc.y - font * 0.62, br * 2, font * 1.3);
             }
         }
     }
@@ -550,12 +563,18 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
     if (b == close_button) o = MAX(0.7, o);
     return b.holders > 0 ? MAX(o, 0.95) : o;
 }
+// The badge in the corner fades less than its button, so it still says which of the pad's buttons this is.
+- (CGFloat)badgeOpacityOf:(PadButton *)b {
+    CGFloat o = [self opacityOf:b];
+    return self.editing ? o : MAX(o, 0.9);
+}
 - (void)colorButton:(PadButton *)b {
     BOOL down = b.holders > 0;
     float ink = b.ink;
     BOOL lit = b.def->control == C_RT && b.kind == KIND_BAT;  // R2 while aiming: lit up, to show where to throw
     UIColor *fg = ink_color(ink, 1);
     b.group.opacity = [self opacityOf:b];
+    b.badge_group.opacity = [self badgeOpacityOf:b];
     b.back.fillColor = (down ? ink_color(ink, 0.55) : ink_color(1 - ink, 0.5)).CGColor;
     b.back.strokeColor = (self.editing && b.hiddenByPlayer ? rgb(0xE86A6A, 0.95)
                           : lit                          ? rgb(0x7FB2E5, 1)
@@ -584,12 +603,13 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
         [self placeButton:b];
         BOOL show = b == close_button ? in_menu && !self.editing && !photo : self.editing || (!in_menu && !photo && !b.hiddenByPlayer);
         b.shown = show;
-        b.group.hidden = !show;
+        b.group.hidden = b.badge_group.hidden = !show;
         if (!show) {
             b.holders = 0;
             continue;
         }
         b.group.opacity = [self opacityOf:b];
+        b.badge_group.opacity = [self badgeOpacityOf:b];
         [self drawButton:b style:style];
         [self colorButton:b];
     }
@@ -829,9 +849,6 @@ static UIView *gear_view;
     CGRect g = rt_ios_game_rect();
     if (!CGRectContainsPoint(g, p)) return;
     rt_ios_click((p.x - g.origin.x) / g.size.width, (p.y - g.origin.y) / g.size.height);
-    // For seeing where the game draws its cursor: the frame a moment after the click, and after the cursor has gone to the corner (Documents/Shots).
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ rt_request_snapshot("tap-1-after-click"); });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1700 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ rt_request_snapshot("tap-2-cursor-parked"); });
 }
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     for (UITouch *t in touches) {
