@@ -19,7 +19,12 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
   haptics engine is retried there since 2026-11-07, never felt with a pad connected. Then the phone: Feral's code goes through IOHIDDevice and
   ForceFeedback, which has to become GameController haptics.
 - **MetalFX** (confirmed wanted, 2026-11-08, for later): spatial upscaling first, the phone rendering below its 1424 x 1000.
-- **The cryptographic sequencer by touch.**
+- **The cryptographic sequencer by touch** ("Секвенатор кода", a gadget later in the story: its "Tune Frequency" mini-game takes both sticks
+  at once, and the touch controls have one stick and the swipe as the mouse). The owner's design (2026-11-08): two touch sticks while the
+  mini-game is up. To find out first: how to tell that it's up (the game's own input actions or interface for it, or the game starting to read
+  the right stick).
+- **Low Power Mode** (2026-11-08): with it on, the phone made about 50 frames a second at the limit of 60 and showed 46 (v20's log).
+  iOS lowers the processor's clock and the game's threads can't keep up. Possible: say so in the frame rate line when it's on.
 - **Resolution and MSAA as settings** (the phone renders at half its screen's pixels, 1424 x 1000).
 - **Better anti-aliasing and upscaling:** FXAA with the game's MSAA (FXAA is in), MetalFX (spatial first; temporal needs jitter and motion
   vectors), TAA, possibly SMAA.

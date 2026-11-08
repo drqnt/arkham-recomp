@@ -537,3 +537,10 @@ app goes to the background.
 - **The inner screen upright:** v19's log has the phone held on its left side turning the app upright, and on its right side not. iOS refuses
   upside-down portrait on iPhone whatever the app allows, and for the inner screen that is one of the two upright ways.
 - `docs/WISHLIST.md` keeps the owner's open wishes and what has been done, so that none is lost between rounds.
+- **v20 on the phone** (the user's log, 337 s):
+  - The startup throw's handler is left 40 ms after the throw, against 2.5 s: the first frame came at 6.05 s instead of 8.28 s.
+  - At the limit of 60 for 267 s: 59.9 frames made and 59.7 shown a second. One went missing in 15 seconds, against 42 of 135 in v19.
+    Off the step 0.4 a second, gaps 16.7 ms.
+  - Folding and unfolding (149 to 192 s) left it even.
+  - The user: "по FPS всё стало намного лучше и стабильнее", and folding is fine.
+  - With Low Power Mode on: about 50 made and 46 shown.
