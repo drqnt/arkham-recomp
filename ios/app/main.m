@@ -53,13 +53,15 @@ static void settings(void) {
     [d setBool:rt_ios_hud_at_launch forKey:@"MetalForceHudEnabled"];
     if (rt_ios_hud_at_launch) setenv("MTL_HUD_ENABLED", "1", 1);
     // The first launch of each new build samples every thread through the startup (hitch.c), so that its log shows where the black seconds go
-    // without a launch from the Mac. A build is known by its executable's time.
+    // without a launch from the Mac. Then again from 90 to 110 s, by then most likely in play, once every 2 s: what the game's own threads do there,
+    // for making them faster (the Mac's profile doesn't name the translated functions). A build is known by its executable's time.
     NSDate *built = [NSFileManager.defaultManager attributesOfItemAtPath:NSBundle.mainBundle.executablePath error:nil].fileModificationDate;
     if (built && [d doubleForKey:@"profiledBuild"] != built.timeIntervalSince1970 && !getenv("ARKHAM_TRACE_PROFILE")) {
         [d setDouble:built.timeIntervalSince1970 forKey:@"profiledBuild"];
         setenv("ARKHAM_TRACE_PROFILE", "0.5", 1);
         setenv("ARKHAM_TRACE_PROFILE_FOR", "10", 1);
-        fprintf(stderr, "[ios] the first launch of this build: where every thread is, every half second for the first 10 s\n");
+        setenv("ARKHAM_TRACE_PROFILE_PLAY", "90:20:2", 1);
+        fprintf(stderr, "[ios] the first launch of this build: where every thread is, every half second for the first 10 s, and every 2 s from 90 to 110 s\n");
     }
 }
 
@@ -204,10 +206,20 @@ CGRect rt_ios_game_rect(void) {
     [CATransaction commit];
     CGSize s = self.view.bounds.size;
     if (!CGSizeEqualToSize(s, laid_out)) {
+        BOOL first = CGSizeEqualToSize(laid_out, CGSizeZero);
         laid_out = s;
         UIEdgeInsets in = self.view.safeAreaInsets;
         fprintf(stderr, "[ios] the view is %.0f x %.0f points (safe area insets top %.0f left %.0f bottom %.0f right %.0f), the game's picture %.0f x %.0f at %.0f,%.0f\n",
                 s.width, s.height, in.top, in.left, in.bottom, in.right, g.size.width, g.size.height, g.origin.x, g.origin.y);
+        // Turned or folded: once it has settled, a new layer for the game (mtl_device.m says why). A turn and back within the wait makes one.
+        if (!first) {
+            static unsigned changes;
+            unsigned mine = ++changes;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+                void rt_mtl_new_layer(void);
+                if (mine == changes) rt_mtl_new_layer();
+            });
+        }
     }
 }
 @end

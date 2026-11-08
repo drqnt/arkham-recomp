@@ -286,6 +286,8 @@ typedef struct Exc {
     int have_handler;
     unw_cursor_t resume;
     struct Exc *next_caught;
+    u64 thrown_ns;  // when it was thrown, for the note at its handler (phase2)
+    int cleanups;   // cleanup landing pads run on the way
 } Exc;
 #define EXC_TAG 0xE4C0DE11u
 static __thread Exc *caught_top;
@@ -487,7 +489,19 @@ _Noreturn static void phase2(CPU *c, Exc *e) {
                 unw_word_t target = 0;
                 unw_get_reg(&run.resume, UNW_REG_SP, &target);
                 run.prev = run_top;
-                while (run.prev && (uintptr_t)run.prev < target) run.prev = run.prev->prev;
+                u64 w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), steps = 0;
+                while (run.prev && (uintptr_t)run.prev < target) {
+                    run.prev = run.prev->prev;
+                    steps++;
+                }
+                // The startup's one throw took 2.5 s on the phone before this point, all of it in phase2's own code (v15/v16 profiles, 2026-11-08):
+                // what each of the first throws spent on the way to its handler.
+                static _Atomic int told;
+                if (atomic_fetch_add(&told, 1) < 8) {
+                    u64 w1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+                    fprintf(stderr, "[eh] a throw of %s reaches its handler %d frames up, %.1f ms after it was thrown, %d cleanups on the way; the walk over running handlers: %llu steps, %.1f ms\n",
+                            ti_name(e->ti), e->frame, (double)(w0 - e->thrown_ns) / 1e6, e->cleanups, steps, (double)(w1 - w0) / 1e6);
+                }
                 run_top = &run;
                 rt_dispatch(c, cs.lp);
                 // The function holding the handler has returned: continue in its native caller.
@@ -496,6 +510,7 @@ _Noreturn static void phase2(CPU *c, Exc *e) {
                 rt_trap(c, cs.lp, "unw_resume failed");
             }
             if (kind == 2) {
+                e->cleanups++;
                 set_guest_regs(c, &e->ctx, e->obj, 0);
                 rt_dispatch(c, cs.lp);
                 rt_trap(c, cs.lp, "cleanup landing pad returned");
@@ -525,6 +540,7 @@ static void raise_exception(CPU *c, Exc *e) {
     e->have_handler = 0;
     uncaught++;
     u64 t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    e->thrown_ns = t0;
     // Phase 1: find the handler without changing anything.
     Ctx x = top;
     int frame = 0;

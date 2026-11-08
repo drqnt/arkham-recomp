@@ -144,6 +144,21 @@ static const char *sym_of(u64 pc) {
     Dl_info di;
     return dladdr((void *)pc, &di) && di.dli_sname ? di.dli_sname : "?";
 }
+// The innermost frame of a profile line. In the runtime's own code it also gets the offset into its function, to 16 bytes, which tells a loop
+// from the rest of the function. That was needed when the startup's 2.5 s on the phone showed only as "phase2" (eh.c).
+// Not for translated functions (F_) or the system's, where the name says enough.
+static const char *leaf_of(u64 pc, char *buf, size_t cap) {
+    Dl_info di;
+    if (!dladdr((void *)pc, &di) || !di.dli_sname) return "?";
+    static const void *main_base;
+    if (!main_base) {
+        Dl_info me;
+        if (dladdr((void *)leaf_of, &me)) main_base = me.dli_fbase;
+    }
+    if (di.dli_fbase != main_base || !strncmp(di.dli_sname, "F_", 2)) return di.dli_sname;
+    snprintf(buf, cap, "%s+0x%llx", di.dli_sname, (unsigned long long)((pc - (u64)(uintptr_t)di.dli_saddr) & ~15ull));
+    return buf;
+}
 static int is_waiting(const char *s) {
     static const char *const names[] = {"__psynch_cvwait", "__ulock_wait", "__ulock_wait2", "mach_msg2_trap", "__semwait_signal", "__workq_kernreturn",
                                         "semaphore_wait_trap", "semaphore_timedwait_trap", "kevent_id", "__select", "__psynch_mutexwait", "start_wqthread", NULL};
@@ -266,11 +281,15 @@ static void stall_check(u64 frame) {
 // ARKHAM_TRACE_PROFILE=s: every s seconds, half a second of samples of every thread, waiting or not, and where each one was most often: in steady play,
 // what a thread waits for is what holds the frame rate.
 static u64 profile_ticks, profile_last, profile_until;  // ARKHAM_TRACE_PROFILE_FOR=s: only for the first s seconds, as for a startup
+// ARKHAM_TRACE_PROFILE_PLAY=from:for:every, in seconds after the start: a second window once the first is over, as for play.
+// The phone's first launch of a build takes 90:20:2, the game being in play by then, with a block only every 2 s so as to slow it less.
+static u64 play_from, play_for, play_every;
 static void describe_full(const Track *tr, u32 s, char *out, size_t cap) {
     size_t len = 0;
     int shown = 0;
     for (u32 i = 0; i < tr->depth[s] && shown < 7 && len + 60 < cap; i++) {
-        const char *f = sym_of(tr->stack[s][i]);
+        char leaf[160];
+        const char *f = i ? sym_of(tr->stack[s][i]) : leaf_of(tr->stack[s][i], leaf, sizeof leaf);
         if (i && !strcmp(f, "?")) continue;
         len += (size_t)snprintf(out + len, cap - len, "%s%s", shown ? " < " : "", f);
         shown++;
@@ -279,11 +298,19 @@ static void describe_full(const Track *tr, u32 s, char *out, size_t cap) {
 static void profile_check(void) {
     u64 now = mach_absolute_time();
     if (profile_until && now > profile_until) {
+        if (play_from) {
+            profile_ticks = play_every;
+            profile_last = play_from - play_every;  // the first block at play_from
+            profile_until = play_from + play_for;
+            play_from = 0;
+            fprintf(stderr, "[profile] done for now; again in play\n");
+            return;
+        }
         profile_ticks = 0;
         fprintf(stderr, "[profile] done\n");
         return;
     }
-    if (now - profile_last < profile_ticks) return;
+    if (now < profile_last || now - profile_last < profile_ticks) return;
     profile_last = now;
     refresh_threads();
     for (int i = 0; i < 100; i++) {
@@ -378,6 +405,14 @@ void rt_hitch_start(void) {
         profile_last = mach_absolute_time();
         const char *for_s = getenv("ARKHAM_TRACE_PROFILE_FOR");
         if (for_s && atof(for_s) > 0) profile_until = profile_last + (u64)(atof(for_s) * 1e9 * tb.denom / tb.numer);
+        double from = 0, len = 0, every = 0;
+        const char *play = getenv("ARKHAM_TRACE_PROFILE_PLAY");
+        if (profile_until && play && sscanf(play, "%lf:%lf:%lf", &from, &len, &every) == 3 && len > 0 && every > 0) {
+            u64 s = (u64)(1e9 * tb.denom / tb.numer);  // ticks a second
+            play_from = profile_last + (u64)(from * s);
+            play_for = (u64)(len * s);
+            play_every = (u64)(every * s);
+        }
     }
     if (!tracks_for_late && !stall_ticks && !profile_ticks) return;
     tracks = calloc(MAX_THREADS, sizeof *tracks);

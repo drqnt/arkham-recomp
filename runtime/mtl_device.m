@@ -2535,12 +2535,7 @@ static _Atomic int layer_asked;
 #if TARGET_OS_IPHONE
 // The app shell's view the game draws into (ios/app), set before the game starts.
 UIView *rt_ios_game_view;
-static void make_layer_on_main(void) {
-    UIView *content = rt_ios_game_view;
-    if (!content) {
-        atomic_store(&layer_asked, 0);  // the shell isn't up yet: the next frame asks again
-        return;
-    }
+static CAMetalLayer *new_game_layer(UIView *content) {
     CAMetalLayer *l = [CAMetalLayer layer];
     l.device = dev;
     l.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -2560,10 +2555,44 @@ static void make_layer_on_main(void) {
         if (@available(iOS 16.0, *)) l.developerHUDProperties = @{@"mode": @"default", @"logging": @"default"};
         fprintf(stderr, "[mtl] Metal HUD on\n");
     }
+    return l;
+}
+static void make_layer_on_main(void) {
+    UIView *content = rt_ios_game_view;
+    if (!content) {
+        atomic_store(&layer_asked, 0);  // the shell isn't up yet: the next frame asks again
+        return;
+    }
+    CAMetalLayer *l = new_game_layer(content);
     [content.layer insertSublayer:l atIndex:0];  // under the app shell's own views: the frame rate line, and controls drawn over the game
     layer = [l retain];
     fprintf(stderr, "[mtl] drawing into a layer on the app's view, %.0f x %.0f points at %.0fx\n", content.bounds.size.width, content.bounds.size.height, l.contentsScale);
     atomic_store(&layer_ready, 1);
+}
+// After the phone turns or folds, a new layer in place of the old (main thread; ios/app/main.m calls it once the view has settled at a new size).
+// Seen on the phone, 2026-11-08: turned upright and back, the layer kept its place and size, but iOS no longer held each frame for the limit's step.
+// Frames came 25 and 8.3 ms apart again, a third of them off the step, to the end of the run; before the turn, none for a minute.
+// A layer made then, as at the start, should be held as at the start. The new one goes under the old, so there is no black frame.
+// The old one leaves a moment later, once frames reach the new one. It is let go only at the next change: the drawable thread may still be using it.
+void rt_mtl_new_layer(void) {
+    UIView *content = rt_ios_game_view;
+    if (!atomic_load(&layer_ready) || !content || !layer) return;
+    CAMetalLayer *old = layer, *l = new_game_layer(content);
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [content.layer insertSublayer:l atIndex:0];
+    [CATransaction commit];
+    layer = [l retain];
+    static CAMetalLayer *retired;
+    [retired release];
+    retired = old;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        [old removeFromSuperlayer];
+        [CATransaction commit];
+    });
+    fprintf(stderr, "[mtl] a new layer for the game's picture, the view having changed\n");
 }
 #else
 static void log_views(NSView *v, int depth) {
@@ -2840,9 +2869,10 @@ static _Atomic u32 drawable_w, drawable_h;
 static _Atomic(void *) ready_drawable;
 static dispatch_semaphore_t drawable_wanted;
 static id<CAMetalDrawable> fetch_drawable(void) {
+    CAMetalLayer *l = layer;  // read once: the phone may put a new layer in its place (rt_mtl_new_layer)
     CGSize want = CGSizeMake(atomic_load(&drawable_w), atomic_load(&drawable_h));
-    if (!CGSizeEqualToSize(layer.drawableSize, want)) layer.drawableSize = want;
-    return [layer nextDrawable];
+    if (!CGSizeEqualToSize(l.drawableSize, want)) l.drawableSize = want;
+    return [l nextDrawable];
 }
 static void *drawable_main(void *unused) {
     (void)unused;
