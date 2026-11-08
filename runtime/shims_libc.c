@@ -833,7 +833,23 @@ static int trace_fs_early(void) { return getenv("ARKHAM_TRACE_FS") != NULL; }
 //   that line from Steam's language at every start, which for the Mac version is only ever English. Feral's own windows stay in English, all they come in.
 // - bSmoothFrameRate, the engine's own frame limit at MaxSmoothedFrameRate (62), off unless ARKHAM_FRAME_LIMIT=1 (rt_no_frame_limit); a first start
 //   on a new machine writes it on. ARKHAM_FPS_CAP is the runtime's own limit.
+// - The [FullScreenMovie] StartupMovies lines left out (skip_intro).
+//   Those are the films played at every start, about half a minute in all: Feral's logo, the game's, Unreal's, the legal text and Install.
+//   With none listed, the engine has no film to wait for and goes on to its menu as soon as that is loaded.
 extern int rt_no_frame_limit;
+// On the phone the films are left out unless ARKHAM_INTRO=1. On the Mac, where the scripted runs click through them, only with ARKHAM_INTRO=0.
+static int skip_intro(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("ARKHAM_INTRO");
+#if TARGET_OS_IPHONE
+        on = !(v && *v == '1');
+#else
+        on = v && *v == '0';
+#endif
+    }
+    return on;
+}
 // The input settings as the engine reads them with open() (BaseInput.ini, DefaultInput.ini, BmInput.ini, UserInput.ini), changed in the text it reads
 // and kept on disk as they are. On the phone, where the mouse is the touch camera (rt_touch_mouse, shims_sys.c):
 // - MouseSensitivity at a quarter of the game's 30. The pointer moves in whole pixels, and four times as many of them for the same turn let a slow
@@ -1002,7 +1018,7 @@ static FILE *language_ini(const char *path, const char *mode) {
     if (mode[0] != 'r' || n < t || strcmp(path + n - t, tail)) return NULL;
     for (size_t i = 0; lang && i < sizeof codes / sizeof codes[0]; i++)
         if (!strcmp(lang, codes[i][0])) ue = codes[i][1];
-    if (!ue && !rt_no_frame_limit) return NULL;
+    if (!ue && !rt_no_frame_limit && !skip_intro()) return NULL;
     FILE *in = fopen(path, "rb");
     if (!in) return NULL;
     fseek(in, 0, SEEK_END);
@@ -1013,11 +1029,13 @@ static FILE *language_ini(const char *path, const char *mode) {
     fclose(in);
     text[got] = 0;
     size_t o = 0;
+    int films = 0;
     for (char *line = text; *line;) {
         char *end = strchr(line, '\n');
         size_t len = end ? (size_t)(end - line + 1) : strlen(line);
         if (ue && !strncmp(line, "Language=", 9)) o += (size_t)sprintf(out + o, "Language=%s\n", ue);
         else if (rt_no_frame_limit && !strncmp(line, "bSmoothFrameRate=", 17)) o += (size_t)sprintf(out + o, "bSmoothFrameRate=FALSE\n");
+        else if (skip_intro() && !strncmp(line, "StartupMovies=", 14)) films++;
         else {
             memcpy(out + o, line, len);
             o += len;
@@ -1026,6 +1044,8 @@ static FILE *language_ini(const char *path, const char *mode) {
     }
     free(text);
     if (ue) fprintf(stderr, "[lang] the engine reads Language=%s\n", ue);
+    static int told_films;
+    if (films && !told_films++) fprintf(stderr, "[intro] the engine reads BmEngine.ini without its %d startup films\n", films);
     return fmemopen(out, o, "r");  // the buffer lives as long as the process: the engine reads this file a few times at start
 }
 #if TARGET_OS_IPHONE

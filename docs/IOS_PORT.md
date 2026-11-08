@@ -413,3 +413,32 @@ app goes to the background.
   - DualSense rumble on the phone;
   - the cryptographic sequencer with touch;
   - resolution and MSAA as settings.
+
+## v16: even frames, readable badges, no startup films, 2026-11-08
+
+- **The first launch's profile (v15):** the startup's open 2.5 s, between the Steam calls after the device is made (5.2 s) and the game
+  setting its cursor association (7.7 s), are the game thread in `runtime/eh.c`. It is in phase 2 of the one exception the game throws
+  at startup and catches itself; phase 1 and the native frame took 8 ms. The Mac goes through the same in about 0.1 s. Not found yet:
+  where in phase 2 the time goes (the profiler names static functions by the nearest symbol, so `phase2 < lsda_lookup` may be either).
+- **Frame pacing:** with the user's limit of 60, the game made an even 60 frames a second, but the phone showed them unevenly: in 5.5 min
+  of play a third of the frames stayed 8.3, 12.5, 20.8 or 25 ms instead of 16.7. The limit only slept to the next 1/60 s; frames then
+  reached the ProMotion display a little early or late, and a late one was followed by a short one. Now, with a limit, each frame is
+  presented with `presentDrawable:afterMinimumDuration:` at the limit's step (`present_paced`, `ARKHAM_MTL_PACE=0` for the old way). On the
+  Mac a limit now also turns the layer's display sync on, since a frame can only be held a step on a synced layer. The `[fps]` line
+  counts the frames that stayed off the step by more than 2 ms.
+  - Mac A/B, the same scripted run into the level, running forward while turning, limit 60: off the step 115 of 1560 frames (7.4%,
+    up to 20 in a second, gaps up to 25 ms) the old way, 0 the new way (longest gap 16.7 ms). The cost: from present to screen 37 ms
+    instead of 20, one frame waiting in the display's queue, which is what absorbs a late frame.
+  - Running on the phone the game makes 53 to 55 frames a second with the GPU busy 7 to 8 ms: that is the game thread, and evenness
+    can't fix it.
+- **Badges:** the PlayStation symbol in a button's corner was drawn by the button's own symbol layer, under the badge's 75% dark disc,
+  so only a trace of it showed, at the button's opacity besides. The badge (disc, symbol, name) is now a layer of its own over the button:
+  a disc with a light rim, a larger symbol with a thicker line, and at least 90% opacity whatever the button's transparency.
+- **A leftover removed:** each tap in the menus saved two screenshots (Documents/Shots), from finding where the game draws its cursor.
+- **No startup films:** the engine reads `[FullScreenMovie] StartupMovies` (feral, baa_logo_run_v5_h264, UTlogo, Legal, Install) from
+  BmEngine.ini; with none listed it has no film to wait for and shows its title screen as soon as that is loaded. On the phone they are
+  left out of the text it reads unless `ARKHAM_INTRO=1`; on the Mac only with `ARKHAM_INTRO=0`, since scripted runs click through them.
+  The engine writes BmEngine.ini back at each start from what it read, so the phone's copy loses those lines for good (bringing the
+  films back would need them written in again). The Mac check kept MacInit's copy and put it back after the run.
+  - Mac, no films: the engine starts at 7.2 s (after the launcher's scripted Play at 6 s), the first frame is at 11.7 s, and that is
+    already the title screen, Batman on the tower and "Щелкните, чтобы начать", with no black wait.
