@@ -18,14 +18,14 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
 - **Rumble, Mac and phone** (the owner confirmed it's wanted, 2026-11-08, for later). Nobody knows yet whether it works on the Mac: the
   haptics engine is retried there since 2026-11-07, never felt with a pad connected. Then the phone: Feral's code goes through IOHIDDevice and
   ForceFeedback, which has to become GameController haptics.
-- **MetalFX** (confirmed wanted, 2026-11-08, for later): spatial upscaling first, the phone rendering below its 1424 x 1000.
+- **MetalFX, temporal.** The spatial upscaler is in since v21. Temporal needs jitter and motion vectors; UE3 makes no motion vectors.
 - **The cryptographic sequencer by touch** ("Секвенатор кода", a gadget later in the story: its "Tune Frequency" mini-game takes both sticks
   at once, and the touch controls have one stick and the swipe as the mouse). The owner's design (2026-11-08): two touch sticks while the
   mini-game is up. To find out first: how to tell that it's up (the game's own input actions or interface for it, or the game starting to read
   the right stick).
 - **Low Power Mode** (2026-11-08): with it on, the phone made about 50 frames a second at the limit of 60 and showed 46 (v20's log).
   iOS lowers the processor's clock and the game's threads can't keep up. Possible: say so in the frame rate line when it's on.
-- **Resolution and MSAA as settings** (the phone renders at half its screen's pixels, 1424 x 1000).
+- **MSAA as a setting.** The game's resolution is one since v21 (high, medium, low: 0.5, 0.42, 0.375 of the screen's pixels).
 - **Better anti-aliasing and upscaling:** FXAA with the game's MSAA (FXAA is in), MetalFX (spatial first; temporal needs jitter and motion
   vectors), TAA, possibly SMAA.
 - **Speed:** the 300 FPS bar on the Mac (the Windows version gives about 350), game thread first, a second-generation translator in its own
@@ -38,6 +38,7 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
 
 ## Done, by version (phone)
 
+- v21: MetalFX spatial upscaling to the screen's pixels (on by default); the game's resolution as a setting.
 - v19 to v20: the occlusion query change made opt-in; the startup throw's resume done by the runtime itself; each turn of the phone logged.
 - v17 to v18: the map by touch (a drag moves it as far as the finger, two fingers zoom, a "Показать Бэтмена" button); a soft dark ring under
   each icon; the badges fade with their button; a new counter (shield) and fist; the picture-following colour removed; all four ways up

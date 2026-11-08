@@ -52,6 +52,10 @@ static void settings(void) {
     rt_ios_hud_at_launch = [d objectForKey:@"metalHUD"] ? [d doubleForKey:@"metalHUD"] > 0 : env_hud && *env_hud == '1';
     [d setBool:rt_ios_hud_at_launch forKey:@"MetalForceHudEnabled"];
     if (rt_ios_hud_at_launch) setenv("MTL_HUD_ENABLED", "1", 1);
+    // The settings' "MetalFX" (on by default) and "Разрешение игры", the share of the screen's pixels the game draws at (half by default),
+    // which the game takes only at its start (shims_cg.c, shims_libc.c).
+    if ([d objectForKey:@"metalFX"]) setenv("ARKHAM_METALFX", [d doubleForKey:@"metalFX"] > 0 ? "1" : "0", 1);
+    if ([d objectForKey:@"renderScale"]) setenv("ARKHAM_RENDER_SCALE", [NSString stringWithFormat:@"%.3f", [d doubleForKey:@"renderScale"]].UTF8String, 1);
     // The first launch of each new build samples every thread through the startup (hitch.c), so that its log shows where the black seconds go
     // without a launch from the Mac. A build is known by its executable's time. (v17 and v18 also sampled 90 to 110 s, in play, every 2 s: what the
     // render thread does there was found, and the sampling itself made play stutter, so ARKHAM_TRACE_PROFILE_PLAY is only on asking now.)
@@ -205,6 +209,11 @@ CGRect rt_ios_game_rect(void) {
     for (CALayer *l in self.view.layer.sublayers)
         if ([l isKindOfClass:CAMetalLayer.class]) l.frame = g;
     [CATransaction commit];
+    // The picture's size in the screen's pixels, for MetalFX to scale the game's frame up to (mtl_device.m).
+    void rt_mtl_set_screen_pixels(unsigned w, unsigned h);
+    CGFloat px = self.view.window.windowScene.screen.nativeScale;
+    if (px <= 0) px = 3;
+    rt_mtl_set_screen_pixels((unsigned)lround(g.size.width * px), (unsigned)lround(g.size.height * px));
     CGSize s = self.view.bounds.size;
     if (!CGSizeEqualToSize(s, laid_out)) {
         laid_out = s;

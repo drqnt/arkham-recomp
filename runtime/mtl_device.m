@@ -11,6 +11,7 @@
 #endif
 #import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
+#import <MetalFX/MetalFX.h>
 #import <QuartzCore/CABase.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include "d3d_shader.h"
@@ -3005,6 +3006,73 @@ static void watch_shown(id<CAMetalDrawable> dr);
 // stopped at 240 FPS, two frames a refresh of a 120 Hz display, and its render thread polled for the GPU in the meantime. So the frame is copied to a texture of our own in
 // the main queue, and a queue of its own waits for that and for the display, copies and presents. ARKHAM_MTL_ONE_QUEUE=1 brings the old way back.
 #define PRESENT_SLOTS 3
+// ---------- MetalFX ----------
+// The finished frame, drawn at a fraction of the screen's pixels, goes to the screen at all of them through MetalFX's spatial upscaler, instead of
+// being stretched by the system's compositor, which blurs. On the phone it follows the settings' "MetalFX" (on by default; ARKHAM_METALFX=0 or 1
+// at the start), and the game's own size is the settings' "Разрешение игры". On the Mac only with ARKHAM_METALFX=1, scaling the frame up by
+// ARKHAM_METALFX_SCALE (1.5), to try it there.
+static _Atomic int fx_on = -1;
+static _Atomic u32 fx_screen_w, fx_screen_h;  // the picture's size on the screen in pixels; the phone's app sets it as the picture moves
+static id<MTLFXSpatialScaler> fx_scaler;
+static u32 fx_in_w, fx_in_h, fx_out_w, fx_out_h;
+static MTLPixelFormat fx_in_format, fx_out_format;
+static id<MTLTexture> fx_out[PRESENT_SLOTS];
+void rt_set_metalfx(int on) { atomic_store(&fx_on, on ? 1 : 0); }
+void rt_mtl_set_screen_pixels(u32 w, u32 h) {
+    atomic_store(&fx_screen_w, w);
+    atomic_store(&fx_screen_h, h);
+}
+// The size to present a frame of bw x bh at: the screen's pixels when MetalFX is on and can scale up to them, else the frame's own. 1 for MetalFX.
+static int fx_target(u32 bw, u32 bh, u32 *ow, u32 *oh) {
+    *ow = bw;
+    *oh = bh;
+    if (atomic_load(&fx_on) < 0) {
+        const char *v = getenv("ARKHAM_METALFX");
+        atomic_store(&fx_on, v ? *v == '1' : TARGET_OS_IPHONE);
+    }
+    if (atomic_load(&fx_on) <= 0) return 0;
+    static int supported = -1;
+    if (supported < 0) {
+        supported = [MTLFXSpatialScalerDescriptor supportsDevice:dev];
+        if (!supported) fprintf(stderr, "[mtl] MetalFX's spatial upscaler isn't there on this GPU\n");
+    }
+    if (!supported) return 0;
+    u32 w = atomic_load(&fx_screen_w), h = atomic_load(&fx_screen_h);
+#if !TARGET_OS_IPHONE
+    if (!w) {
+        const char *s = getenv("ARKHAM_METALFX_SCALE");
+        double k = s ? atof(s) : 1.5;
+        w = (u32)(bw * k);
+        h = (u32)(bh * k);
+    }
+#endif
+    if (!w || !h || w < bw || h < bh || (w == bw && h == bh) || w > 16384 || h > 16384) return 0;  // not larger: nothing to scale up to
+    *ow = w;
+    *oh = h;
+    return 1;
+}
+// The upscaler for these sizes and formats, made again when one changes.
+static id<MTLFXSpatialScaler> fx_scaler_for(u32 iw, u32 ih, MTLPixelFormat inf, u32 ow, u32 oh, MTLPixelFormat outf) {
+    if (fx_scaler && fx_in_w == iw && fx_in_h == ih && fx_out_w == ow && fx_out_h == oh && fx_in_format == inf && fx_out_format == outf) return fx_scaler;
+    MTLFXSpatialScalerDescriptor *d = [MTLFXSpatialScalerDescriptor new];
+    d.colorTextureFormat = inf;
+    d.outputTextureFormat = outf;
+    d.inputWidth = iw;
+    d.inputHeight = ih;
+    d.outputWidth = ow;
+    d.outputHeight = oh;
+    d.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;  // the frame holds display colours, as an sRGB picture does
+    [fx_scaler release];
+    fx_scaler = [d newSpatialScalerWithDevice:dev];
+    [d release];
+    fx_in_w = iw, fx_in_h = ih, fx_out_w = ow, fx_out_h = oh, fx_in_format = inf, fx_out_format = outf;
+    for (int i = 0; i < PRESENT_SLOTS; i++) {
+        [fx_out[i] release];
+        fx_out[i] = nil;
+    }
+    fprintf(stderr, "[mtl] MetalFX: the game's %u x %u frame scaled up to %u x %u for the screen%s\n", iw, ih, ow, oh, fx_scaler ? "" : ", but the upscaler couldn't be made");
+    return fx_scaler;
+}
 static id<MTLCommandQueue> present_queue;
 static id<MTLEvent> present_event;
 static u64 present_value;
@@ -3025,18 +3093,27 @@ static void present_on_its_own_queue(void) {
     id<CAMetalDrawable> dr = take_drawable();
     if (!dr) return;
     id<MTLTexture> bb = back_buffer->tex;
-    // One made before a change of resolution has the old size. Letting it go makes the next one the right size.
-    if (dr.texture.width != bb.width || dr.texture.height != bb.height) {
+    u32 ow, oh;
+    int fx = fx_target((u32)bb.width, (u32)bb.height, &ow, &oh);
+    // One made before a change of resolution, or of MetalFX, has the old size. Letting it go makes the next one the right size.
+    if (dr.texture.width != ow || dr.texture.height != oh) {
         [dr release];
         return;
     }
     id<MTLTexture> copy = present_copy[slot];
-    if (!copy || copy.width != bb.width || copy.height != bb.height || copy.pixelFormat != bb.pixelFormat) {
+    MTLTextureUsage copy_usage = fx ? MTLTextureUsageShaderRead : 0;  // MetalFX reads it
+    if (!copy || copy.width != bb.width || copy.height != bb.height || copy.pixelFormat != bb.pixelFormat || copy.usage != copy_usage) {
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:bb.pixelFormat width:bb.width height:bb.height mipmapped:NO];
         d.storageMode = MTLStorageModePrivate;
-        d.usage = 0;
+        d.usage = copy_usage;
         [copy release];
         copy = present_copy[slot] = [dev newTextureWithDescriptor:d];
+    }
+    id<MTLFXSpatialScaler> scaler = fx ? fx_scaler_for((u32)bb.width, (u32)bb.height, bb.pixelFormat, ow, oh, dr.texture.pixelFormat) : nil;
+    if (fx && !scaler) {
+        [dr release];
+        rt_set_metalfx(0);  // couldn't be made: the plain way from the next frame
+        return;
     }
     atomic_store(&present_busy[slot], 1);
     ensure_cb();
@@ -3047,9 +3124,34 @@ static void present_on_its_own_queue(void) {
     [cb encodeSignalEvent:present_event value:v];
     id<MTLCommandBuffer> p = [present_queue commandBuffer];
     [p encodeWaitForEvent:present_event value:v];
-    b = [p blitCommandEncoder];
-    [b copyFromTexture:copy toTexture:dr.texture];
-    [b endEncoding];
+    if (scaler) {
+        // Straight into the drawable when it can take MetalFX's writes, else into a texture of our own and copied over.
+        MTLTextureUsage need = scaler.outputTextureUsage;
+        id<MTLTexture> out = (dr.texture.usage & need) == need ? dr.texture : nil;
+        if (!out) {
+            if (!fx_out[slot]) {
+                MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dr.texture.pixelFormat width:ow height:oh mipmapped:NO];
+                d.storageMode = MTLStorageModePrivate;
+                d.usage = need;
+                fx_out[slot] = [dev newTextureWithDescriptor:d];
+            }
+            out = fx_out[slot];
+        }
+        scaler.colorTexture = copy;
+        scaler.outputTexture = out;
+        scaler.inputContentWidth = bb.width;
+        scaler.inputContentHeight = bb.height;
+        [scaler encodeToCommandBuffer:p];
+        if (out != dr.texture) {
+            b = [p blitCommandEncoder];
+            [b copyFromTexture:out toTexture:dr.texture];
+            [b endEncoding];
+        }
+    } else {
+        b = [p blitCommandEncoder];
+        [b copyFromTexture:copy toTexture:dr.texture];
+        [b endEncoding];
+    }
     watch_shown(dr);
     present_paced(p, dr);
     [p addCompletedHandler:^(id<MTLCommandBuffer> done) {
@@ -3063,8 +3165,10 @@ static void present_on_its_own_queue(void) {
 static id<CAMetalDrawable> take_drawable(void) {
     static int vsync = -1;
     if (vsync < 0) vsync = getenv("ARKHAM_MTL_VSYNC") != NULL;
-    atomic_store(&drawable_w, back_buffer->width);
-    atomic_store(&drawable_h, back_buffer->height);
+    u32 ow, oh;
+    fx_target(back_buffer->width, back_buffer->height, &ow, &oh);  // the screen's pixels with MetalFX, else the frame's
+    atomic_store(&drawable_w, ow);
+    atomic_store(&drawable_h, oh);
     if (vsync) {
         u64 t0 = mach_absolute_time();
         id<CAMetalDrawable> dr = [fetch_drawable() retain];

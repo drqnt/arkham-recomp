@@ -1069,7 +1069,9 @@ static FILE *phone_prefs_data(const char *path, const char *mode) {
     char *text = calloc(1, (size_t)size + 1), *out = malloc((size_t)size + 64);
     size_t got = fread(text, 1, (size_t)size, in);
     fclose(in);
-    int want[2] = {(int)(rt_ios_screen_w * rt_ios_screen_scale * 0.5) & ~7, (int)(rt_ios_screen_h * rt_ios_screen_scale * 0.5) & ~7};
+    double rt_ios_render_scale(void);  // shims_cg.c: the settings' "Разрешение игры", half the screen's pixels by default
+    double share = rt_ios_render_scale();
+    int want[2] = {(int)(rt_ios_screen_w * rt_ios_screen_scale * share) & ~7, (int)(rt_ios_screen_h * rt_ios_screen_scale * share) & ~7};
     static const char *const keys[2] = {"name=\"ScreenW\" type=\"integer\">", "name=\"ScreenH\" type=\"integer\">"};
     size_t o = 0, i = 0;
     int was[2] = {0, 0};

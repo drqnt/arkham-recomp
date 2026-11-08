@@ -544,3 +544,19 @@ app goes to the background.
   - Folding and unfolding (149 to 192 s) left it even.
   - The user: "по FPS всё стало намного лучше и стабильнее", and folding is fine.
   - With Low Power Mode on: about 50 made and 46 shown.
+
+## v21: MetalFX, and the game's resolution as a setting, 2026-11-08
+
+- **MetalFX's spatial upscaler between the frame and the screen.** The game's frame, drawn at a share of the screen's pixels, used to reach the
+  screen at its own size, stretched by the compositor. Now it is scaled up to all of the screen's pixels by `MTLFXSpatialScaler` (perceptual
+  colour, the frame as anti-aliased input after FXAA) on the present queue, straight into the drawable when that can take MetalFX's writes.
+  The drawable is then the screen's size.
+  - The app tells the runtime the picture's size in pixels whenever it moves (`rt_mtl_set_screen_pixels`).
+  - Nothing is scaled when the screen's pixels aren't larger than the frame, as on the outer screen.
+  - Settings, "Изображение": "MetalFX", on by default, at once. `ARKHAM_METALFX` sets it at the start. On the Mac, `ARKHAM_METALFX=1` and
+    `ARKHAM_METALFX_SCALE` (1.5) try it.
+- **Mac check** (2560 x 1600 scaled to 3840 x 2400): the game runs at 172 FPS with 120 a second on screen, as without it. The picture is right.
+  Apple's Metal HUD shows a MetalFX block: input 2560 x 1600, target 3840 x 2400, spatial.
+- **"Разрешение игры"** (high, medium, low): 0.5, 0.42 or 0.375 of the screen's pixels, taken at the next start. `ARKHAM_RENDER_SCALE` is
+  read by the preferences rewrite and by the display modes, which put that share first as the default. Feral takes back the default whenever
+  the size it kept isn't one of the modes.

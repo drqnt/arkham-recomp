@@ -38,6 +38,7 @@ void rt_ios_click(double share_x, double share_y);
 void rt_ios_park_cursor(void);
 void rt_set_fps_cap(double n);
 void rt_set_metal_hud(int on);
+void rt_set_metalfx(int on);  // mtl_device.m: the frame up to the screen's pixels through MetalFX
 extern int rt_ios_hud_at_launch;  // main.m: whether Apple's HUD was on for this process from its launch, which it needs to show at all
 void rt_set_async_pipelines(int on);  // mtl_device.m: new pipelines built off the game's thread
 void rt_ios_overlay_enable(int on);  // main.m: the frame rate line
@@ -1377,9 +1378,14 @@ static UIView *gear_view;
 
     [self section:@"Изображение"
            footer:@"Экран показывает не больше 120 кадров в секунду; ограничение 60 бережёт батарею и греет меньше. Без рывков: в месте, где вы ещё не были, "
-                  @"новый объект или эффект может появиться на кадр-другой позже, зато игра не замирает, пока видеокарта готовит его в первый раз."];
+                  @"новый объект или эффект может появиться на кадр-другой позже, зато игра не замирает, пока видеокарта готовит его в первый раз. "
+                  @"MetalFX дотягивает картинку игры до полного разрешения экрана — чётче, чем простое растяжение. Разрешение игры: высокое — половина "
+                  @"пикселей экрана, как было; среднее и низкое дают больше FPS, MetalFX дотягивает их сильнее. Разрешение меняется со следующего запуска."];
     double cap = setting(@"fpsCap", "ARKHAM_FPS_CAP", 0);
     [self choice:@"Ограничение FPS" items:@[@"30", @"60", @"120", @"Без ограничения"] value:cap <= 0 ? 3 : cap <= 30 ? 0 : cap <= 60 ? 1 : 2 action:@selector(capChanged:)];
+    [self toggle:@"MetalFX" on:setting(@"metalFX", "ARKHAM_METALFX", 1) > 0 action:@selector(metalFXChanged:)];
+    double share = setting(@"renderScale", "ARKHAM_RENDER_SCALE", 0.5);
+    [self choice:@"Разрешение игры" items:@[@"Высокое", @"Среднее", @"Низкое"] value:share >= 0.49 ? 0 : share >= 0.41 ? 1 : 2 action:@selector(renderScaleChanged:)];
     [self toggle:@"Без рывков в новых местах" on:setting(@"asyncPipelines", "ARKHAM_ASYNC_PIPELINES", 1) > 0 action:@selector(asyncChanged:)];
     [self toggle:@"Строка FPS и нагрева" on:setting(@"showFPS", "ARKHAM_FPS", 1) > 0 action:@selector(fpsLineChanged:)];
     [self toggle:@"Metal HUD (со следующего запуска)" on:setting(@"metalHUD", "ARKHAM_METAL_HUD", 0) > 0 action:@selector(hudChanged:)];
@@ -1463,6 +1469,19 @@ static UIView *gear_view;
 - (void)asyncChanged:(UISwitch *)s {
     set_setting(@"asyncPipelines", s.on);
     rt_set_async_pipelines(s.on);
+}
+- (void)metalFXChanged:(UISwitch *)s {
+    set_setting(@"metalFX", s.on);
+    rt_set_metalfx(s.on);
+}
+// The share of the screen's pixels the game draws at: half (1424 x 1000 on the inner screen), 0.42 and 0.375. The game takes it at its start.
+- (void)renderScaleChanged:(UISegmentedControl *)s {
+    static const double shares[] = {0.5, 0.42, 0.375};
+    set_setting(@"renderScale", shares[s.selectedSegmentIndex]);
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Разрешение игры" message:@"Поменяется при следующем запуске игры."
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 - (void)editLayout {
     [self.navigationController dismissViewControllerAnimated:YES completion:^{

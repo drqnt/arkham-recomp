@@ -15,7 +15,7 @@ ENV = dict(os.environ, DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer
 COMMON = ["-std=gnu11", "-fno-strict-aliasing", "-fwrapv", "-w", "-fno-stack-protector", "-fno-exceptions", "-funwind-tables",
           "-fno-math-errno", "-ffp-contract=off", "-mcpu=apple-m1", "-arch", "arm64", "-mmacosx-version-min=14.0",
           f"-I{ROOT}/runtime"]
-FRAMEWORKS = ["CoreFoundation", "CoreServices", "Foundation", "AppKit", "OpenGL", "ApplicationServices", "Carbon", "ImageIO", "CoreGraphics", "CoreText", "AudioToolbox", "AudioUnit", "CoreAudio", "Metal", "GameController", "CoreHaptics", "QuartzCore"]
+FRAMEWORKS = ["CoreFoundation", "CoreServices", "Foundation", "AppKit", "OpenGL", "ApplicationServices", "Carbon", "ImageIO", "CoreGraphics", "CoreText", "AudioToolbox", "AudioUnit", "CoreAudio", "Metal", "GameController", "CoreHaptics", "QuartzCore", "MetalFX"]
 
 
 EXTRA: list[str] = []

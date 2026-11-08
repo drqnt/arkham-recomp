@@ -71,13 +71,31 @@ SHIM(CGDisplayScreenSize) {
     memcpy(&c->edx, &h, 4);
 }
 SHIM(CGDisplayIDToOpenGLDisplayMask) { RET(1); }
-// The default and current mode is half the screen's pixels, which the game ran at over 100 FPS: Feral falls back to the default whenever the size it
-// kept isn't one of the modes, as after a start on the outer screen, and the full pixels took four times the GPU (shims_libc.c, phone_prefs_data).
-SHIM(CGDisplayCopyDisplayMode) { RET(cf_wrap(phone_mode(0.5, 1))); }
+// The share of the screen's pixels the game draws at: the settings' "Разрешение игры" (ARKHAM_RENDER_SCALE), half by default.
+// MetalFX takes the picture up to the screen's pixels (mtl_device.m).
+double rt_ios_render_scale(void) {
+    static double s = -1;
+    if (s < 0) {
+        const char *v = getenv("ARKHAM_RENDER_SCALE");
+        s = v ? atof(v) : 0.5;
+        if (!(s >= 0.3 && s <= 1.0)) s = 0.5;
+    }
+    return s;
+}
+// The default and current mode is that share, half the screen's pixels unless the settings say otherwise, which the game ran at over 100 FPS.
+// Feral falls back to the default whenever the size it kept isn't one of the modes, as after a start on the outer screen.
+// The full pixels took four times the GPU (shims_libc.c, phone_prefs_data).
+SHIM(CGDisplayCopyDisplayMode) { RET(cf_wrap(phone_mode(rt_ios_render_scale(), 1))); }
 SHIM(CGDisplayCopyAllDisplayModes) {
-    CFDictionaryRef modes[3] = {phone_mode(0.5, 1), phone_mode(0.75, 0), phone_mode(1.0, 0)};
-    CFArrayRef a = CFArrayCreate(NULL, (const void **)modes, 3, &kCFTypeArrayCallBacks);
-    for (int i = 0; i < 3; i++) CFRelease(modes[i]);
+    double s = rt_ios_render_scale();
+    CFDictionaryRef modes[4];
+    int n = 0;
+    modes[n++] = phone_mode(s, 1);
+    if (s != 0.5) modes[n++] = phone_mode(0.5, 0);
+    if (s != 0.75) modes[n++] = phone_mode(0.75, 0);
+    if (s != 1.0) modes[n++] = phone_mode(1.0, 0);
+    CFArrayRef a = CFArrayCreate(NULL, (const void **)modes, n, &kCFTypeArrayCallBacks);
+    for (int i = 0; i < n; i++) CFRelease(modes[i]);
     if (tracing()) fprintf(stderr, "[cg] display modes: %d x %d and two smaller\n", mode_int(cf_wrap(CFArrayGetValueAtIndex(a, 0)), CFSTR("w")), mode_int(cf_wrap(CFArrayGetValueAtIndex(a, 0)), CFSTR("h")));
     RET(cf_wrap(a));
 }

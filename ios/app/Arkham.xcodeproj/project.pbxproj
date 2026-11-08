@@ -177,7 +177,7 @@
 					"$(PROJECT_DIR)/../../build/ios/libarkham.a",
 					"-lz",
 					"-framework", UIKit, "-framework", Foundation, "-framework", CoreFoundation, "-framework", CFNetwork,
-					"-framework", Metal, "-framework", QuartzCore, "-framework", CoreGraphics, "-framework", CoreText, "-framework", ImageIO,
+					"-framework", Metal, "-framework", MetalFX, "-framework", QuartzCore, "-framework", CoreGraphics, "-framework", CoreText, "-framework", ImageIO,
 					"-framework", AVFoundation, "-framework", AudioToolbox, "-framework", CoreAudio,
 					"-framework", GameController, "-framework", CoreHaptics,
 					"-framework", CoreVideo, "-framework", CoreMedia, "-framework", Security,
