@@ -289,7 +289,7 @@ void rt_dispatch(CPU *c, u32 t) {
     guest_fn f = ht_lookup(t);
     if (__builtin_expect(f != NULL, 1)) {
         c->jt = t;
-        f(c);
+        f(c, RT_M);
         return;
     }
     if (t >= IMP_BASE && t < IMP_BASE + rt_import_n * IMP_STEP) {
@@ -322,7 +322,10 @@ void rt_dispatch(CPU *c, u32 t) {
     rt_trap(c, t, "indirect transfer to an unknown address (add it to config/roots.json)");
 }
 
-void rt_dispatch_jt(CPU *restrict c) { rt_dispatch(c, c->jt); }
+void rt_dispatch_jt(CPU *restrict c, u8 *restrict M) {
+    (void)M;
+    rt_dispatch(c, c->jt);
+}
 
 // Call a guest function from host code using the guest cdecl convention.
 static int rt_serial;  // ARKHAM_SERIAL=1 on a tools/build.py --serial binary: one guest thread at a time, for telling threading bugs from others

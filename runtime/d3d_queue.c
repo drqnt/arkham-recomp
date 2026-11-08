@@ -228,7 +228,7 @@ static inline void call_on_worker(CPU *w, guest_fn fn, const u32 *args, u32 top)
     esp -= 4;
     G32(esp) = RT_HOST_RETURN;
     w->esp = esp;
-    fn(w);
+    fn(w, RT_M);
 }
 // ARKHAM_SHADER_EXTRACT=out ARKHAM_SHADER_SOURCES=a;b: runs every shader in the game's shader caches through the layer's translator, once the
 // device exists, so that the programs it hands to OpenGL can be collected ahead of play (rt_pipe_capture_program), and exits.
@@ -580,7 +580,7 @@ u32 rt_d3dq_feral(CPU *c, const char *name, const u32 *args, int n) {
     esp -= 4;
     G32(esp) = RT_HOST_RETURN;
     c->esp = esp;
-    fn(c);
+    fn(c, RT_M);
     c->esp = saved;
     return c->eax;
 }
@@ -742,7 +742,8 @@ static void method_shim(CPU *c) { method_call(c, rt_dyn_cur_arg); }
 // Reached straight from rt_dispatch's table, through the vtable slot's address in c->jt: no search for the import, no thread-local variable.
 void rt_ht_add(u32 addr, guest_fn fn);
 u32 rt_dyn_arg_at(u32 addr);
-static void method_entry(CPU *c) {
+static void method_entry(CPU *c, u8 *m) {
+    (void)m;
     method_call(c, rt_dyn_arg_at(c->jt));
     c->esp += 4;  // the return address, which the import path pops for other imports
 }
@@ -780,7 +781,7 @@ static void method_call(CPU *c, u32 index) {
     // Calls the layer makes on itself, and calls while the queue isn't running, go straight through.
     if (c == worker_cpu || m->kind == K_LOCAL) {
         if (m->host) {
-            m->fn(c);
+            m->fn(c, RT_M);
             return;
         }
         rt_dispatch(c, m->orig);
@@ -983,7 +984,7 @@ void rt_d3dq_function(CPU *c, guest_fn body) {
         return;
     }
     if (c == worker_cpu || !ring) {
-        body(c);
+        body(c, RT_M);
         return;
     }
     static Method direct;
@@ -1026,7 +1027,7 @@ static void add_method(u32 vtable, u32 slot, const char *cls, const char *method
         void (*rt_mtl_method(const char *name, unsigned slot))(CPU *);
         void (*metal)(CPU *) = rt_mtl_method(m->name, slot);
         if (metal) {
-            m->fn = metal;
+            m->fn = (guest_fn)metal;  // takes the CPU only; the memory argument it's called with is left in its register
             m->host = 1;
             m->missing = metal == rt_mtl_missing;
             metal_on = 1;

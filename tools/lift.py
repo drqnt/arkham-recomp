@@ -511,7 +511,7 @@ class Emitter:
                 t = st[1]
         if not W.in_code(t):
             return f'SAVE;rt_trap(c,{hx(t)},"tail outside code");return;'
-        return f"SAVE;__attribute__((musttail)) return {self.fname(t)}(c);"
+        return f"SAVE;__attribute__((musttail)) return {self.fname(t)}(c,M);"
 
     def call(self, t: int, nxt: int) -> str:
         pre = f"esp-=4;R32(esp)={hx(nxt)};SAVE;"
@@ -530,7 +530,7 @@ class Emitter:
                 t = st[1]
         if not W.in_code(t):
             return f'{pre}rt_trap(c,{hx(t)},"call outside code");LOAD;'
-        return f"{pre}{self.fname(t)}(c);LOAD;"
+        return f"{pre}{self.fname(t)}(c,M);LOAD;"
 
     def jump(self, i: Ins, t: int) -> str:
         fn = self.fn
@@ -552,7 +552,7 @@ class Emitter:
                     leaders.add(t)
                 for tt in fn.tables.get(a, []):
                     leaders.add(tt)
-        out = [f"void F_{fn.addr:07x}(CPU *restrict c){{LOCALS;"]
+        out = [f"void F_{fn.addr:07x}(CPU *restrict c,u8 *restrict M){{LOCALS;"]
         pend = None
         for idx, a in enumerate(order):
             i = fn.reach[a]
@@ -632,8 +632,8 @@ class Emitter:
                 cases = "".join(f"case {hx(t)}:goto L_{t:x};" for t in sorted(set(tb)))
                 # A recovered table can be a false match on a tail call through a vtable, so a miss goes to the dispatcher.
                 return (f"POLL;{{u32 jt_={rd(o, 4)};switch(jt_){{{cases}"
-                        f"default:c->jt=jt_;SAVE;__attribute__((musttail)) return rt_dispatch_jt(c);}}}}")
-            return f"c->jt={rd(o, 4)};SAVE;__attribute__((musttail)) return rt_dispatch_jt(c);"
+                        f"default:c->jt=jt_;SAVE;__attribute__((musttail)) return rt_dispatch_jt(c,M);}}}}")
+            return f"c->jt={rd(o, 4)};SAVE;__attribute__((musttail)) return rt_dispatch_jt(c,M);"
         if mn in ("ret", "retn"):
             n = i.ops[0].val if i.ops else 0
             return f"esp+={4 + n}u;SAVE;return;"
@@ -696,14 +696,14 @@ def lift_shard(job):
         emit_module.plain_memory = False
         if f in EMPTY_FUNCTIONS:
             em.refs = set()
-            body = f"void F_{f:07x}(CPU *restrict c){{c->eax=0;c->esp+=4;}}"
+            body = f"void F_{f:07x}(CPU *restrict c,u8 *restrict M){{c->eax=0;c->esp+=4;}}"
         if f in D3D_QUEUE_FUNCTIONS:
-            body = body.replace(f"void F_{f:07x}(CPU *restrict c){{", f"static void H_{f:07x}(CPU *restrict c){{", 1)
-            body += f"\nvoid rt_d3dq_function(CPU *c, guest_fn body);\nvoid F_{f:07x}(CPU *restrict c){{rt_d3dq_function(c,H_{f:07x});}}"
+            body = body.replace(f"void F_{f:07x}(CPU *restrict c,u8 *restrict M){{", f"static void H_{f:07x}(CPU *restrict c,u8 *restrict M){{", 1)
+            body += f"\nvoid rt_d3dq_function(CPU *c, guest_fn body);\nvoid F_{f:07x}(CPU *restrict c,u8 *restrict M){{rt_d3dq_function(c,H_{f:07x});}}"
         if hooked:
             # The real body becomes H_xxx; F_xxx logs around it and may be overridden in the runtime.
-            body = body.replace(f"void F_{f:07x}(CPU *restrict c){{", f"static void H_{f:07x}(CPU *restrict c){{", 1)
-            body += (f"\nvoid F_{f:07x}(CPU *restrict c){{rt_hook_enter(c,{hx(f)});H_{f:07x}(c);rt_hook_leave(c,{hx(f)});}}")
+            body = body.replace(f"void F_{f:07x}(CPU *restrict c,u8 *restrict M){{", f"static void H_{f:07x}(CPU *restrict c,u8 *restrict M){{", 1)
+            body += (f"\nvoid F_{f:07x}(CPU *restrict c,u8 *restrict M){{rt_hook_enter(c,{hx(f)});H_{f:07x}(c,M);rt_hook_leave(c,{hx(f)});}}")
         bodies.append(body)
         decls |= em.refs
         defined.append(f"F_{f:07x}")
@@ -711,8 +711,8 @@ def lift_shard(job):
     decls -= set(defined)
     path = os.path.join(GEN, f"s_{shard:04x}.c")
     text = ['#include "rt.h"\n']
-    text += [f"void {d}(CPU*restrict);\n" for d in sorted(decls)]
-    text += [f"void {d}(CPU*restrict);\n" for d in defined]
+    text += [f"void {d}(CPU*restrict,u8*restrict);\n" for d in sorted(decls)]
+    text += [f"void {d}(CPU*restrict,u8*restrict);\n" for d in defined]
     text.append("\n".join(bodies))
     text.append("\n")
     blob = "".join(text)
@@ -738,7 +738,7 @@ def write_tables(world: World, bink: World, bink_base: int) -> None:
     with open(os.path.join(GEN, "fntab.c"), "w") as fh:
         fh.write('#include "rt.h"\n')
         for f in fnlist:
-            fh.write(f"void F_{f:07x}(CPU*restrict);\n")
+            fh.write(f"void F_{f:07x}(CPU*restrict,u8*restrict);\n")
         fh.write("const rt_fn_entry rt_fntab[] = {\n")
         for f in fnlist:
             fh.write(f"{{{f:#x}u,F_{f:07x}}},\n")

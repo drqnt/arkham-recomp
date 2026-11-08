@@ -50,13 +50,17 @@ typedef struct CPU {
     u32 *tsd;  // this thread's pthread_getspecific slots, set on first use
 } CPU;
 
-typedef void (*guest_fn)(CPU *restrict);
+// A translated function takes guest memory as a pointer of its own, restrict like the CPU's. The compiler then knows that the game's loads and stores
+// never touch the emulated registers, so it neither reloads a register after a guest store nor writes back a register nothing changed: with
+// memory as a constant address it had to assume both could be the same, and every function loaded all eight registers and stored all eight back.
+typedef void (*guest_fn)(CPU *restrict, u8 *restrict);
 typedef struct { u32 addr; guest_fn fn; } rt_fn_entry;
 typedef struct { u32 addr; u32 import; i32 addend; } rt_bind_entry;
 typedef struct { u32 vmaddr, vmsize, fileoff, filesize; } rt_seg_entry;
 
 // Guest memory has a fixed host address, so translated code needs no load to find it.
 #define RT_MEM_BASE 0x7000000000ull
+#define RT_M ((u8 *)RT_MEM_BASE)  // the second argument of every call to a translated function
 extern u8 *rt_mem;
 extern volatile u32 rt_gate_wait;
 extern int rt_no_frame_limit;
@@ -80,7 +84,7 @@ _Noreturn void rt_trap(CPU *c, u32 addr, const char *msg);
 _Noreturn void rt_unimpl(CPU *c, u32 addr, const char *msg);
 void rt_imp(CPU *c, u32 idx);
 void rt_dispatch(CPU *c, u32 target);
-void rt_dispatch_jt(CPU *restrict c);
+void rt_dispatch_jt(CPU *restrict c, u8 *restrict M);
 void rt_gate_yield(void);
 void rt_hook_enter(CPU *c, u32 addr);
 void rt_hook_leave(CPU *c, u32 addr);
@@ -124,7 +128,6 @@ typedef double __attribute__((aligned(1), may_alias)) f64a;
 #define GSBASE (c->gsbase)
 
 #define LOCALS                                                                                   \
-    u8 *const M = (u8 *)RT_MEM_BASE;                                                             \
     u32 eax = c->eax, ecx = c->ecx, edx = c->edx, ebx = c->ebx, esp = c->esp, ebp = c->ebp,      \
         esi = c->esi, edi = c->edi;                                                              \
     u32 cf = 0, zf = 0, sf = 0, of = 0, pf = 0, af = 0;                                          \

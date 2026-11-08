@@ -330,7 +330,8 @@ int rt_move_not_pad(void) {
     }
     return on;
 }
-static void input_axis_as_pad(CPU *c) {
+static void input_axis_as_pad(CPU *c, u8 *m) {
+    (void)m;
     u32 ret = G32(c->esp);
     if (mouse_as_pad() && (ret == 0x19df2eau || ret == 0x19df353u)) G32(c->esp + 0x20) = 1;
     if (rt_move_not_pad()) {
@@ -342,7 +343,7 @@ static void input_axis_as_pad(CPU *c) {
         }
     }
     c->jt = input_axis_at;
-    input_axis_orig(c);
+    input_axis_orig(c, RT_M);
 }
 static void install_mouse_as_pad(u32 bp2) {
     if (input_axis_orig || !(mouse_as_pad() || rt_move_not_pad()) || bp2 < 0x1000) return;

@@ -1592,7 +1592,8 @@ id rt_web_debug_delegate(void) { return web_debug_delegate(); }
 // once, as Play would. ARKHAM_SKIP_LAUNCHER=1 does the same on the Mac. It is only ever called through a vtable, so taking its place in the
 // dispatcher's table is enough.
 #define LAUNCHER_MODAL 0x2055740u
-static void launcher_play(CPU *c) {
+static void launcher_play(CPU *c, u8 *m) {
+    (void)m;
     u32 self = G32(c->esp + 4);
     fprintf(stderr, "[rt] launcher skipped: modal loop of %08x answered as Play, called from %08x\n", self, G32(c->esp));
     if (self) G8(self + 0x40) = 1;
