@@ -666,7 +666,7 @@ app goes to the background.
 - In it: `Steam` (answer.txt, what the Mac's Steam answered; the saves), `Logs` (run.txt), `Shaders`, `Shots`, `arkham.env`, and
   `Batman Arkham Asylum GOTY`, the game's own files (about 9 GB), which must stay where they are.
 
-## v29: the camera turned by the thumb holding the aim; the aim's camera up to ×15, 2026-11-09 (built 10:30, not installed yet)
+## v29: the camera turned by the thumb holding the aim; the aim's camera up to ×15, 2026-11-09 (installed 10:32)
 
 - **The aim thumb turns the camera.** The thumb holding the touch L2 (the gadget's aim) turns the camera as a swipe does, at the aim's speed.
   - Why: the owner keeps every button under the right thumb, so with the aim held there was no thumb left for the camera.
