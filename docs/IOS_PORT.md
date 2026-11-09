@@ -47,6 +47,13 @@ libraries and caches. A phone's screen and its render targets are smaller, so th
   game start. Achievements, stats and saves stay on the phone. The user would rather have no check at all; I won't write one that makes the answer up instead of asking
   Steam, and this way costs them nothing they don't already do. A refresh through AltStore keeps the app's data, so the answer stays.
 - **Reinstalling every 7 days** with the free account, through Xcode or AltStore, is the user's plan. Either needs the Mac and the internet to sign again.
+- **AltStore takes Batman's profile away (2026-11-09).** AltStore is on the phone under the same Apple account, and AltServer runs on the Mac. Each time AltStore
+  refreshes or installs through AltServer, it removes every free provisioning profile on the phone that isn't one of AltStore's own apps (AltServer's
+  ALTDeviceManager.mm, removeAllFreeProfilesExcludingBundleIdentifiers). That includes Batman's and the probe's profiles. The phone then says Batman is "no longer
+  available" and its profile is unavailable, though the profile's dates and the certificates are fine (Apple's OCSP said "good").
+  - The fix needs no rebuild. `xcrun devicectl device install app --device <UDID> $TMPDIR/arkham-app-build/Build/Products/Release-iphoneos/Arkham.app` puts the
+    same build back with its profile. The app's data stays: the game's files, saves and the Steam answer.
+  - Deleting the app instead would lose all of that.
 
 ## First build for iOS, 2026-11-07
 
