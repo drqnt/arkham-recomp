@@ -42,6 +42,8 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
 
 ## Done, by version (phone)
 
+- v29: the thumb holding the aim (L2) turns the camera too; "Камера при прицеле" up to ×15, and the owner's ×5 became ×15.
+- v28: the app's folder in the Files app and the Mac's Finder.
 - v27: the game's size from the inner screen even when started folded (it had drawn at 1016 x 696); the resolution as sizes in pixels,
   up to full (2848×2000).
 - v26: the gadgets' wheel as the game's own: eight gadgets with their pictures and Russian names, the diagonals for the four between the

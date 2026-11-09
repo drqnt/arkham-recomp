@@ -75,6 +75,12 @@ static const struct {
 // What a pixel of the game's mouse turns it, as the phone reads its settings (shims_libc.c: MouseSensitivity 7.5, no smoothing): 7.5 of the
 // engine's rotation units, 65536 to a turn. A scripted run on the Mac measured the same, at any speed (docs/IOS_PORT.md, controls v7).
 #define CAMERA_DEG_PER_PIXEL (7.5 * 360.0 / 65536.0)
+// While a gadget is aimed (L2 held), the swipe is this many times faster ("Камера при прицеле"). The default is 2.5. Since v29 the top is
+// 15, three times the old top of 5, which the owner still found slow.
+#define AIM_LOOK_DEFAULT 2.5
+#define AIM_LOOK_MAX 15.0
+// The thumb holding the aim turns the camera once it is this many points from where it pressed, so the press itself doesn't move the aim.
+#define AIM_TURN_AFTER 8.0
 
 // ---------- settings ----------
 static NSUserDefaults *prefs(void) { return NSUserDefaults.standardUserDefaults; }
@@ -91,6 +97,15 @@ static double setting(NSString *key, const char *env, double fallback) { return 
 // Written through at once: a game that's stopped from the Mac, or by iOS, gives the defaults no time to be saved later.
 static void set_setting(NSString *key, double v) {
     [prefs() setDouble:v forKey:key];
+    [prefs() synchronize];
+}
+// v29: the aim's camera goes up to 15 instead of 5. A setting left at the old top (the owner's 5) moves to the new top, once. The slider
+// stays at its end and turns three times as fast; lower settings stay as they were.
+static void upgrade_aim_setting(void) {
+    if ([prefs() boolForKey:@"aimCameraSpeedUpTo15"]) return;
+    id v = [prefs() objectForKey:@"aimCameraSpeed"];
+    if (v && [v doubleValue] >= 4.99) [prefs() setDouble:AIM_LOOK_MAX forKey:@"aimCameraSpeed"];
+    [prefs() setBool:YES forKey:@"aimCameraSpeedUpTo15"];
     [prefs() synchronize];
 }
 
@@ -300,6 +315,10 @@ static void open_settings(void);
     NSMapTable<UITouch *, NSNumber *> *tap_time;
     UITouch *stick_touch, *look_touch, *pan_touch, *wheel_touch;
     CGPoint stick_center, look_last, pan_last, pan_sum;
+    // The thumb holding the aim (L2) turns the camera too, so one thumb holds the aim and aims (the owner, v29).
+    UITouch *aim_touch;
+    CGPoint aim_start, aim_last;
+    BOOL aim_turning;  // it has gone far enough from where it pressed
     float lx, ly, rx, ry;
     BOOL running;  // the stick pushed past its edge
     BOOL panning;  // the touch outside play has moved far enough to be a drag
@@ -369,6 +388,7 @@ static void open_settings(void);
 
 - (instancetype)initWithFrame:(CGRect)frame {
     if (!(self = [super initWithFrame:frame])) return nil;
+    upgrade_aim_setting();
     self.multipleTouchEnabled = YES;
     self.backgroundColor = UIColor.clearColor;
     owners = [NSMapTable strongToStrongObjectsMapTable];
@@ -1108,6 +1128,11 @@ static UIView *gear_view;
             if (b == close_button && map_open) map_open = NO;  // the back button closes the map
             [owners setObject:b forKey:t];
             b.holders++;
+            if (b.def->control == C_LT && !aim_touch) {
+                aim_touch = t;
+                aim_start = aim_last = p;
+                aim_turning = NO;
+            }
             [self restyle];
             [tap impactOccurred];
             continue;
@@ -1196,24 +1221,39 @@ static UIView *gear_view;
             ry = (float)v.y;
             [self showStick:YES at:rstick_center knob:k];
         } else if (t == look_touch) {
-            // The camera: the thumb's travel as the game's mouse, as it comes. Right turns right; up looks up, unless the settings invert it.
-            CGPoint d = CGPointZero;
-            for (UITouch *c in [event coalescedTouchesForTouch:t] ?: @[t]) {
-                CGPoint q = [c locationInView:self];
-                d.x += q.x - look_last.x;
-                d.y += q.y - look_last.y;
-                look_last = q;
-            }
-            if (!in_menu) {
-                double k = setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT / CAMERA_DEG_PER_PIXEL;
-                // While a gadget is aimed (L2 held) the game turns the camera much more slowly for the same mouse travel (the owner, v23:
-                // "very, very slow, hard to aim"), so the swipe is scaled up then, by its own setting.
-                if ([self aiming]) k *= setting(@"aimCameraSpeed", "ARKHAM_TOUCH_AIM_LOOK", 2.5);
-                rt_touch_mouse(d.x * k, d.y * k * (setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 ? -1 : 1));
-            }
+            [self turnCamera:[self travelOf:t event:event since:&look_last]];
+        } else if (t == aim_touch) {
+            // The thumb holding the aim turns the camera once it has gone a few points from where it pressed. The travel up to there is
+            // left out, so the camera starts from rest. The aim stays held wherever the thumb goes, until it lifts.
+            CGPoint d = [self travelOf:t event:event since:&aim_last];
+            if (aim_turning)
+                [self turnCamera:d];
+            else if (hypot(p.x - aim_start.x, p.y - aim_start.y) > AIM_TURN_AFTER)
+                aim_turning = YES;
         }
     }
     [self send];
+}
+// How far a finger went since it was last seen, over all its touches in this event. *last moves on to where it is now.
+- (CGPoint)travelOf:(UITouch *)t event:(UIEvent *)event since:(CGPoint *)last {
+    CGPoint d = CGPointZero;
+    for (UITouch *c in [event coalescedTouchesForTouch:t] ?: @[t]) {
+        CGPoint q = [c locationInView:self];
+        d.x += q.x - last->x;
+        d.y += q.y - last->y;
+        *last = q;
+    }
+    return d;
+}
+// The camera turned by a finger's travel, as the game's mouse, as it comes; in play only. Right turns right; up looks up, unless the settings
+// invert it.
+- (void)turnCamera:(CGPoint)d {
+    if (in_menu) return;
+    double k = setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT / CAMERA_DEG_PER_PIXEL;
+    // While a gadget is aimed (L2 held) the game turns the camera much more slowly for the same mouse travel (the owner, v23:
+    // "very, very slow, hard to aim"), so the swipe is scaled up then, by its own setting.
+    if ([self aiming]) k *= setting(@"aimCameraSpeed", "ARKHAM_TOUCH_AIM_LOOK", AIM_LOOK_DEFAULT);
+    rt_touch_mouse(d.x * k, d.y * k * (setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 ? -1 : 1));
 }
 
 - (void)lift:(NSSet<UITouch *> *)touches tapped:(BOOL)ended {
@@ -1282,6 +1322,7 @@ static UIView *gear_view;
             rstick_base.hidden = rstick_knob.hidden = YES;
         }
         if (t == look_touch) look_touch = nil;
+        if (t == aim_touch) aim_touch = nil;
         [owners removeObjectForKey:t];
     }
     [self send];
@@ -1294,7 +1335,7 @@ static UIView *gear_view;
     [owners removeAllObjects];
     [tap_start removeAllObjects];
     [tap_time removeAllObjects];
-    stick_touch = look_touch = pan_touch = wheel_touch = pinch_touch = rstick_touch = nil;
+    stick_touch = look_touch = pan_touch = wheel_touch = pinch_touch = rstick_touch = aim_touch = nil;
     lx = ly = rx = ry = 0;
     pan_sum = pan_debt = CGPointZero;
     pinch_last = 0;
@@ -1566,9 +1607,9 @@ static UIView *gear_view;
     [self toggle:@"Прятать вне игры" on:setting(@"hideInMenus", "ARKHAM_TOUCH_HIDE", 1) > 0 action:@selector(hideChanged:)];
     [self action:@"Расположение кнопок" selector:@selector(editLayout)];
 
-    [self section:@"Управление" footer:@"Камера поворачивается ровно на столько, на сколько проведён палец, с любой скоростью и на ходу. Скорость — на сколько градусов поворачивает свайп через весь экран. При прицеле (зажата L2) игра сама замедляет камеру, поэтому свайп тогда во столько раз быстрее."];
+    [self section:@"Управление" footer:@"Камера поворачивается ровно на столько, на сколько проведён палец, с любой скоростью и на ходу. Скорость — на сколько градусов поворачивает свайп через весь экран. При прицеле (зажата L2) игра сама замедляет камеру, поэтому свайп тогда во столько раз быстрее, до ×15. Палец, которым держишь прицел, тоже поворачивает камеру: зажми кнопку и веди."];
     look_value = [self slider:@"Скорость камеры" min:0.25 max:3.0 value:setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) action:@selector(lookChanged:)];
-    aim_value = [self slider:@"Камера при прицеле" min:1.0 max:5.0 value:setting(@"aimCameraSpeed", "ARKHAM_TOUCH_AIM_LOOK", 2.5) action:@selector(aimLookChanged:)];
+    aim_value = [self slider:@"Камера при прицеле" min:1.0 max:AIM_LOOK_MAX value:setting(@"aimCameraSpeed", "ARKHAM_TOUCH_AIM_LOOK", AIM_LOOK_DEFAULT) action:@selector(aimLookChanged:)];
     [self toggle:@"Инвертировать вверх-вниз" on:setting(@"invertLook", "ARKHAM_TOUCH_INVERT", 0) > 0 action:@selector(invertChanged:)];
     [self toggle:@"Бег: стик за край" on:setting(@"autoRun", "ARKHAM_TOUCH_RUN", 1) > 0 action:@selector(runChanged:)];
     [self section:@"Камера игры" footer:@"Помощь камеры — сама разворачивает камеру за спину Бэтмена на бегу. С сенсорной камерой она мешает поворачивать на бегу, с геймпадом может быть удобна. Меняется со следующего запуска игры."];
@@ -1580,7 +1621,7 @@ static UIView *gear_view;
     size_value.text = [NSString stringWithFormat:@"%.0f %%", setting(@"buttonScale", "ARKHAM_TOUCH_SIZE", 1.0) * 100];
     opacity_value.text = [NSString stringWithFormat:@"%.0f %%", (1 - setting(@"opacity", "ARKHAM_TOUCH_OPACITY", 0.8)) * 100];
     look_value.text = [NSString stringWithFormat:@"%.0f° на экран", setting(@"mouseCameraSpeed", "ARKHAM_TOUCH_LOOK", 1.0) * CAMERA_DEG_PER_POINT * 951];
-    aim_value.text = [NSString stringWithFormat:@"× %.1f", setting(@"aimCameraSpeed", "ARKHAM_TOUCH_AIM_LOOK", 2.5)];
+    aim_value.text = [NSString stringWithFormat:@"× %.1f", setting(@"aimCameraSpeed", "ARKHAM_TOUCH_AIM_LOOK", AIM_LOOK_DEFAULT)];
 }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)t { return (NSInteger)rows.count; }
 - (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return (NSInteger)rows[(NSUInteger)s].count; }

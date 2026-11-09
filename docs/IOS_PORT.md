@@ -665,3 +665,14 @@ app goes to the background.
   Arkham Asylum") and in the Mac's Finder. The owner asked to see Steam's stored answer on the phone.
 - In it: `Steam` (answer.txt, what the Mac's Steam answered; the saves), `Logs` (run.txt), `Shaders`, `Shots`, `arkham.env`, and
   `Batman Arkham Asylum GOTY`, the game's own files (about 9 GB), which must stay where they are.
+
+## v29: the camera turned by the thumb holding the aim; the aim's camera up to ×15, 2026-11-09 (built 10:30, not installed yet)
+
+- **The aim thumb turns the camera.** The thumb holding the touch L2 (the gadget's aim) turns the camera as a swipe does, at the aim's speed.
+  - Why: the owner keeps every button under the right thumb, so with the aim held there was no thumb left for the camera.
+  - It starts once the thumb is 8 points from where it pressed, so the press itself doesn't move the aim. The travel up to there is left out.
+  - The aim stays held wherever the thumb goes, until it lifts. On the map and in menus the thumb turns nothing.
+- **"Камера при прицеле" goes from 1 to 15** (it was 1 to 5). The default stays 2.5.
+  - A setting at the old top of 5 (the owner's) moves to 15 once (`aimCameraSpeedUpTo15`). The slider stays at its end and turns three times as fast.
+  - The owner asked for exactly that, and not to measure on the Mac how much the game slows the camera while aiming.
+- **Checked:** it builds without warnings. Touch can't be tried on the Mac, and the owner asked not to run the game there for this.
