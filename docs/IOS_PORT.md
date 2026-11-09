@@ -677,7 +677,7 @@ app goes to the background.
   - The owner asked for exactly that, and not to measure on the Mac how much the game slows the camera while aiming.
 - **Checked:** it builds without warnings. Touch can't be tried on the Mac, and the owner asked not to run the game there for this.
 
-## v30: the screen takes touches with a controller connected, 2026-11-09 (built 10:43, not installed yet)
+## v30: the screen takes touches with a controller connected, 2026-11-09 (installed 10:45)
 
 - **What was wrong.** With a controller connected, the touch controls hid for as long as it was connected, and the screen took no touch at all,
   not even a tap on a menu's item. The owner's DualSense had connected by itself, so the game couldn't be started by touch. The game also took its
