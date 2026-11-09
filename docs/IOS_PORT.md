@@ -676,3 +676,16 @@ app goes to the background.
   - A setting at the old top of 5 (the owner's) moves to 15 once (`aimCameraSpeedUpTo15`). The slider stays at its end and turns three times as fast.
   - The owner asked for exactly that, and not to measure on the Mac how much the game slows the camera while aiming.
 - **Checked:** it builds without warnings. Touch can't be tried on the Mac, and the owner asked not to run the game there for this.
+
+## v30: the screen takes touches with a controller connected, 2026-11-09 (built 10:43, not installed yet)
+
+- **What was wrong.** With a controller connected, the touch controls hid for as long as it was connected, and the screen took no touch at all,
+  not even a tap on a menu's item. The owner's DualSense had connected by itself, so the game couldn't be started by touch. The game also took its
+  buttons only from the controller then.
+- **Now whichever was used last is the game's.**
+  - While a controller is connected, the controls hide until the screen is touched.
+  - A touch brings them back and works at once: a tap on a menu's item clicks it, and a touch on a button presses it.
+  - Their values then go to the game as the controller's own profile, so the game sees no controller come or go (shims_hid.m).
+  - The controller's next use (a button down, a trigger past 0.3, a stick past 0.4) makes it the game's again, and the controls hide.
+- **Checked:** both files build without warnings, for the phone and the Mac. The Mac never turns the touch pad on, so nothing changes there.
+- **Not run:** the owner asked not to run the game on the Mac this round, and touch can only be tried on the phone.

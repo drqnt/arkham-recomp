@@ -42,6 +42,7 @@ Kept so that a wish isn't lost between rounds of fixes; updated with each versio
 
 ## Done, by version (phone)
 
+- v30: the screen takes touches with a controller connected: a touch brings the controls back, the controller's use hides them.
 - v29: the thumb holding the aim (L2) turns the camera too; "Камера при прицеле" up to ×15, and the owner's ×5 became ×15.
 - v28: the app's folder in the Files app and the Mac's Finder.
 - v27: the game's size from the inner screen even when started folded (it had drawn at 1016 x 696); the resolution as sizes in pixels,

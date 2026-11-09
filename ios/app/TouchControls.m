@@ -15,7 +15,8 @@
 //
 // Held upright, the phone shows the game across the top and the controls in the space below it, with a layout of their own. A moved button keeps its
 // place in proportion to the space for the controls and its size in proportion to that space's height, so a layout made on a foldable's outer screen
-// comes back in the same places on the inner one, larger, and the other way round. The controls hide while a real controller is connected.
+// comes back in the same places on the inner one, larger, and the other way round. While a real controller is connected, the controls hide until
+// the screen is touched; then they are back, and the game's, until the controller is next used.
 //
 // The settings, behind the gear at the top right: the frame rate limit, the controls' style, size, opacity and camera speed, the run push, hiding
 // outside play, the frame rate line and Apple's Metal HUD, and the layout: moving, resizing, hiding and resetting each button. They're kept in the
@@ -31,6 +32,7 @@ void rt_touch_pad(float lx, float ly, float rx, float ry, float lt, float rt, un
 void rt_touch_mouse(double dx, double dy);  // shims_sys.c: the pointer's motion in pixels, which the game reads as its mouse's
 void rt_touch_move(float x, float y, int in_play);  // shims_sys.c: the walking stick's position, up and right positive
 void rt_touch_pad_on(int on);
+int rt_touch_pad_is_on(void);
 void rt_touch_pad_playstation(int ps);
 int rt_controller_connected(void);
 int rt_game_holds_cursor(void);
@@ -292,6 +294,7 @@ enum { KIND_PS_SHAPE, KIND_TEXT, KIND_ICON, KIND_BAT };
 - (void)releaseAll;
 - (void)startEditing;
 - (void)followFrameRateLimit;
+- (void)setControllerConnected:(BOOL)pad;
 @end
 static TouchControlsView *controls;
 static void open_settings(void);
@@ -324,6 +327,8 @@ static void open_settings(void);
     BOOL panning;  // the touch outside play has moved far enough to be a drag
     BOOL in_menu;  // outside play
     BOOL seen_play, photo;
+    BOOL pad_connected;  // a real controller
+    BOOL pad_hides;      // the controls hidden while that controller is the game's: until the screen is touched
     CFTimeInterval last_frame, last_play, heavy_until;
     unsigned play_frame;
     CGSize laid_out;
@@ -730,13 +735,14 @@ static UIColor *ink_color(float ink, CGFloat alpha) { return [UIColor colorWithW
     rt_touch_pad_playstation(style != STYLE_XBOX);
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
+    BOOL gone = photo || pad_hides;  // everything hidden: for a picture, or while a controller is the game's
     for (PadButton *b in [self allButtons]) {
         [self placeButton:b];
-        BOOL show = b == close_button                                    ? in_menu && !self.editing && !photo
-                    : b == findbat_button                                ? in_menu && map_open && !self.editing && !photo
-                    : b.def->control == C_TWOSTICKS && twosticks && !self.editing ? !photo  // while on, always there to turn them off
-                    : aim_only(b.def) && !self.editing                   ? !in_menu && !photo && !b.hiddenByPlayer && [self aiming]
-                                                                         : self.editing || (!in_menu && !photo && !b.hiddenByPlayer);
+        BOOL show = b == close_button                                    ? in_menu && !self.editing && !gone
+                    : b == findbat_button                                ? in_menu && map_open && !self.editing && !gone
+                    : b.def->control == C_TWOSTICKS && twosticks && !self.editing ? !gone  // while on, always there to turn them off
+                    : aim_only(b.def) && !self.editing                   ? !in_menu && !gone && !b.hiddenByPlayer && [self aiming]
+                                                                         : self.editing || (!in_menu && !gone && !b.hiddenByPlayer);
         b.shown = show;
         b.group.hidden = b.badge_group.hidden = !show;
         if (!show) {
@@ -954,6 +960,24 @@ static UIView *gear_view;
     [self restyle];
     fprintf(stderr, "[touch] %s\n", on ? "photo mode: everything hidden" : "photo mode over");
 }
+// A real controller connected or gone (GCController's notifications). While one is connected, the controls hide and the controller is the game's,
+// until the screen is touched: then they are back and the game's, until the controller is next used (shims_hid.m, rt_touch_pad_is_on).
+// Before v30 a controller hid them for as long as it was connected, and the screen took no touch at all, not even a tap on a menu's item: the
+// owner's DualSense had connected by itself, and the game couldn't be started by touch (2026-11-09).
+- (void)setControllerConnected:(BOOL)pad {
+    pad_connected = pad;
+    [self setPadHides:pad why:NULL];
+}
+- (void)setPadHides:(BOOL)on why:(const char *)why {
+    rt_touch_pad_on(!on);
+    if (on == pad_hides) return;
+    pad_hides = on;
+    if (on)
+        [self releaseAll];  // what the thumbs held lets go: the controller has it now
+    else
+        [self restyle];
+    if (why) fprintf(stderr, "[touch] %s\n", why);
+}
 // A few words of help over the bottom of the picture, for a moment.
 - (void)flashHint:(NSString *)text for:(NSTimeInterval)secs {
     photo_hint.text = text;
@@ -1027,6 +1051,9 @@ static UIView *gear_view;
     CFTimeInterval now = l.timestamp, dt = last_frame > 0 ? now - last_frame : 1.0 / 60;
     last_frame = now;
     if (dt <= 0 || dt > 0.1) dt = 1.0 / 60;
+    // The controller used while the touch controls were the game's: it has taken over again (shims_hid.m), and they hide.
+    if (pad_connected && !pad_hides && !rt_touch_pad_is_on())
+        [self setPadHides:YES why:"the controller is used: touch controls hidden until the screen is touched"];
     [self updatePlay:now];
     if (!rstick_touch) rx = ry = 0;
     if (twosticks) {
@@ -1086,6 +1113,8 @@ static UIView *gear_view;
             [self editTouchBegan:p];
             continue;
         }
+        // The screen touched while a controller was the game's: the controls are back, and this touch works as any other.
+        if (pad_hides) [self setPadHides:NO why:"the screen is touched: touch controls back, and the game's until the controller is used"];
         // The wheel left open: a touch on one of its sides chooses that, anywhere else only closes it.
         if (wheel_open && !wheel_touch) {
             int side = [self sideAt:p from:wheel_center within:YES];
@@ -1700,7 +1729,6 @@ static UIView *gear_view;
 }
 - (void)editLayout {
     [self.navigationController dismissViewControllerAnimated:YES completion:^{
-        controls.hidden = NO;
         [controls startEditing];
     }];
 }
@@ -1721,10 +1749,8 @@ static void open_settings(void) {
 // ---------- putting it together ----------
 static void update_visibility(void) {
     BOOL pad = rt_controller_connected();
-    if (pad && !controls.hidden) [controls releaseAll];
-    if (!controls.editing) controls.hidden = pad;
-    rt_touch_pad_on(!pad);
-    fprintf(stderr, "[touch] %s\n", pad ? "a controller is connected: touch controls hidden" : "touch controls shown");
+    fprintf(stderr, "[touch] %s\n", pad ? "a controller is connected: touch controls hidden until the screen is touched" : "touch controls shown");
+    [controls setControllerConnected:pad];
 }
 // What the settings say, applied once at start: the frame rate limit, the HUD and the frame rate line.
 void rt_ios_apply_settings(void) {

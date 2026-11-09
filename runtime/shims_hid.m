@@ -242,7 +242,10 @@ void rt_touch_pad(float lx, float ly, float rx, float ry, float lt, float rt, u3
     atomic_store(&touch.rt, rt);
     atomic_store(&touch.buttons, buttons);
 }
+// Whether the touch controls are the game's pad. With no controller connected, the app keeps them on. With one connected, it turns them on when
+// the screen is touched, and tick() turns them off again when the controller is used (pad_in_use). The app sees that here and hides them.
 void rt_touch_pad_on(int on) { atomic_store(&touch.on, on); }
+int rt_touch_pad_is_on(void) { return atomic_load(&touch.on); }
 // Which controller the touch controls are shown to the game as, so that its prompts match what they draw: 1 for the PlayStation one, 0 for Xbox.
 void rt_touch_pad_playstation(int ps) { atomic_store(&touch.playstation, ps); }
 // Whether a real controller is connected, for the app to hide its controls.
@@ -250,6 +253,17 @@ int rt_controller_connected(void) {
     for (GCController *k in GCController.controllers)
         if (k.extendedGamepad && !k.isSnapshot) return 1;
     return 0;
+}
+// Whether a controller is being used: a button down, a trigger pulled, or a stick well off its middle. A pad lying on the table is still,
+// drifting sticks included.
+static int pad_in_use(GCExtendedGamepad *g) {
+    const float s = 0.4f, t = 0.3f;
+    if (fabsf(g.leftThumbstick.xAxis.value) > s || fabsf(g.leftThumbstick.yAxis.value) > s) return 1;
+    if (fabsf(g.rightThumbstick.xAxis.value) > s || fabsf(g.rightThumbstick.yAxis.value) > s) return 1;
+    if (g.leftTrigger.value > t || g.rightTrigger.value > t) return 1;
+    return g.buttonA.pressed || g.buttonB.pressed || g.buttonX.pressed || g.buttonY.pressed || g.leftShoulder.pressed || g.rightShoulder.pressed ||
+           g.buttonMenu.pressed || g.buttonOptions.pressed || g.leftThumbstickButton.pressed || g.rightThumbstickButton.pressed ||
+           g.dpad.up.pressed || g.dpad.down.pressed || g.dpad.left.pressed || g.dpad.right.pressed;
 }
 static void push_control(Control *k, int v);
 int rt_move_owned(void);                        // shims_sys.c
@@ -299,6 +313,15 @@ static void tick(void) {
         if (!g && atomic_load(&touch.on)) {
             want = atomic_load(&touch.playstation) ? &profiles[0] : &profiles[1];
             touching = 1;
+        } else if (g && atomic_load(&touch.on)) {
+            // The screen touched with a controller connected: the touch controls' values go to the game until the controller is used. They go as
+            // the controller's own profile, so the game sees no controller come or go.
+            if (pad_in_use(g)) {
+                atomic_store(&touch.on, 0);
+                fprintf(stderr, "[pad] the controller is used: it is the game's again, and the touch controls hide\n");
+            } else {
+                touching = 1;
+            }
         }
     }
     if (shown && shown != want) {
